@@ -11,3 +11,4 @@ tests/e2e/participant-screens
 tests/fixtures/*.wav
 tests/fixtures/*.y4m
 tests/fixtures/*.png
+tests/fixtures/real-sessions/

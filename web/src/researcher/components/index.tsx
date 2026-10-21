@@ -279,7 +279,7 @@ export function Menu({ trigger, children, align = 'left', className }: { trigger
     <div ref={ref} className="relative">
       {trigger({ open, toggle: () => setOpen((o) => !o) })}
       {open && (
-        <div className={cn('absolute z-40 mt-1.5 min-w-56 rounded-[14px] border border-black/[0.06] bg-white/90 p-1 shadow-[0_12px_40px_rgba(0,0,0,.14)] backdrop-blur-xl animate-[ta-sheet_.2s_cubic-bezier(0.32,0.72,0,1)]', align === 'right' ? 'right-0' : 'left-0', className)}>
+        <div className={cn('absolute z-40 mt-1.5 min-w-56 rounded-[14px] border border-black/[0.06] bg-white p-1 shadow-[0_12px_40px_rgba(0,0,0,.14)] backdrop-blur-xl animate-[ta-sheet_.2s_cubic-bezier(0.32,0.72,0,1)]', align === 'right' ? 'right-0' : 'left-0', className)}>
           {children(() => setOpen(false))}
         </div>
       )}

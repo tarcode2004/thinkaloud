@@ -26,6 +26,7 @@ The goal: it should feel like a first-party Apple app or a WWDC session slide �
 ## Shape, materials, depth
 - Continuous corners: controls `rounded-full` (pill buttons) or `rounded-[10px]`; cards/panels `rounded-[18px]`–`rounded-[22px]`; sheets `rounded-[28px]`.
 - Cards: white, hairline border OR very soft shadow (`shadow-[0_1px_2px_rgba(0,0,0,.04),0_4px_16px_rgba(0,0,0,.04)]`), never both heavy.
+- Menus, popovers, dropdowns and sheets are OPAQUE (`bg-white` / `bg-surface`) with a soft shadow — never translucent; text underneath must not show through.
 - Materials: toolbars, sidebars, floating docks use translucent blur — `bg-white/72 backdrop-blur-xl backdrop-saturate-180` + hairline border. Dark contexts: `bg-black/55 backdrop-blur-2xl`.
 - Grouped inset lists (iOS Settings style) for settings/forms: rows separated by inset hairlines, label left, control right.
 - Segmented controls instead of tabs where there are 2–5 options.

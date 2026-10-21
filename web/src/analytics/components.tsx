@@ -117,7 +117,7 @@ export function Popover({ trigger, children, align = 'right' }: { trigger: (togg
       {open && (
         <div
           className={cn(
-            'absolute z-40 mt-2 min-w-[220px] rounded-[14px] bg-white/90 p-1.5 shadow-[0_10px_40px_rgba(0,0,0,.16),0_0_0_0.5px_rgba(0,0,0,.08)] backdrop-blur-xl animate-[ta-sheet_.25s_cubic-bezier(0.32,0.72,0,1)]',
+            'absolute z-40 mt-2 min-w-[220px] rounded-[14px] bg-white p-1.5 shadow-[0_10px_40px_rgba(0,0,0,.16),0_0_0_0.5px_rgba(0,0,0,.08)] backdrop-blur-xl animate-[ta-sheet_.25s_cubic-bezier(0.32,0.72,0,1)]',
             align === 'right' ? 'right-0' : 'left-0',
           )}
         >

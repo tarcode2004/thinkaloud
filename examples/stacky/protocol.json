@@ -22,7 +22,7 @@
     "voice": "marin",
     "tone": "warm, calm, curious and strictly neutral",
     "customRules": [
-      "Never explain what the highlights, stacks or the 'Modified by AI' badge mean; if asked, reply 'What do you think it means?'",
+      "If the participant asks what a CrossWeave feature means (the highlighted phrases, the posts on the right, the colored tags, the 'Modified by AI' badge), don't explain it \u2014 ask what they think it means. This applies ONLY to app features: always answer plainly when they ask about the task wording or what you just said.",
       "Do not use the words 'related', 'AI-added' or 'original author' before the participant does, except when reading a task or question verbatim."
     ],
     "allowTextFallback": true
@@ -112,14 +112,9 @@
       "id": "t_ai",
       "type": "task",
       "title": "AI disclosure",
-      "instruction": "Find a post on the right that is marked as modified by AI. Take a close look at it and tell me which words came from the person who wrote the post and which did not.",
-      "successCriteria": "Participant locates a 'Modified by AI' card, inspects the disclosure, and correctly identifies the AI-added (green) words vs the author's original words.",
-      "successRules": [
-        {
-          "type": "click_matches",
-          "text": "Modified by AI"
-        }
-      ],
+      "instruction": "I've opened a post for you. Among the posts on the right side of this page, find one that is marked as modified by AI. Take a close look at it and tell me which words came from the person who wrote that post and which did not.",
+      "successCriteria": "Participant locates the 'Modified by AI' card in the right pane of /ChineseEVs/posts/149289030, inspects the disclosure (hover/click shows the track-changes diff), and correctly says the green words were added by AI while the rest is the author's.",
+      "successRules": [],
       "timeLimitSec": 240,
       "probes": [
         "What makes you say that?"
@@ -141,7 +136,8 @@
           "required": true,
           "intent": "Expected: no, only the contextual copy is edited."
         }
-      ]
+      ],
+      "startPath": "/ChineseEVs/posts/149289030"
     },
     {
       "id": "t_full",
