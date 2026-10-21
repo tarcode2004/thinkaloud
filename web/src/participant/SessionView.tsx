@@ -158,7 +158,14 @@ export function SessionView({ runner, title, preview, onWithdraw }: { runner: Se
                 {s.card.kind === 'questionnaire' ? (
                   <QuestionnaireCard title={s.card.title} questions={s.card.questions} answers={answerOf} onAnswer={onAnswer} onSubmit={() => runner.submitQuestionnaire()} submitted={s.card.submitted} />
                 ) : (
-                  <QuestionCard q={s.card.questions[0]} answer={answerOf(s.card.questions[0].id)} onAnswer={(a) => onAnswer(s.card!.questions[0], a)} allowOpenInput={s.mode !== 'voice'} voiceMode={voice} />
+                  <QuestionCard
+                    key={`${s.card.stepId}:${s.card.questions[0].id}`}
+                    q={s.card.questions[0]}
+                    answer={answerOf(s.card.questions[0].id)}
+                    onAnswer={(a) => onAnswer(s.card!.questions[0], a)}
+                    onDecline={() => runner.declineFromScreen(s.card!.stepId, s.card!.questions[0])}
+                    voiceMode={voice}
+                  />
                 )}
               </div>
             )}

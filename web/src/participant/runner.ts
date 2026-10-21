@@ -10,7 +10,11 @@ import {
   buildModeratorInstructions,
   describeScale,
   followUpBudget,
+  isLikelyNoise,
   languageName,
+  meanLogprob,
+  parseRecordAnswer,
+  wrapUpDecision,
   MODERATOR_TOOLS,
   questionHasCard,
   questionnaireOnScreen,
@@ -28,6 +32,7 @@ import {
   type TaskStep,
 } from '@thinkaloud/shared';
 import { pApi, type SessionAuth } from './api.ts';
+import { CaptionPacer } from './captionPacer.ts';
 import { EventQueue, RrwebUploader } from './eventQueue.ts';
 import { LevelMeter, MixedRecorder } from './media.ts';
 import { ProbeBridge, type ProbeEvent } from './probeBridge.ts';
@@ -39,6 +44,8 @@ export type RunnerMode = 'voice' | 'text' | 'manual';
 export type OrbState = 'connecting' | 'listening' | 'user' | 'assistant' | 'thinking' | 'muted' | 'offline';
 export type TaskPhase = 'briefing' | 'active' | 'post';
 export type AppStatus = 'none' | 'loading' | 'ready' | 'crashed' | 'limited';
+/** Quiet-phase classification of a participant utterance. */
+export type TurnLabel = 'DONE' | 'DELIVERED' | 'SKIP' | 'STUCK' | 'ADDRESSED' | 'NO';
 
 export interface Caption {
   id: string;
@@ -53,6 +60,8 @@ export interface AnswerValue {
   text?: string;
   value?: number;
   choices?: string[];
+  /** "I don't know" / "not sure" / skipped on screen. */
+  declined?: boolean;
   source: 'voice' | 'screen' | 'text';
 }
 
@@ -119,11 +128,41 @@ const INTERACTION_GRACE_MS = 10_000;
 const CHECK_IN_SILENCE_MS = 90_000;
 const akey = (stepId: string, qid: string) => `${stepId}::${qid}`;
 
+/**
+ * The "I'm done" wrap-up window. Opened by the Done button, by a verbal "I'm done", when the
+ * participant has delivered what a tell/explain task asked for, or when the model calls
+ * set_task_outcome on its own. The outcome is only recorded once the participant has finished
+ * talking (held tool output), so their answer is never cut off by "Thanks".
+ */
+interface WrapUp {
+  source: 'button' | 'verbal' | 'delivered' | 'model';
+  phase: 'asking' | 'listening' | 'judging';
+  openedAt: number;
+  /** When the listening window started (the question finished). */
+  listenFrom: number;
+  questionHeard: boolean;
+  /** The "how did it go" question was requested (deferred while the participant is still talking). */
+  askSent: boolean;
+  /** Meaningful (non-noise) participant utterances in this window. */
+  heard: string[];
+  lastHeardAt: number;
+  typed: boolean;
+  /** A speech segment ended but its transcript has not arrived yet. */
+  transcriptPending: boolean;
+  judgeAt: number;
+  judgeRequests: number;
+  /** Held set_task_outcome calls, released when the participant has finished. */
+  waiters: (() => void)[];
+  ack: string;
+}
+
 export class SessionRunner {
   readonly queue: EventQueue;
   readonly bridge: ProbeBridge;
   private rrweb: RrwebUploader;
   private rt: RealtimeClient | null = null;
+  /** Moderator captions revealed in step with the audible voice. */
+  private pacer: CaptionPacer | null = null;
   private recorder: MixedRecorder | null = null;
   micMeter: LevelMeter | null = null;
   remoteMeter: LevelMeter | null = null;
@@ -194,7 +233,18 @@ export class SessionRunner {
   /** `${stepId}::${questionId}` of spoken questions the moderator has fully read out. */
   private askedQuestions = new Set<string>();
   /** Quiet-phase turn-taking decisions (debug / tests). */
-  readonly turnChecks: { text: string; addressed: boolean; via: string; verdict: string | null; at: number }[] = [];
+  readonly turnChecks: { text: string; addressed: boolean; label: TurnLabel; via: string; verdict: string | null; at: number }[] = [];
+  private wrap: WrapUp | null = null;
+  private wrapTimer: ReturnType<typeof setInterval> | null = null;
+  /** "You can skip" reminder given in this task / STUCK utterances heard. */
+  private skipReminded = false;
+  private stuckCount = 0;
+  /** How often each question of the current step was read out (`stepId::qid`). */
+  private askCounts = new Map<string, number>();
+  private repeatGuard: ReturnType<typeof setTimeout> | null = null;
+  private lastDirectedAt = 0;
+  private lastResponseStartAt = 0;
+  private lastSpeechStopAt = 0;
 
   constructor(private opts: RunnerOptions) {
     this.steps = opts.start.steps;
@@ -358,30 +408,40 @@ export class SessionRunner {
           this.lastUserSpeech = performance.now();
           this.userSpeechStartT = this.queue.now();
           this.heardSinceStep = true;
+          if (this.wrap) this.wrap.transcriptPending = true;
           this.queue.push('speech.start', { who: 'participant' });
           this.updateOrb();
         },
         onUserSpeechStop: () => {
           this.lastUserSpeech = performance.now();
+          this.lastSpeechStopAt = this.lastUserSpeech;
           this.queue.push('speech.stop', { who: 'participant' });
           this.updateOrb();
         },
         onUserTranscriptDelta: (itemId, delta) => this.caption('participant', itemId, delta, false, true),
-        onUserTranscript: (itemId, text) => this.onUserTranscript(itemId, text),
-        onAssistantTranscriptDelta: (rid, delta) => this.caption('moderator', rid, delta, false, true),
-        onAssistantTranscript: (rid, text, phase) => this.onAssistantTranscript(rid, text, phase),
-        onAssistantAudioStart: () => {
+        onUserTranscript: (itemId, text, logprobs) => this.onUserTranscript(itemId, text, logprobs),
+        onAssistantTranscriptDelta: (rid, delta) => this.pacer?.delta(rid, delta),
+        onAssistantTranscript: (rid, text, phase) => this.pacer?.done(rid, text, phase),
+        onAssistantAudioStart: (rid) => {
+          this.pacer?.audioStart(rid);
           this.lastAssistantAudio = performance.now();
           this.queue.push('speech.start', { who: 'moderator' });
           this.updateOrb();
         },
-        onAssistantAudioStop: () => {
+        onAssistantAudioStop: (rid, cleared, byClient) => {
+          // Commit what was audible first (the step logic below reads the committed transcript).
+          const cut = this.pacer?.audioStop(rid, cleared);
+          // We cut it off ourselves: tell the server what was heard (its own VAD interruptions it truncates itself).
+          if (cut && byClient) rt.truncate(cut.seg.itemId, cut.playedMs);
           this.lastAssistantAudio = performance.now();
           this.queue.push('speech.stop', { who: 'moderator' });
           this.updateOrb();
           this.onModeratorFinishedSpeaking();
         },
-        onResponseStart: () => this.updateOrb(),
+        onResponseStart: () => {
+          this.lastResponseStartAt = performance.now();
+          this.updateOrb();
+        },
         onResponseDone: () => {
           this.updateOrb();
           // In text-only output there is no audio stop event.
@@ -391,6 +451,17 @@ export class SessionRunner {
       },
     });
     this.rt = rt;
+    this.pacer?.dispose();
+    this.pacer = new CaptionPacer({
+      show: (id, text, final) => {
+        if (text) this.caption('moderator', id, text, final, false);
+      },
+      commit: (seg, text, truncated, late) => {
+        this.onAssistantTranscript(seg.id, text, seg.phase, truncated);
+        if (late && !this.rt?.assistantAudioPlaying) this.onModeratorFinishedSpeaking();
+      },
+      level: () => (this.remoteMeter ? this.remoteMeter.raw() : null),
+    });
     await rt.connectWithRetry();
   }
 
@@ -401,6 +472,9 @@ export class SessionRunner {
       tools: MODERATOR_TOOLS,
       tool_choice: 'auto',
     });
+    // Transcription confidence (used to drop noise). Separate update: an unsupported field must not
+    // reject the instructions above.
+    rt.updateSession({ include: ['item.input_audio_transcription.logprobs'] });
     this.applyTurnDetection(true);
     if (!reconnected) {
       this.enterStep(-1, 'announce');
@@ -427,9 +501,16 @@ export class SessionRunner {
     const quiet = this.isQuietPhase();
     if (!force && quiet === this.quiet) return;
     this.quiet = quiet;
+    const tr = this.rt.transcription;
     this.rt.updateSession({
       audio: {
         input: {
+          // Always re-send the language-pinned transcription settings with the turn detection, so a
+          // partial update can never fall back to auto language detection.
+          ...(tr ? { transcription: tr } : {}),
+          noise_reduction: { type: 'near_field' },
+          // Quiet phases (and the "how did it go" answer window) never auto-respond: the runner decides
+          // when the participant has finished. Low eagerness = wait longer before ending a turn.
           turn_detection: { type: 'semantic_vad', eagerness: 'low', create_response: !quiet, interrupt_response: true },
         },
       },
@@ -440,7 +521,8 @@ export class SessionRunner {
   private isQuietPhase() {
     const s = this.step;
     if (!s) return false;
-    if (s.type === 'task') return this.state.taskPhase === 'active' && !this.doneRequested;
+    // Includes the "I'm done" answer window: the runner (not VAD) decides when they have finished.
+    if (s.type === 'task') return this.state.taskPhase === 'active';
     if (s.type === 'instruction') return (s.exploreSeconds ?? 0) > 0 && this.state.exploreEndsAt != null && !this.exploreDone;
     if (s.type === 'questionnaire') return questionnaireOnScreen(s) && !this.questionnaireSubmitted;
     return false;
@@ -469,64 +551,150 @@ export class SessionRunner {
     this.set({ captions: caps.slice(-8) });
   }
 
-  private onUserTranscript(itemId: string, text: string) {
+  private onUserTranscript(itemId: string, text: string, logprobs?: unknown) {
     this.caption('participant', itemId, text, true, false);
+    if (this.wrap) this.wrap.transcriptPending = false;
     if (!text) return;
+    const avgLogprob = meanLogprob(logprobs);
+    if (isLikelyNoise({ text, language: this.mod.language, avgLogprob })) {
+      // Background noise / a mis-transcribed fragment in another language: logged for the researcher,
+      // but never an answer, never a turn, and removed from the model's conversation.
+      this.queue.push('transcript.participant', { text, itemId, startT: this.userSpeechStartT ?? undefined, endT: this.queue.now(), source: 'voice', noise: true, ...(avgLogprob != null ? { avgLogprob: Math.round(avgLogprob * 100) / 100 } : {}) });
+      this.dropCaption(itemId);
+      const rt = this.rt;
+      if (rt) {
+        rt.deleteItem(itemId);
+        // The VAD may already have started a reply to it: cancel that reply if it has not started speaking.
+        const vadReply = rt.responding && !rt.assistantAudioPlaying && this.lastResponseStartAt >= this.lastSpeechStopAt - 200 && this.lastDirectedAt < this.lastSpeechStopAt;
+        if (vadReply && !this.quiet) rt.cancelResponse();
+      }
+      return;
+    }
     this.heardSinceStep = true;
     this.transcriptLog.push({ role: 'participant', text });
-    this.queue.push('transcript.participant', { text, itemId, startT: this.userSpeechStartT ?? undefined, endT: this.queue.now(), source: 'voice' });
+    this.queue.push('transcript.participant', { text, itemId, startT: this.userSpeechStartT ?? undefined, endT: this.queue.now(), source: 'voice', ...(avgLogprob != null ? { avgLogprob: Math.round(avgLogprob * 100) / 100 } : {}) });
+    if (this.wrap) return this.onWrapUtterance(text, false);
     // In quiet phases the VAD doesn't auto-respond; respond only when addressed.
-    if (this.quiet && this.rt) void this.respondIfAddressed(text);
+    if (this.quiet && this.rt) return void this.respondIfAddressed(text);
+    this.guardRepeatedQuestion();
+  }
+
+  private dropCaption(itemId: string) {
+    const cid = `participant:${itemId}`;
+    if (this.state.captions.some((c) => c.id === cid)) this.set({ captions: this.state.captions.filter((c) => c.id !== cid) });
   }
 
   /**
-   * Quiet phases (active task, exploration, on-screen questionnaire): should the moderator answer
-   * this utterance? Decided by the model itself in a silent out-of-band check (works in any
-   * language, and it hears the audio); falls back to punctuation / English keywords on timeout.
+   * Quiet phases (active task, exploration, on-screen questionnaire): what is this utterance?
+   * Decided by the model itself in a silent out-of-band check (works in any language, and it hears
+   * the audio); falls back to punctuation / English keywords on timeout. During a task it also
+   * recognises "I'm done" (→ wrap-up), a delivered tell/explain answer (→ wrap-up without asking),
+   * skip requests, and a participant who is stuck or frustrated.
    */
   private async respondIfAddressed(text: string) {
     const rt = this.rt;
     if (!rt) return;
-    const stepId = this.step?.id;
-    if (performance.now() < this.awaitingReplyUntil) {
-      this.awaitingReplyUntil = 0;
-      this.turnChecks.push({ text, addressed: true, via: 'reply', verdict: null, at: this.queue.now() });
+    const step = this.step;
+    const stepId = step?.id;
+    const awaiting = performance.now() < this.awaitingReplyUntil;
+    this.awaitingReplyUntil = 0;
+    const onScreenForm = step?.type === 'questionnaire';
+    const task = step?.type === 'task' ? step : null;
+    if (onScreenForm && awaiting) {
+      this.turnChecks.push({ text, addressed: true, label: 'ADDRESSED', via: 'reply', verdict: null, at: this.queue.now() });
       rt.requestResponse();
       return;
     }
-    const onScreenForm = this.step?.type === 'questionnaire';
-    const verdict = await rt.classify(
-      `You are a silent turn-taking classifier for a usability-test moderator — you are NOT talking to anyone. The participant is ${
-        onScreenForm ? 'filling in an on-screen questionnaire' : 'working on a task and thinking aloud'
-      }. Their most recent utterance (it may be in any language) was transcribed as: "${text.replace(/"/g, "'")}".
+    const quoted = text.replace(/"/g, "'");
+    const prompt = task
+      ? `You are a silent turn-taking classifier for a usability-test moderator — you are NOT talking to anyone. The participant is working on this task (they were told: "${task.instruction.replace(/"/g, "'")}") and thinking aloud. Their most recent utterance (it may be in any language) was transcribed as: "${quoted}".${awaiting ? ' The moderator had just asked them something.' : ''}
+Classify it with exactly one label:
+DONE — they say they have finished the task or found what they were looking for ("I'm done", "I think that's it", "found it", "fertig"), in any language.
+DELIVERED — the task asks them to tell, explain or describe something to the moderator, and in this utterance (together with what they said just before) they have clearly and completely said it. A plan, a guess about where to look, or a half sentence is not DELIVERED.
+SKIP — they want to skip, stop or give up on the task.
+STUCK — they say they cannot find or do not see something, are lost, or sound frustrated or irritated.
+ADDRESSED — any other question or request to the moderator (including asking what the task was or what the moderator meant), or a reply to something the moderator just asked.
+NO — thinking aloud, describing what they see or do, reading text aloud, talking to themselves, or noise.
+Reply with exactly one word: DONE, DELIVERED, SKIP, STUCK, ADDRESSED or NO.`
+      : `You are a silent turn-taking classifier for a usability-test moderator — you are NOT talking to anyone. The participant is ${
+          onScreenForm ? 'filling in an on-screen questionnaire' : 'exploring the app and thinking aloud'
+        }. Their most recent utterance (it may be in any language) was transcribed as: "${quoted}".
 Answer YES if they are addressing the moderator and expect a reply or an action: answering a question the moderator just asked, a question to the moderator, a request for help or to repeat something, saying they are done / finished / want to skip, stop or give up${
-        onScreenForm ? ', or saying a rating or answer for one of the on-screen items' : ''
-      }. Answer NO if they are thinking aloud, describing what they see or do, reading text aloud, or asking themselves a question.
-Reply with exactly one word: YES or NO.`,
-      4000,
-    );
-    let addressed: boolean;
-    let via: 'model' | 'fallback';
-    if (verdict && /^\W*(yes|no)\b/i.test(verdict)) {
-      addressed = /^\W*yes/i.test(verdict);
-      via = 'model';
+          onScreenForm ? ', or saying a rating or answer for one of the on-screen items' : ''
+        }. Answer NO if they are thinking aloud, describing what they see or do, reading text aloud, or asking themselves a question.
+Reply with exactly one word: YES or NO.`;
+    const verdict = await rt.classify(prompt, 4000);
+    let label: TurnLabel | null = null;
+    let via: string = 'model';
+    const m = verdict ? /^\W*(DONE|DELIVERED|SKIP|STUCK|ADDRESSED|NO|YES)\b/i.exec(verdict) : null;
+    if (m) {
+      const v = m[1].toUpperCase();
+      label = v === 'YES' ? 'ADDRESSED' : (v as TurnLabel);
+      if (!task && (label === 'DONE' || label === 'DELIVERED' || label === 'SKIP' || label === 'STUCK')) label = 'ADDRESSED';
     } else {
-      addressed = /[?？؟¿]/.test(text) || ((this.mod.language ?? 'en').toLowerCase().startsWith('en') && addressedToModerator(text));
       via = 'fallback';
+      const en = (this.mod.language ?? 'en').toLowerCase().startsWith('en');
+      if (task && en && /\b(i('| a)?m (done|finished)|i think i('| a)?m done|i found it|found it|that'?s it|done now)\b/i.test(text)) label = 'DONE';
+      else label = /[?？؟¿]/.test(text) || (en && addressedToModerator(text)) ? 'ADDRESSED' : 'NO';
     }
-    this.turnChecks.push({ text, addressed, via, verdict, at: this.queue.now() });
+    if (label === 'NO' && awaiting) {
+      label = 'ADDRESSED';
+      via = `${via}+reply`;
+    }
+    // Being stuck is usually said while thinking aloud: the moderator stays quiet the first time (unless
+    // it is a reply to the moderator) and reminds them once that they can skip if it happens again.
+    const stuckReply = label === 'STUCK' && (awaiting || (this.stuckCount + 1 >= 2 && !this.skipReminded));
+    const addressed = label === 'STUCK' ? stuckReply : label !== 'NO';
+    this.turnChecks.push({ text, addressed, label, via, verdict, at: this.queue.now() });
     if (this.turnChecks.length > 50) this.turnChecks.shift();
-    if (addressed && this.quiet && this.rt === rt && this.step?.id === stepId) rt.requestResponse();
+    // Stale (step changed, wrap-up already open, connection replaced)?
+    if (this.rt !== rt || this.step?.id !== stepId || !this.quiet || this.wrap || this.state.taskPhase === 'post') return;
+    switch (label) {
+      case 'DONE':
+        return this.startWrapUp('verbal');
+      case 'DELIVERED':
+        return this.startWrapUp('delivered', text);
+      case 'STUCK':
+        this.stuckCount++;
+        if (this.stuckCount >= 2 && !this.skipReminded) return this.remindSkip();
+        if (awaiting) rt.requestResponse();
+        return;
+      case 'SKIP':
+      case 'ADDRESSED':
+        rt.requestResponse();
+        return;
+      default:
+        return;
+    }
   }
 
-  private onAssistantTranscript(rid: string, text: string, phase?: string) {
-    this.caption('moderator', rid, text, true, false);
+  /** Stuck or frustrated: tell them once per task that skipping is fine. */
+  private remindSkip() {
+    this.skipReminded = true;
+    this.lastTrigger = performance.now();
+    this.queue.push('observation', { kind: 'skip_reminder' });
+    const en = (this.mod.language ?? 'en').toLowerCase().startsWith('en');
+    this.directed(
+      en
+        ? `The participant seems stuck or frustrated. Briefly acknowledge it and say once, kindly and neutrally: "If you'd like, you can skip this one — just say so or press Skip." Nothing else. No hints, no apology for the design.`
+        : `The participant seems stuck or frustrated. In ${languageName(this.mod.language)}, briefly and kindly say once that they can skip this task if they like, by saying so or pressing "Skip". Nothing else. No hints, no apology for the design.`,
+    );
+  }
+
+  /** A moderator utterance as it was actually heard (cut at the interruption point when `truncated`). */
+  private onAssistantTranscript(rid: string, text: string, phase?: string, truncated = false) {
     if (!text) return;
+    this.caption('moderator', rid, text, true, false);
     this.transcriptLog.push({ role: 'moderator', text });
-    this.queue.push('transcript.moderator', { text, responseId: rid, ...(phase ? { phase } : {}) });
+    this.queue.push('transcript.moderator', { text, responseId: rid, ...(phase ? { phase } : {}), ...(truncated ? { truncated: true } : {}) });
     // Which spoken question was actually read out (an interrupted reading does not count).
     const cur = this.step && this.state.index >= 0 ? this.nextQuestion() : null;
-    if (cur && isReadingOf(text, cur.prompt)) this.askedQuestions.add(`${this.step!.id}::${cur.id}`);
+    if (cur && isReadingOf(text, cur.prompt)) {
+      const k = akey(this.step!.id, cur.id);
+      this.askedQuestions.add(k);
+      this.askCounts.set(k, (this.askCounts.get(k) ?? 0) + 1);
+    }
+    if (this.wrap?.phase === 'asking' && /[?？؟]/.test(text)) this.wrap.questionHeard = true;
     // The moderator asked something during a quiet phase: the next utterance is the answer.
     this.awaitingReplyUntil = /[?？؟]/.test(text) && this.quiet ? performance.now() + 60_000 : 0;
     if (this.step?.type === 'task' && this.state.taskPhase === 'briefing' && isReadingOf(text, (this.step as TaskStep).instruction)) this.instructionHeard = true;
@@ -592,6 +760,11 @@ Reply with exactly one word: YES or NO.`,
       nextQuestion: this.step && this.step.type !== 'instruction' ? this.nextQuestion() : undefined,
       answeredCount: queue.filter((q) => this.isHandled(q)).length,
       exploreLeftSec: this.state.exploreEndsAt ? Math.max(0, (this.state.exploreEndsAt - Date.now()) / 1000) : undefined,
+      timesAsked: (() => {
+        const q = this.step && this.step.type !== 'instruction' ? this.nextQuestion() : null;
+        return q ? this.askCounts.get(akey(this.step!.id, q.id)) ?? 0 : 0;
+      })(),
+      taskEndedAs: this.step?.type === 'task' && this.state.taskPhase === 'post' ? this.taskOutcome?.outcome : undefined,
       taskElapsedSec: this.state.taskStartedAt ? (Date.now() - this.state.taskStartedAt) / 1000 : undefined,
       taskTimeLeftSec: this.state.taskDeadline ? Math.max(0, (this.state.taskDeadline - Date.now()) / 1000) : null,
       taskOutcomeSet: Boolean(this.taskOutcome),
@@ -630,6 +803,12 @@ Reply with exactly one word: YES or NO.`,
     this.checkInDone = false;
     this.observed = new Map();
     this.behaviourProbeAsked = false;
+    this.endWrap();
+    this.skipReminded = false;
+    this.stuckCount = 0;
+    this.askCounts = new Map();
+    if (this.repeatGuard) clearTimeout(this.repeatGuard);
+    this.repeatGuard = null;
     this.queue.stepId = step?.id ?? (index < 0 ? 'intro' : 'closing');
     const showApp = Boolean(step && this.opts.start.appUrl && (step.type === 'task' || (step.type === 'instruction' && step.showApp)));
     this.set({
@@ -668,9 +847,9 @@ Reply with exactly one word: YES or NO.`,
       return brief;
     }
     if (mode === 'announce' && this.rt) {
-      this.rt.addSystemItem(`${prefix ? `${prefix}\n` : ''}[STEP] ${JSON.stringify(brief)}`);
+      this.rt.addSystemItem(`${prefix ? `${prefix}\n` : ''}[STEP] ${JSON.stringify(this.withAck(brief, ack))}`);
       // Verbatim text known: dictate this turn (no improvisation, no tool calls, no double reading).
-      if (brief.say_verbatim) this.directed(`${ack ? `${this.ackPhrase(ack)}, then say` : 'Say'} the following text verbatim, completely and only once, and nothing else:\n"${brief.say_verbatim}"`);
+      if (brief.say_verbatim) this.directed(this.sayWithAck(ack, brief.say_verbatim, 'Say the following text verbatim, completely and only once, and nothing else'));
       else this.rt.requestResponse();
       this.briefDelivered = true;
     } else this.briefDelivered = true;
@@ -678,6 +857,25 @@ Reply with exactly one word: YES or NO.`,
   }
 
   /** "Say "<ack>"" — or its equivalent in the session language. */
+  /**
+   * Dictate "<ack> <text>". In English the acknowledgement is part of the verbatim text (the model
+   * reliably says it then); other languages get the ack as an instruction to translate.
+   */
+  private sayWithAck(ack: string | undefined, text: string, how: string) {
+    if (!ack) return `${how}:\n"${text}"`;
+    if (this.isEnglish()) return `${how}:\n"${ack} ${text}"`;
+    return `${this.ackPhrase(ack)}, then — ${how.charAt(0).toLowerCase()}${how.slice(1)}:\n"${text}"`;
+  }
+
+  /** The brief as announced: in English the dictated acknowledgement is part of the verbatim text. */
+  private withAck(b: ModeratorBrief, ack?: string): ModeratorBrief {
+    return ack && b.say_verbatim && this.isEnglish() ? { ...b, say_verbatim: `${ack} ${b.say_verbatim}` } : b;
+  }
+
+  private isEnglish() {
+    return (this.mod.language ?? 'en').toLowerCase().startsWith('en');
+  }
+
   private ackPhrase(ack: string) {
     const lang = this.mod.language?.toLowerCase().split(/[-_]/)[0] ?? 'en';
     return lang === 'en' ? `Say "${ack}"` : `Say a short, natural ${languageName(this.mod.language)} equivalent of "${ack}"`;
@@ -686,7 +884,7 @@ Reply with exactly one word: YES or NO.`,
   private sayClosing(ack?: string) {
     this.closingAttempts++;
     this.closingRequestedAt = performance.now();
-    this.directed(`The session is over. ${ack ? `${this.ackPhrase(ack)}, then say` : 'Say'} exactly the following text, verbatim, and nothing else:\n"${this.protocol.closing}"`);
+    this.directed(`The session is over. ${this.sayWithAck(ack, this.protocol.closing, 'Say exactly the following text, verbatim, and nothing else')}`);
   }
 
   private clearStepTimers() {
@@ -699,6 +897,11 @@ Reply with exactly one word: YES or NO.`,
   /** Called whenever the moderator stops talking. */
   private onModeratorFinishedSpeaking() {
     const s = this.step;
+    const w = this.wrap;
+    if (w?.phase === 'asking' && w.questionHeard) {
+      w.phase = 'listening';
+      w.listenFrom = performance.now();
+    }
     // Only a finished reading of the instruction starts the task. A leftover line from the previous
     // step (or an interrupted reading) must not start the clock; the 25 s timeout is the fallback.
     if (s?.type === 'task' && this.state.taskPhase === 'briefing' && this.instructionHeard && performance.now() - this.stepEnteredAt > 1500) this.activateTask('briefed');
@@ -785,6 +988,7 @@ Reply with exactly one word: YES or NO.`,
     this.followUpsUsed = 0;
     this.set({ taskPhase: 'post', appVisible: false, taskDeadline: null, pendingAction: null });
     this.doneRequested = false;
+    this.endWrap();
     this.applyTurnDetection();
     this.updateCard();
     this.refreshManualPrompt();
@@ -796,18 +1000,18 @@ Reply with exactly one word: YES or NO.`,
    * asks it; otherwise the runner moves on to the next step itself (one acknowledgement + the next
    * step's text — no improvised filler, no redundant tool calls).
    */
-  private announceTaskEnd(text: string, ack: string, allowProbes = true) {
+  private announceTaskEnd(text: string, ack: string, allowProbes = true, summary?: string) {
     if (!this.rt) return;
     this.rt.cancelResponse();
     if (!this.nextQuestion() && !(allowProbes && this.postTaskProbesAvailable())) {
-      this.queue.push('observation', { kind: 'step_summary', note: text.split('. ')[0] });
+      this.queue.push('observation', { kind: 'step_summary', note: summary ?? text.split('. ')[0] });
       this.advance(`[EVENT] ${text} This task is finished; move on to the next step below.`, ack);
       return;
     }
     const b = this.brief();
-    this.rt.addSystemItem(`[EVENT] ${text}\n[STEP] ${JSON.stringify(b)}`);
+    this.rt.addSystemItem(`[EVENT] ${text}\n[STEP] ${JSON.stringify(this.withAck(b, ack))}`);
     // The runner knows exactly what must be said next: direct it (no improvisation, no tools).
-    if (b.say_verbatim) this.directed(`${this.ackPhrase(ack)} and then ask this question verbatim: "${b.say_verbatim}". Say nothing else.`);
+    if (b.say_verbatim) this.directed(this.sayWithAck(ack, b.say_verbatim, 'Say this verbatim and nothing else (the question exactly as written)'));
     else this.rt.requestResponse();
   }
 
@@ -822,6 +1026,7 @@ Reply with exactly one word: YES or NO.`,
 
   /** A response whose content the runner dictates (full rules + a NOW section, tools disabled). */
   private directed(now: string) {
+    this.lastDirectedAt = performance.now();
     this.rt?.requestResponse(`${buildModeratorInstructions(this.protocol, this.steps)}\n\n# NOW\n${now}\nDo not continue, finish or repeat any earlier (interrupted) sentence of yours.`, 'none');
   }
 
@@ -832,11 +1037,10 @@ Reply with exactly one word: YES or NO.`,
       if (s.type === 'questionnaire' && questionnaireOnScreen(s)) {
         card = { kind: 'questionnaire', stepId: s.id, title: s.title, questions: stepQuestions(s), submitted: this.questionnaireSubmitted };
       } else {
+        // Every question gets an on-screen card (open ones too): the question text, an optional typed
+        // answer and an "I'm not sure" control — so the participant always sees what is being asked.
         const q = this.nextQuestion();
-        const manual = this.state.mode === 'manual';
-        const showOpen = manual || s.type === 'question';
-        if (q && (questionHasCard(q) || showOpen) && s.type !== 'interview') card = { kind: 'question', stepId: s.id, questions: [q], activeQuestionId: q.id };
-        else if (q && s.type === 'interview' && manual) card = { kind: 'question', stepId: s.id, questions: [q], activeQuestionId: q.id };
+        if (q) card = { kind: 'question', stepId: s.id, questions: [q], activeQuestionId: q.id };
         else if (!q && this.state.card && this.state.card.stepId === s.id && this.state.card.kind === 'question') {
           // keep the last answered card visible until the step changes (shows the recorded answer)
           card = this.state.card;
@@ -913,12 +1117,27 @@ Reply with exactly one word: YES or NO.`,
         }
         const outcome = String(args.outcome);
         if (!['success', 'partial', 'failure'].includes(outcome)) return this.err('outcome must be success, partial or failure.');
-        const evidence = String(args.evidence ?? '').slice(0, 1000);
+        // Never cut the participant off: hold the outcome (and the "Thanks") until they have finished.
+        if (this.state.mode !== 'manual' && this.rt) {
+          if (!this.wrap) this.openWrapForModel();
+          const w = this.wrap!;
+          if (w.phase !== 'judging') await new Promise<void>((r) => w.waiters.push(r));
+          if (this.step !== s || this.snapshot.taskPhase === 'post' || this.state.ended)
+            return { output: { ...this.brief(), ignored: true, note: 'The task already ended meanwhile. Continue with this brief.' }, respond: false };
+        }
+        const w = this.wrap;
+        const said = w?.heard.join(' ').trim();
+        const ack = w?.ack || 'Thanks.';
+        let evidence = String(args.evidence ?? '').slice(0, 1000);
+        if (said && !evidence.includes(said.slice(0, 40))) evidence = `${evidence} Participant's own words at the end: "${said.slice(0, 400)}"`;
         // Deterministic rules override the AI judgement.
         const ruleHit = await this.checkRulesNow(s);
         if (ruleHit) this.endTask('success', 'rule', `Rule matched: ${ruleHit}. AI judgement: ${outcome} — ${evidence}`);
         else this.endTask(outcome as TaskOutcome, 'ai', evidence);
-        return { output: { ...this.brief(), note: 'Outcome recorded. Never tell the participant the outcome.' }, respond: true };
+        if (this.state.mode === 'manual' || !this.rt) return { output: { ...this.brief(), note: 'Outcome recorded. Never tell the participant the outcome.' }, respond: true };
+        // The runner says the acknowledgement and the next text itself (no improvised "Thanks" too early).
+        this.announceTaskEnd('The task outcome is recorded. Never tell the participant the outcome or imply success or failure.', ack, true, evidence.slice(0, 500));
+        return { output: { ok: true, note: 'Outcome recorded. Never tell the participant the outcome. The next instruction tells you what to say.' }, respond: false };
       }
 
       case 'log_observation': {
@@ -1019,14 +1238,16 @@ Reply with exactly one word: YES or NO.`,
       return this.err(`Question "${q.id}" has not been asked yet — your reading of it was interrupted.`, `Ask it now, verbatim: "${q.prompt}", then wait for the answer. Do not record what the participant said before it.`);
     if (onScreenForm && this.questionnaireSubmitted) return this.err('The questionnaire was already submitted.', 'Follow the current brief.');
     const prevAns = this.state.answers[akey(s.id, q.id)];
-    // Follow-up enrichment: keep the earlier value/choices when only text is added.
-    const parsed = this.validateAnswer(q, { text: args.text, value: args.value ?? prevAns?.value, choices: args.choices ?? prevAns?.choices });
-    if ('error' in parsed) return this.err(parsed.error, `Expected: ${describeScale(q) ?? 'free text'}`);
+    // "I don't know" is valid for every kind of question; asked twice already → keep what they said.
+    const parsed = parseRecordAnswer(q, args, { timesAsked: this.askCounts.get(akey(s.id, q.id)) ?? 0, prev: prevAns });
+    if ('error' in parsed)
+      return this.err(parsed.error, `Expected: ${describeScale(q) ?? 'free text'}. If the participant does not know, is not sure or did not see it, call record_answer with declined: true and their words in text.`);
     const prev = this.state.answers[akey(s.id, q.id)];
     // A follow-up enrichment keeps the earlier numeric value unless a new one is given.
     const merged: AnswerValue = {
       ...(prev ?? {}),
       ...parsed,
+      declined: parsed.declined ? true : undefined,
       text: parsed.text && prev?.text && !parsed.text.includes(prev.text) && args.value == null ? `${prev.text} — ${parsed.text}` : parsed.text ?? prev?.text,
       source: prev?.source === 'screen' && parsed.value == null && !parsed.choices ? 'screen' : this.state.mode === 'text' ? 'text' : 'voice',
     };
@@ -1034,44 +1255,6 @@ Reply with exactly one word: YES or NO.`,
     // On-screen questionnaire answered aloud: the card shows it; stay quiet while they fill in the rest.
     if (onScreenForm) return { output: { ok: true, recorded: q.id, note: 'Recorded and shown on screen. Say nothing; let them continue.' }, respond: false };
     return { output: { ...this.brief(), recorded: q.id, acknowledge: 'Begin your next turn with a brief neutral acknowledgement in the session language (like "Thanks." / "Got it."), then continue. Never narrate what you are doing.' }, respond: true };
-  }
-
-  private validateAnswer(q: Question, a: { text?: unknown; value?: unknown; choices?: unknown }): Omit<AnswerValue, 'source'> | { error: string } {
-    const text = typeof a.text === 'string' && a.text.trim() ? a.text.trim().slice(0, 4000) : undefined;
-    let value = typeof a.value === 'number' && isFinite(a.value) ? a.value : typeof a.value === 'string' && a.value.trim() !== '' && isFinite(Number(a.value)) ? Number(a.value) : undefined;
-    let choices = Array.isArray(a.choices) ? a.choices.map(String) : undefined;
-    switch (q.kind) {
-      case 'rating': {
-        const sc = q.scale ?? { min: 1, max: 5 };
-        if (value == null) return { error: 'A numeric value from the scale is required.' };
-        if (value < sc.min || value > sc.max) return { error: `Value must be between ${sc.min} and ${sc.max}.` };
-        const st = sc.step ?? 1;
-        value = Math.round((value - sc.min) / st) * st + sc.min;
-        return { value, text };
-      }
-      case 'number':
-        if (value == null) return { error: 'A number is required.' };
-        return { value, text };
-      case 'yes_no': {
-        if (value == null && choices?.length) value = /^y|^ja|^oui|^s[ií]|^evet/i.test(choices[0]) ? 1 : 0;
-        if (value == null && text) value = /^(yes|yeah|yep|ja|oui|sí|si|evet)\b/i.test(text) ? 1 : /^(no|nope|nein|non|hayır)\b/i.test(text) ? 0 : undefined;
-        if (value !== 0 && value !== 1) return { error: 'value must be 1 (yes) or 0 (no).' };
-        return { value, choices: [value ? 'Yes' : 'No'], text };
-      }
-      case 'single_choice':
-      case 'multi_choice': {
-        const opts = q.options ?? [];
-        if (!choices?.length && value != null && opts[value]) choices = [opts[value]];
-        if (!choices?.length) return { error: `choices is required. Options: ${opts.join(' | ')}` };
-        const mapped = choices.map((c) => opts.find((o) => o.toLowerCase().trim() === c.toLowerCase().trim()) ?? opts.find((o) => o.toLowerCase().includes(c.toLowerCase().trim())));
-        if (mapped.some((m) => !m)) return { error: `Choices must be exact option labels: ${opts.join(' | ')}` };
-        if (q.kind === 'single_choice' && mapped.length > 1) return { error: 'Only one choice allowed.' };
-        return { choices: mapped as string[], value: opts.indexOf(mapped[0]!), text };
-      }
-      default:
-        if (!text) return { error: 'text is required for open questions (the participant’s answer in their own words).' };
-        return { text };
-    }
   }
 
   private storeAnswer(stepId: string, q: Question, a: AnswerValue) {
@@ -1083,6 +1266,7 @@ Reply with exactly one word: YES or NO.`,
       ...(a.text != null ? { text: a.text } : {}),
       ...(a.value != null ? { value: a.value } : {}),
       ...(a.choices ? { choices: a.choices } : {}),
+      ...(a.declined ? { declined: true } : {}),
       source: a.source,
       at: Date.now(),
     });
@@ -1139,14 +1323,215 @@ Reply with exactly one word: YES or NO.`,
       });
       return;
     }
+    this.startWrapUp('button');
+  }
+
+  // ── "I'm done" wrap-up window ─────────────────────────────────────────────
+  /**
+   * Open the wrap-up: ask how it went (unless they just delivered what a tell/explain task asked
+   * for), then wait until the participant has finished answering before the outcome is judged.
+   */
+  private startWrapUp(source: 'button' | 'verbal' | 'delivered', delivered?: string) {
+    const s = this.step;
+    const rt = this.rt;
+    if (s?.type !== 'task' || this.state.taskPhase === 'post' || this.wrap || !rt) return;
+    if (this.state.taskPhase === 'briefing') this.activateTask('interaction');
+    const now = performance.now();
+    const ask = source !== 'delivered';
     this.doneRequested = true;
-    this.applyTurnDetection();
+    this.wrap = {
+      source,
+      phase: ask ? 'asking' : 'listening',
+      openedAt: now,
+      listenFrom: now,
+      questionHeard: false,
+      askSent: !ask,
+      heard: delivered ? [delivered] : [],
+      lastHeardAt: delivered ? now : 0,
+      typed: false,
+      transcriptPending: false,
+      judgeAt: 0,
+      judgeRequests: 0,
+      waiters: [],
+      ack: 'Thanks.',
+    };
     this.set({ pendingAction: 'done' });
-    this.rt.addSystemItem(
-      '[EVENT] The participant pressed the "I\'m done" button for this task. Ask once, neutrally, how they feel it went (e.g. "How do you feel that went?"). After their answer, call set_task_outcome with your honest judgement against the hidden success criteria. Do not reveal whether they succeeded.',
+    this.queue.push('observation', { kind: 'wrap_up', source });
+    rt.cancelClassifications();
+    this.applyTurnDetection();
+    if (ask) {
+      rt.cancelResponse();
+      rt.addSystemItem(
+        `[EVENT] The participant ${source === 'button' ? 'pressed the "I\'m done" button' : 'said they are done'} with this task. The system now asks how it went and waits until they have finished answering. Do NOT call set_task_outcome and do not say "Thanks" until the system tells you to.`,
+      );
+      if (!rt.userSpeaking) this.askHowItWent();
+    }
+    if (!this.wrapTimer) this.wrapTimer = setInterval(() => this.checkWrapUp(), 250);
+  }
+
+  private askHowItWent() {
+    if (!this.wrap || this.wrap.askSent) return;
+    this.wrap.askSent = true;
+    this.wrap.openedAt = performance.now();
+    const en = (this.mod.language ?? 'en').toLowerCase().startsWith('en');
+    this.directed(en ? 'Ask exactly this, neutrally: "How do you feel that went?" Say nothing else.' : `Ask once, neutrally and briefly in ${languageName(this.mod.language)}, how they feel the task went. Say nothing else.`);
+  }
+
+  /** The model called set_task_outcome on its own: hold it until the participant has finished talking. */
+  private openWrapForModel() {
+    const now = performance.now();
+    const last = this.transcriptLog.filter((l) => l.role === 'participant').at(-1)?.text;
+    const recent = now - this.lastUserSpeech < 15_000;
+    this.doneRequested = true;
+    this.wrap = {
+      source: 'model',
+      phase: 'listening',
+      openedAt: now,
+      listenFrom: now,
+      questionHeard: true,
+      askSent: true,
+      heard: recent && last ? [last] : [],
+      lastHeardAt: recent ? this.lastUserSpeech : 0,
+      typed: false,
+      transcriptPending: Boolean(this.rt?.userSpeaking),
+      judgeAt: 0,
+      judgeRequests: 0,
+      waiters: [],
+      ack: 'Thanks.',
+    };
+    this.set({ pendingAction: 'done' });
+    this.applyTurnDetection();
+    if (!this.wrapTimer) this.wrapTimer = setInterval(() => this.checkWrapUp(), 250);
+  }
+
+  private onWrapUtterance(text: string, typed: boolean) {
+    const w = this.wrap;
+    if (!w) return;
+    // The end of what they were saying when they pressed "I'm done" — not the answer to a question
+    // that has not been asked yet.
+    if (w.phase === 'asking' && !w.askSent) return;
+    w.heard.push(text);
+    w.lastHeardAt = performance.now();
+    w.typed = typed;
+    w.transcriptPending = false;
+    // They spoke before the question finished (or instead of waiting for it): count it as the answer.
+    if (w.phase === 'asking') {
+      w.phase = 'listening';
+      w.listenFrom = performance.now();
+    }
+  }
+
+  /** Close the wrap-up window and release any held tool call. */
+  private endWrap() {
+    const w = this.wrap;
+    this.wrap = null;
+    if (this.wrapTimer) clearInterval(this.wrapTimer);
+    this.wrapTimer = null;
+    w?.waiters.splice(0).forEach((r) => r());
+  }
+
+  /** Has the participant finished answering? Then judge the outcome (or release the held call). */
+  private checkWrapUp() {
+    const w = this.wrap;
+    const rt = this.rt;
+    const s = this.step;
+    if (!w || !rt || s?.type !== 'task' || this.state.taskPhase === 'post' || this.disposed) return this.endWrap();
+    const now = performance.now();
+    if (w.phase === 'asking') {
+      // Don't talk over them: the question waits until they have stopped speaking.
+      if (!w.askSent) {
+        if (!rt.userSpeaking && now - this.lastUserSpeech > 700) this.askHowItWent();
+        return;
+      }
+      // The question never got spoken (e.g. a dropped response): listen anyway.
+      if (now - w.openedAt > 15_000) {
+        w.phase = 'listening';
+        w.listenFrom = now;
+      }
+      return;
+    }
+    if (w.phase === 'judging') {
+      if (now - w.judgeAt < 12_000) return;
+      if (w.judgeRequests < 2) return this.requestJudgement();
+      // The model never judged: record a neutral fallback and move on.
+      this.queue.push('observation', { kind: 'wrap_up_no_judgement' });
+      const ack = w.ack;
+      this.endTask('partial', 'ai', `No AI judgement was received after the participant finished. Participant's words: "${w.heard.join(' ').slice(0, 300)}"`);
+      this.announceTaskEnd('The task is over. Never tell the participant the outcome.', ack);
+      return;
+    }
+    // listening
+    const d = wrapUpDecision({
+      source: w.source,
+      heard: w.heard,
+      typed: w.typed,
+      now,
+      listenFrom: w.listenFrom,
+      lastHeardAt: w.lastHeardAt,
+      lastUserSpeech: this.lastUserSpeech,
+      userSpeaking: rt.userSpeaking,
+      transcriptPending: w.transcriptPending,
+    });
+    if (!d.ready) return;
+    const answered = d.answered;
+    w.ack = d.ack;
+    this.queue.push('observation', { kind: 'wrap_up_answered', answered, waitedMs: Math.round(now - w.listenFrom) });
+    if (w.waiters.length) {
+      // A set_task_outcome call is already waiting: release it.
+      w.phase = 'judging';
+      w.judgeAt = now;
+      w.waiters.splice(0).forEach((r) => r());
+      return;
+    }
+    this.requestJudgement();
+  }
+
+  /** Ask the model (tool forced, nothing spoken) for its judgement now that the participant has finished. */
+  private requestJudgement() {
+    const w = this.wrap;
+    const rt = this.rt;
+    if (!w || !rt) return;
+    w.phase = 'judging';
+    w.judgeAt = performance.now();
+    w.judgeRequests++;
+    const said = w.heard.join(' ').trim();
+    const what =
+      w.source === 'delivered'
+        ? `The participant has told you what the task asked for${said ? `: "${said}"` : ''}, and has finished talking.`
+        : said
+          ? `The participant has finished answering how it went: "${said}".`
+          : 'The participant did not answer how it went.';
+    this.lastDirectedAt = performance.now();
+    rt.requestResponse(
+      `${buildModeratorInstructions(this.protocol, this.steps)}\n\n# NOW\n${what} Call set_task_outcome now with your honest judgement against the hidden success criteria (evidence: the observed app activity first, then what they said). Do not say anything.`,
+      w.judgeRequests > 1 ? undefined : { type: 'function', name: 'set_task_outcome' },
+      true, // text only: the judgement turn must never be audible
     );
-    this.rt.cancelResponse();
-    this.rt.requestResponse();
+  }
+
+  /**
+   * "Never ask the same question more than twice": once a question has been read out twice and the
+   * participant replies again without a recordable answer, the moderator must record what they said.
+   */
+  private guardRepeatedQuestion() {
+    const s = this.step;
+    const q = s && this.state.index >= 0 && s.type !== 'instruction' ? this.nextQuestion() : null;
+    if (!s || !q || !this.rt || (s.type === 'questionnaire' && questionnaireOnScreen(s))) return;
+    const k = akey(s.id, q.id);
+    if ((this.askCounts.get(k) ?? 0) < 2) return;
+    if (this.repeatGuard) clearTimeout(this.repeatGuard);
+    this.repeatGuard = setTimeout(() => {
+      this.repeatGuard = null;
+      const rt = this.rt;
+      if (!rt || this.step !== s || this.nextQuestion()?.id !== q.id || this.state.answers[k]) return;
+      this.queue.push('observation', { kind: 'question_repeat_guard', questionId: q.id });
+      rt.cancelResponse();
+      this.lastDirectedAt = performance.now();
+      rt.requestResponse(
+        `${buildModeratorInstructions(this.protocol, this.steps)}\n\n# NOW\nYou have already asked question "${q.id}" twice. Do not ask it again. Call record_answer for question_id "${q.id}" now with what the participant said in their own words (declined: true if they did not know, did not see it or did not really answer).`,
+        { type: 'function', name: 'record_answer' },
+      );
+    }, 1500);
   }
 
   /** "Skip task" button. */
@@ -1173,6 +1558,8 @@ Reply with exactly one word: YES or NO.`,
     }
     if (!this.rt) return;
     this.rt.addUserText(t);
+    // Typed answer to "How do you feel that went?": the wrap-up decides when to move on.
+    if (this.wrap) return this.onWrapUtterance(t, true);
     this.rt.requestResponse();
   }
 
@@ -1199,6 +1586,21 @@ Reply with exactly one word: YES or NO.`,
       }
     }
     this.enterStep(idx + 1, 'announce');
+  }
+
+  /** "I'm not sure" on a question card: a valid answer for every kind of question (stored as declined). */
+  declineFromScreen(stepId: string, q: Question) {
+    const s = this.step;
+    if (!s || s.id !== stepId || this.state.answers[akey(stepId, q.id)]) return;
+    const wasCurrent = this.nextQuestion()?.id === q.id;
+    this.storeAnswer(stepId, q, { text: "I'm not sure", declined: true, source: 'screen' });
+    if (this.state.mode === 'manual') return this.refreshManualPrompt();
+    if (!this.rt || !wasCurrent) return;
+    this.rt.cancelResponse();
+    this.rt.addSystemItem(
+      `[EVENT] The participant pressed "I'm not sure" on screen for question_id "${q.id}" ("${q.prompt}"). It is recorded as their answer (declined) — do not call record_answer for it and do not ask it again. Say a brief neutral acknowledgement ("Okay.") and go straight on with the brief below.\n[STEP] ${JSON.stringify(this.brief())}`,
+    );
+    this.rt.requestResponse();
   }
 
   /** Manual mode: skip current (optional) question. */
@@ -1476,7 +1878,8 @@ Reply with exactly one word: YES or NO.`,
     this.opts.eye?.setSuspended(!this.state.appVisible);
     // Time limit
     // (Let the participant finish their sentence first — up to 8 s past the limit.)
-    if (s?.type === 'task' && this.state.taskPhase === 'active' && this.state.taskDeadline && now >= this.state.taskDeadline && this.state.appStatus !== 'crashed' && (!this.rt?.userSpeaking || now - this.state.taskDeadline > 8000)) {
+    // (An open "I'm done" answer window is finished first — it has its own cap.)
+    if (s?.type === 'task' && this.state.taskPhase === 'active' && !this.wrap && this.state.taskDeadline && now >= this.state.taskDeadline && this.state.appStatus !== 'crashed' && (!this.rt?.userSpeaking || now - this.state.taskDeadline > 8000)) {
       this.endTask('timeout', 'rule', `Time limit of ${s.timeLimitSec}s reached.`);
       this.announceTaskEnd('The time limit for this task was reached. Say neutrally that we will stop this task there and move on (e.g. "Let\'s stop this one here."). No judgement, never imply failure.', "Let's stop this one here.");
       return;
@@ -1662,7 +2065,10 @@ Reply with exactly one word: YES or NO.`,
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
+    this.pacer?.dispose();
     this.clearStepTimers();
+    this.endWrap();
+    if (this.repeatGuard) clearTimeout(this.repeatGuard);
     if (this.helloTimer) clearTimeout(this.helloTimer);
     this.timers.forEach(clearInterval);
     this.rt?.close();
@@ -1674,6 +2080,6 @@ Reply with exactly one word: YES or NO.`,
 
   /** Debug/test hook. */
   debug() {
-    return { brief: this.brief(), quiet: this.quiet, rt: this.rt?.status, events: this.queue.log.length };
+    return { brief: this.brief(), quiet: this.quiet, rt: this.rt?.status, events: this.queue.log.length, captionRate: this.pacer?.rate };
   }
 }

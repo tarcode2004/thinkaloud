@@ -652,7 +652,8 @@ function AnswersPanel({ d }: { d: Detail }) {
                               {p?.max ? <span className="text-tertiary">/{p.max}</span> : null}
                             </span>
                           )}
-                          {a.choices?.join(', ')}
+                          {!a.declined && a.choices?.join(', ')}
+                          {a.declined && <span className="mr-2 text-secondary">Declined</span>}
                           {a.text && <span className="leading-relaxed">“{a.text}”</span>}
                         </div>
                       </div>

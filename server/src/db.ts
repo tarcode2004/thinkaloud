@@ -150,6 +150,7 @@ const MIGRATIONS: string[] = [
   );
   `,
   /* 2 */ `ALTER TABLE variants ADD COLUMN app_params TEXT NOT NULL DEFAULT '';`,
+  /* 3 */ `ALTER TABLE answers ADD COLUMN declined INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 db.exec('CREATE TABLE IF NOT EXISTS _migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)');

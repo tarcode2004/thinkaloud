@@ -7,6 +7,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import {
   REALTIME_VOICES,
+  languageName,
   newId,
   type Protocol,
   type PublicLinkInfo,
@@ -285,6 +286,7 @@ const AnswerData = z.object({
   text: z.string().max(20_000).optional(),
   value: z.number().optional(),
   choices: z.array(z.string().max(1000)).max(100).optional(),
+  declined: z.boolean().optional(),
   source: z.enum(['voice', 'screen', 'text']).default('screen'),
   at: z.number().optional(),
 });
@@ -304,9 +306,9 @@ export function ingestEvents(sessionId: string, rawEvents: unknown[]): { accepte
        WHERE task_results.source != 'researcher'`,
     );
     const upsertAnswer = db.prepare(
-      `INSERT INTO answers (session_id, step_id, question_id, text, value, choices, source, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO answers (session_id, step_id, question_id, text, value, choices, source, at, declined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (session_id, step_id, question_id) DO UPDATE SET text = excluded.text, value = excluded.value,
-         choices = excluded.choices, source = excluded.source, at = excluded.at`,
+         choices = excluded.choices, source = excluded.source, at = excluded.at, declined = excluded.declined`,
     );
     for (const raw of rawEvents) {
       const p = EventSchema.safeParse(raw);
@@ -345,7 +347,7 @@ export function ingestEvents(sessionId: string, rawEvents: unknown[]): { accepte
         const sid = stepId ?? (d.success ? d.data.stepId : undefined);
         if (d.success && sid) {
           const x = d.data;
-          upsertAnswer.run(sessionId, sid, x.questionId, x.text ?? null, x.value ?? null, x.choices ? json.str(x.choices) : null, x.source, Math.round(x.at ?? e.at));
+          upsertAnswer.run(sessionId, sid, x.questionId, x.text ?? null, x.value ?? null, x.choices ? json.str(x.choices) : null, x.source, Math.round(x.at ?? e.at), x.declined ? 1 : 0);
         }
       } else if (e.kind === 'eyetracking.calibrated') {
         const err = Number(e.data.errorPx);
@@ -415,6 +417,17 @@ function primaryLanguage(lang: string | undefined): string {
   return /^[a-z]{2,3}$/.test(l) ? l : 'en';
 }
 
+/** Realtime input-transcription settings for a session language. */
+export function transcriptionConfig(lang: string | undefined): { model: string; language: string; prompt: string } {
+  const language = primaryLanguage(lang);
+  const name = languageName(language);
+  return {
+    model: config.transcribeModel,
+    language,
+    prompt: `A usability-test participant thinking aloud in ${name} while using a website. Transcribe only clearly spoken ${name} words; leave background noise untranscribed.`,
+  };
+}
+
 participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
   const row = sessionFor(req);
   if (!config.openaiKey) throw new HttpError(503, 'Voice moderation is not configured on this server (missing OPENAI_API_KEY)');
@@ -427,12 +440,15 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
   const wanted = protocol?.moderation.voice;
   const voice = wanted && (REALTIME_VOICES as readonly string[]).includes(wanted) ? wanted : config.realtimeVoice;
   const model = config.realtimeModel;
+  // Input transcription is pinned to the session language (plus a short context prompt): without it,
+  // background noise gets "transcribed" as fragments in other languages.
+  const transcription = transcriptionConfig(protocol?.moderation.language);
   const session = {
     type: 'realtime',
     model,
     audio: {
       input: {
-        transcription: { model: config.transcribeModel, language: primaryLanguage(protocol?.moderation.language) },
+        transcription,
         noise_reduction: { type: 'near_field' },
         turn_detection: { type: 'semantic_vad', eagerness: 'low', create_response: true, interrupt_response: true },
       },
@@ -469,7 +485,7 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
   const j = (await r.json()) as { value?: string; expires_at?: number; client_secret?: { value?: string; expires_at?: number } };
   const value = j.value ?? j.client_secret?.value;
   if (!value) throw new HttpError(502, 'Voice service returned no key');
-  const out: RealtimeTokenResponse = { value, expiresAt: Number(j.expires_at ?? j.client_secret?.expires_at ?? 0), model, voice };
+  const out: RealtimeTokenResponse = { value, expiresAt: Number(j.expires_at ?? j.client_secret?.expires_at ?? 0), model, voice, transcription };
   res.json(out);
 });
 

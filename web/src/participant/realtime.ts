@@ -22,12 +22,14 @@ export interface RealtimeHandlers {
   onUserSpeechStart?: () => void;
   onUserSpeechStop?: () => void;
   onUserTranscriptDelta?: (itemId: string, delta: string) => void;
-  onUserTranscript?: (itemId: string, text: string) => void;
+  /** `logprobs`: transcription token log-probabilities when the session includes them. */
+  onUserTranscript?: (itemId: string, text: string, logprobs?: unknown) => void;
   onAssistantTranscriptDelta?: (responseId: string, delta: string) => void;
   /** `phase`: gpt-realtime-2 marks spoken preambles as 'commentary' and the actual reply as 'final_answer'. */
   onAssistantTranscript?: (responseId: string, text: string, phase?: string) => void;
-  onAssistantAudioStart?: () => void;
-  onAssistantAudioStop?: () => void;
+  onAssistantAudioStart?: (responseId?: string) => void;
+  /** `cleared`: playback was cut (interruption); `byClient`: we asked for the clear (not the server's VAD). */
+  onAssistantAudioStop?: (responseId: string | undefined, cleared: boolean, byClient: boolean) => void;
   onResponseStart?: () => void;
   onResponseDone?: (status: string) => void;
   /** Called after a (re)connect once the data channel is open — send session.update + context here. */
@@ -37,6 +39,10 @@ export interface RealtimeHandlers {
 }
 
 export type ServerEvent = { type: string; [k: string]: unknown };
+
+/** `none` = speak only; `{type:'function', name}` = must call exactly this tool. */
+export type ToolChoice = 'none' | { type: 'function'; name: string };
+type CreateReq = { instructions?: string; toolChoice?: ToolChoice; textOnly?: boolean; retried?: boolean };
 
 export interface RealtimeOptions {
   getToken: () => Promise<RealtimeTokenResponse>;
@@ -51,11 +57,20 @@ export class RealtimeClient {
   model = '';
   voice = '';
   remoteStream: MediaStream | null = null;
+  /** Input-transcription settings from the token (language-pinned). */
+  transcription: RealtimeTokenResponse['transcription'] | null = null;
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
   private seenCalls = new Set<string>();
   private activeResponse = false;
-  private wantResponse: { instructions?: string; toolChoice?: 'none' } | null = null;
+  private wantResponse: CreateReq | null = null;
+  /** The last response.create we sent (re-sent if the server rejects it as "already has an active response"). */
+  private lastCreate: CreateReq | null = null;
+  /** In-band responses the server created and has not finished yet. */
+  private liveResponses = new Set<string>();
+  /** Out-of-band (classification) responses still running on the server. */
+  private liveOob = new Set<string>();
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingCallOutputs = 0;
   private respondAfterCalls = false;
   private reconnects = 0;
@@ -91,6 +106,7 @@ export class RealtimeClient {
     const token = await this.opts.getToken();
     this.model = token.model;
     this.voice = token.voice;
+    this.transcription = token.transcription ?? null;
     const pc = new RTCPeerConnection();
     this.pc = pc;
     pc.ontrack = (e) => {
@@ -206,6 +222,10 @@ export class RealtimeClient {
     for (const o of this.oob.values()) o.resolve(null);
     this.oob.clear();
     this.oobByResponse.clear();
+    this.liveOob.clear();
+    this.liveResponses.clear();
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
     this.activeResponse = false;
     this.assistantAudioPlaying = false;
     try {
@@ -238,14 +258,19 @@ export class RealtimeClient {
       const mine = ++this.createSeq;
       const seenBefore = this.createdSeen;
       setTimeout(() => {
-        if (mine === this.createSeq && this.createdSeen === seenBefore && this.activeResponse) {
+        if (mine === this.createSeq && this.createdSeen === seenBefore && this.activeResponse && !this.liveResponses.size) {
           this.activeResponse = false;
+          // Re-send it once (it may have been dropped); never loop on a request the server keeps rejecting.
+          if (!this.wantResponse && this.lastCreate && !this.lastCreate.retried) {
+            this.tr('! response.create never acknowledged; retrying once');
+            this.wantResponse = { ...this.lastCreate, retried: true };
+          }
           this.maybeContinue();
         }
-      }, 8000);
+      }, 5000);
     }
-    const e = ev as { type?: string; response?: { instructions?: string; tool_choice?: string } };
-    this.tr(`> ${e.type}${e.response?.tool_choice ? ` tool_choice=${e.response.tool_choice}` : ''}${e.response?.instructions ? ` NOW:${e.response.instructions.split('# NOW').pop()?.slice(0, 60).replace(/\s+/g, ' ')}` : ''}`);
+    const e = ev as { type?: string; response?: { instructions?: string; tool_choice?: unknown } };
+    this.tr(`> ${e.type}${e.response?.tool_choice ? ` tool_choice=${JSON.stringify(e.response.tool_choice)}` : ''}${e.response?.instructions ? ` NOW:${e.response.instructions.split('# NOW').pop()?.slice(0, 60).replace(/\s+/g, ' ')}` : ''}`);
     if (this.dc?.readyState === 'open') this.dc.send(JSON.stringify(ev));
     else if (this.status === 'connecting' || this.status === 'reconnecting') this.outbox.push(ev);
   }
@@ -259,12 +284,15 @@ export class RealtimeClient {
     if (this.dc?.readyState !== 'open') return Promise.resolve(null);
     const id = `ta_oob_${++this.oobSeq}`;
     return new Promise((resolve) => {
-      const timer = setTimeout(() => done(null), timeoutMs);
+      const timer = setTimeout(() => {
+        // Timed out: stop it on the server too, so it never blocks a real response.
+        for (const [rid, oid] of this.oobByResponse) if (oid === id && this.liveOob.has(rid)) this.send({ type: 'response.cancel', response_id: rid });
+        done(null);
+      }, timeoutMs);
       const done = (t: string | null) => {
         clearTimeout(timer);
         if (!this.oob.has(id)) return;
         this.oob.delete(id);
-        for (const [rid, oid] of this.oobByResponse) if (oid === id) this.oobByResponse.delete(rid);
         resolve(t);
       };
       this.oob.set(id, { resolve: done, text: '' });
@@ -298,24 +326,39 @@ export class RealtimeClient {
     this.send({ type: 'conversation.item.create', item: { type: 'message', role: 'system', content: [{ type: 'input_text', text }] } });
   }
 
+  /** Cancel any classification still running (an urgent spoken response must not wait for it). */
+  cancelClassifications() {
+    for (const rid of this.liveOob) this.send({ type: 'response.cancel', response_id: rid });
+    for (const o of [...this.oob.values()]) o.resolve(null);
+  }
+
+  /** Remove an item from the conversation (e.g. a noise transcript the model must not treat as an answer). */
+  deleteItem(itemId: string) {
+    if (itemId) this.send({ type: 'conversation.item.delete', item_id: itemId });
+  }
+
   addUserText(text: string) {
     this.send({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } });
   }
 
   /** Ask the model to respond. Queued until the active response (and pending tool calls) finish. */
-  requestResponse(instructions?: string, toolChoice?: 'none') {
+  requestResponse(instructions?: string, toolChoice?: ToolChoice, textOnly?: boolean) {
     if (this.activeResponse || this.pendingCallOutputs > 0) {
-      this.wantResponse = { instructions: instructions ?? this.wantResponse?.instructions, toolChoice: toolChoice ?? this.wantResponse?.toolChoice };
+      this.wantResponse = instructions
+        ? { instructions, toolChoice, textOnly }
+        : { instructions: this.wantResponse?.instructions, toolChoice: toolChoice ?? this.wantResponse?.toolChoice, textOnly: textOnly ?? this.wantResponse?.textOnly };
       return;
     }
     this.activeResponse = true; // optimistic, avoids double-create races
-    this.sendCreate({ instructions, toolChoice });
+    this.sendCreate({ instructions, toolChoice, textOnly });
   }
 
-  private sendCreate(w: { instructions?: string; toolChoice?: 'none' }) {
+  private sendCreate(w: CreateReq) {
+    this.lastCreate = w;
     const response: Record<string, unknown> = {};
     if (w.instructions) response.instructions = w.instructions;
     if (w.toolChoice) response.tool_choice = w.toolChoice;
+    if (w.textOnly) response.output_modalities = ['text'];
     this.send({ type: 'response.create', ...(Object.keys(response).length ? { response } : {}) });
   }
 
@@ -323,9 +366,21 @@ export class RealtimeClient {
     return this.activeResponse;
   }
 
+  private clearRequestedAt = 0;
+  private truncSeq = 0;
+
   cancelResponse() {
-    if (this.activeResponse) this.send({ type: 'response.cancel' });
-    if (this.assistantAudioPlaying) this.send({ type: 'output_audio_buffer.clear' });
+    if (this.activeResponse || this.liveResponses.size) this.send({ type: 'response.cancel' });
+    if (this.assistantAudioPlaying) {
+      this.clearRequestedAt = performance.now();
+      this.send({ type: 'output_audio_buffer.clear' });
+    }
+  }
+
+  /** Tell the server how much of an assistant item was actually heard (after we cut its playback). */
+  truncate(itemId: string, audioEndMs: number) {
+    if (!itemId) return;
+    this.send({ type: 'conversation.item.truncate', event_id: `ta_trunc_${++this.truncSeq}`, item_id: itemId, content_index: 0, audio_end_ms: Math.max(0, Math.round(audioEndMs)) });
   }
 
   private async runFunctionCall(call: FunctionCall) {
@@ -340,6 +395,16 @@ export class RealtimeClient {
     if (result.respond) this.respondAfterCalls = true;
     this.pendingCallOutputs--;
     this.maybeContinue();
+  }
+
+  private scheduleRetry(ms = 600) {
+    if (this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (this.liveResponses.size) return; // its response.done continues
+      this.activeResponse = false;
+      this.maybeContinue();
+    }, ms);
   }
 
   private maybeContinue() {
@@ -369,23 +434,36 @@ export class RealtimeClient {
     if (ev.type.startsWith('response.')) {
       const oob = this.oobOf(ev);
       if (oob) {
+        const rid = (ev.response as { id?: string } | undefined)?.id ?? (ev.response_id as string | undefined);
+        if (ev.type === 'response.created' && rid) this.liveOob.add(rid);
         if (ev.type === 'response.output_text.delta') oob.o.text += (ev.delta as string) ?? '';
         if (ev.type === 'response.done') {
           const resp = ev.response as { output?: { content?: { text?: string; transcript?: string }[] }[] } | undefined;
           const text = resp?.output?.flatMap((i) => i.content ?? []).map((c) => c.text ?? c.transcript ?? '').join('') || oob.o.text;
           oob.o.resolve(text.trim());
+          if (rid) {
+            this.liveOob.delete(rid);
+            this.oobByResponse.delete(rid);
+          }
+          // A spoken response may have been waiting for this one to finish.
+          this.maybeContinue();
         }
         return;
       }
     }
     switch (ev.type) {
-      case 'response.created':
+      case 'response.created': {
         this.createdSeen++;
+        const rid = (ev.response as { id?: string } | undefined)?.id;
+        if (rid) this.liveResponses.add(rid);
         this.activeResponse = true;
         h.onResponseStart?.();
         break;
+      }
       case 'response.done': {
-        this.activeResponse = false;
+        const rid = (ev.response as { id?: string } | undefined)?.id;
+        if (rid) this.liveResponses.delete(rid);
+        this.activeResponse = this.liveResponses.size > 0;
         const resp = ev.response as { status?: string; output?: { type: string; call_id?: string; name?: string; arguments?: string }[] } | undefined;
         // Function calls may only be reported here (safety net).
         for (const item of resp?.output ?? []) {
@@ -421,7 +499,7 @@ export class RealtimeClient {
         h.onUserTranscriptDelta?.(ev.item_id as string, (ev.delta as string) ?? '');
         break;
       case 'conversation.item.input_audio_transcription.completed':
-        h.onUserTranscript?.(ev.item_id as string, ((ev.transcript as string) ?? '').trim());
+        h.onUserTranscript?.(ev.item_id as string, ((ev.transcript as string) ?? '').trim(), ev.logprobs);
         break;
       case 'response.output_audio_transcript.delta':
       case 'response.output_text.delta':
@@ -435,31 +513,39 @@ export class RealtimeClient {
         break;
       case 'output_audio_buffer.started':
         this.assistantAudioPlaying = true;
-        h.onAssistantAudioStart?.();
+        h.onAssistantAudioStart?.(ev.response_id as string | undefined);
         break;
       case 'output_audio_buffer.stopped':
       case 'output_audio_buffer.cleared':
         if (this.assistantAudioPlaying) {
           this.assistantAudioPlaying = false;
-          h.onAssistantAudioStop?.();
+          const cleared = ev.type === 'output_audio_buffer.cleared';
+          h.onAssistantAudioStop?.(ev.response_id as string | undefined, cleared, cleared && performance.now() - this.clearRequestedAt < 3000);
         }
         break;
       case 'error': {
         const err = ev.error as { message?: string; code?: string; event_id?: string } | undefined;
         const code = err?.code;
+        if (err?.event_id?.startsWith('ta_trunc_')) break; // e.g. the server already truncated it itself
         if (err?.event_id?.startsWith('ta_oob_')) {
           console.warn('[realtime] classification failed', err.message);
           this.oob.get(err.event_id)?.resolve(null);
           break;
         }
         if (code === 'conversation_already_has_active_response') {
-          // Our response.create raced with a VAD-created response: retry after it ends.
-          this.activeResponse = true;
-          this.wantResponse = this.wantResponse ?? {};
+          // Our response.create was rejected: another response (VAD-created, or a classification still
+          // running) is active. Keep what we asked for — including directed instructions — and re-send
+          // it as soon as that response ends. Out-of-band responses never report done to the in-band
+          // scheduler, so also retry on a short timer instead of waiting for the watchdog.
+          this.wantResponse = this.wantResponse ?? this.lastCreate ?? {};
+          this.activeResponse = this.liveResponses.size > 0;
+          this.scheduleRetry();
         } else if (code === 'response_cancel_not_active') {
           /* harmless */
         } else {
           console.warn('[realtime] error', err);
+          // A rejected response.create never produces response.created: don't stay "busy" forever.
+          if (this.activeResponse && !this.liveResponses.size && /response/i.test(`${err?.message ?? ''} ${err?.event_id ?? ''}`)) this.scheduleRetry(1500);
           h.onError?.(err?.message ?? 'Realtime error', code);
         }
         break;

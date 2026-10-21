@@ -352,6 +352,8 @@ export interface Answer {
   value?: number;
   /** Selected option labels for choice questions. */
   choices?: string[];
+  /** The participant did not know / was not sure / did not want to answer (their words are in `text`). */
+  declined?: boolean;
   source: 'voice' | 'screen' | 'text';
   at: Millis;
 }
@@ -600,4 +602,6 @@ export interface RealtimeTokenResponse {
   expiresAt: number;
   model: string;
   voice: string;
+  /** Input transcription settings (re-sent with every client turn-detection update). */
+  transcription?: { model: string; language: string; prompt?: string };
 }

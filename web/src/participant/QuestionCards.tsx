@@ -1,7 +1,7 @@
 // On-screen answer cards. Participants can click OR answer by voice (the AI calls
 // record_answer and the card reflects the recorded value).
 import { useState } from 'react';
-import { Check } from 'lucide-react';
+import { Check, Keyboard } from 'lucide-react';
 import type { Question } from '@thinkaloud/shared';
 import { Button, cn } from '../ui/index.tsx';
 import type { AnswerValue } from './runner.ts';
@@ -169,24 +169,66 @@ function ScaleLabels({ q }: { q: Question }) {
   );
 }
 
-export function QuestionCard({ q, answer, onAnswer, allowOpenInput, voiceMode }: { q: Question; answer?: AnswerValue; onAnswer: (a: Ans) => void; allowOpenInput: boolean; voiceMode: boolean }) {
-  const hint =
-    q.kind === 'open' ? (voiceMode ? 'Answer out loud' : null) : voiceMode ? 'Tap an answer or say it out loud' : null;
+export function QuestionCard({
+  q,
+  answer,
+  onAnswer,
+  onDecline,
+  voiceMode,
+}: {
+  q: Question;
+  answer?: AnswerValue;
+  onAnswer: (a: Ans) => void;
+  /** "I'm not sure": a valid answer to every question (stored as declined). */
+  onDecline?: () => void;
+  voiceMode: boolean;
+}) {
+  const open = q.kind === 'open';
+  // In voice mode the typed answer is optional and tucked away; on screen it is always there.
+  const [typing, setTyping] = useState(!voiceMode);
+  const hint = open ? (voiceMode ? 'Answer out loud' : null) : voiceMode ? 'Tap an answer or say it out loud' : null;
+  const declined = Boolean(answer?.declined);
   return (
     <div
       data-testid="question-card"
+      data-qid={q.id}
       className="w-full max-w-[560px] rounded-[22px] bg-surface p-6 shadow-[0_1px_2px_rgba(0,0,0,.04),0_8px_28px_rgba(0,0,0,.06)] [animation:ta-sheet_.35s_cubic-bezier(.32,.72,0,1)]"
     >
-      <p className="text-[19px] font-semibold leading-snug tracking-[-0.012em] text-label">{q.prompt}</p>
+      <p className="text-[19px] font-semibold leading-snug tracking-[-0.012em] text-label" data-testid="question-prompt">
+        {q.prompt}
+      </p>
       {hint && <p className="mt-1 text-[13px] text-tertiary">{hint}</p>}
-      <div className="mt-5">
-        <AnswerInput q={q} answer={answer} onAnswer={onAnswer} allowOpenInput={allowOpenInput} />
-      </div>
-      {answer && answer.source !== 'screen' && q.kind !== 'open' && (
+      {(!open || typing || (answer?.text && !declined)) && (
+        <div className="mt-5">
+          {open && !typing && answer?.text ? <p className="text-[15px] text-secondary">“{answer.text}”</p> : <AnswerInput q={q} answer={declined ? undefined : answer} onAnswer={onAnswer} allowOpenInput compact={false} />}
+        </div>
+      )}
+      {answer && answer.source !== 'screen' && !open && !declined && (
         <p className="mt-3 flex items-center gap-1.5 text-[13px] text-secondary">
           <span className="size-1.5 rounded-full bg-sys-green" /> Recorded from your voice — tap to change
         </p>
       )}
+      <div className="mt-4 flex items-center justify-between gap-3 border-t border-separator pt-3">
+        {open && voiceMode && !typing ? (
+          <button type="button" onClick={() => setTyping(true)} className="-ml-2 flex h-8 items-center gap-1.5 rounded-full px-2 text-[13px] font-medium text-secondary transition-colors hover:bg-black/5" data-testid="type-answer">
+            <Keyboard className="size-4" strokeWidth={1.75} /> Type your answer
+          </button>
+        ) : (
+          <span />
+        )}
+        {declined ? (
+          <span className="flex items-center gap-1.5 text-[13px] text-secondary" data-testid="declined">
+            <span className="size-1.5 rounded-full bg-tertiary" /> Not sure — that’s fine
+          </span>
+        ) : (
+          onDecline &&
+          !answer && (
+            <button type="button" onClick={onDecline} className="-mr-2 flex h-8 items-center rounded-full px-3 text-[13px] font-medium text-secondary transition-colors hover:bg-black/5" data-testid="decline-question">
+              I’m not sure
+            </button>
+          )
+        )}
+      </div>
     </div>
   );
 }

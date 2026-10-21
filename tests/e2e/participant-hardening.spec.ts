@@ -3,7 +3,7 @@
 //
 //   npx playwright test tests/e2e/participant-hardening.spec.ts
 //
-// Ports: API 4800, app host 4801, Vite 5800 (started automatically if not running), DATA_DIR ./data-hardening.
+// Ports: API 4800, app host 4801, Vite 5800 by default (HARDEN_API_PORT/HARDEN_APP_PORT/HARDEN_WEB_PORT/HARDEN_DATA_DIR override).
 // Participant speech: TTS clips (tests/fixtures) mixed into the fake mic on demand (window.__taSpeak).
 // Conversations are written to tests/e2e/participant-screens/hardening-*.txt for review.
 import { test, expect, chromium, type Browser, type BrowserContext, type Page } from '@playwright/test';
@@ -16,14 +16,20 @@ import { ensureClip, ensureFixtures, clipPath, FAKE_MIC, FIXTURES_DIR } from './
 import { ensureFaceVideo } from './face.fixtures.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
-const API = 'http://localhost:4800';
-const WEB = 'http://localhost:5800';
+// Ports / data dir can be moved (HARDEN_API_PORT, HARDEN_APP_PORT, HARDEN_WEB_PORT, HARDEN_DATA_DIR) so
+// several agents can run the suite side by side.
+const API_PORT = process.env.HARDEN_API_PORT || '4800';
+const APP_PORT = process.env.HARDEN_APP_PORT || '4801';
+const WEB_PORT = process.env.HARDEN_WEB_PORT || '5800';
+const DATA_DIR = process.env.HARDEN_DATA_DIR || './data-hardening';
+const API = `http://localhost:${API_PORT}`;
+const WEB = `http://localhost:${WEB_PORT}`;
 const OUT = path.join(ROOT, 'tests/e2e/participant-screens');
 const CHROME = path.join(os.homedir(), '.cache/ms-playwright/chromium-1234/chrome-linux/chrome');
 
 for (const line of fs.readFileSync(path.join(ROOT, '.env'), 'utf8').split('\n')) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
-  if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+  if (m && !(m[1] in process.env)) process.env[m[1]] = m[2];
 }
 
 // ── servers ──────────────────────────────────────────────────────────────────
@@ -48,14 +54,14 @@ async function ensureServers() {
     procs.push(
       spawn('npx', ['tsx', '--env-file=../.env', 'src/index.ts'], {
         cwd: path.join(ROOT, 'server'),
-        env: { ...process.env, PORT: '4800', APP_HOST_PORT: '4801', APP_HOST_URL: 'http://localhost:4801', PUBLIC_URL: WEB, DATA_DIR: './data-hardening', BUILD_MODE: 'local' },
+        env: { ...process.env, PORT: API_PORT, APP_HOST_PORT: APP_PORT, APP_HOST_URL: `http://localhost:${APP_PORT}`, PUBLIC_URL: WEB, DATA_DIR, BUILD_MODE: 'local' },
         stdio: 'inherit',
       }),
     );
     await waitUp(`${API}/api/health`);
   }
   if (!(await up(`${WEB}/`))) {
-    procs.push(spawn('npx', ['vite', '--port', '5800', '--strictPort'], { cwd: path.join(ROOT, 'web'), env: { ...process.env, PORT: '4800', VITE_NO_HMR: '1' }, stdio: 'inherit' }));
+    procs.push(spawn('npx', ['vite', '--port', WEB_PORT, '--strictPort'], { cwd: path.join(ROOT, 'web'), env: { ...process.env, PORT: API_PORT, VITE_NO_HMR: '1' }, stdio: 'inherit' }));
     await waitUp(`${WEB}/`);
   }
 }
@@ -319,6 +325,14 @@ const CLIPS: Record<string, string> = {
   think_de: 'Okay, ich suche jetzt die Lampe. Ich schaue mal unter Beleuchtung.',
   done_de: 'Ich bin jetzt fertig mit der Aufgabe.',
   went_de: 'Das lief eigentlich ganz gut, ich habe die Lampe schnell gefunden.',
+  // Real-session regressions (tests/fixtures/real-sessions/stacky-P-XKC5).
+  went_part1: 'Well, the interface was kind of, um,',
+  went_part2: 'confusing at first, but I found it with the search in the end.',
+  price_told: 'Okay, here it is. The Aurora desk lamp costs eighty-nine dollars.',
+  no_poster: "Hmm. I don't see any poster.",
+  what_again: 'Sorry, what am I supposed to do again?',
+  annoyed: "Ugh, this is annoying. I really can't find any poster anywhere.",
+  dont_know: "I don't know, I didn't see any.",
 };
 
 test.beforeAll(async () => {
@@ -372,7 +386,7 @@ test('1 · app crash detection: error, freeze and white screen → app.crash, ge
   await expect(page.getByTestId('reload-app')).toHaveCount(0);
 
   // (b) Freeze: the app's main thread never yields → heartbeat lost → app.crash.
-  const frame = page.frames().find((f) => f.url().includes(':4801'))!;
+  const frame = page.frames().find((f) => f.url().includes(`:${APP_PORT}`))!;
   await frame.evaluate(() => setTimeout(() => (document.querySelector('#place-order') as HTMLElement).click(), 50));
   const crash1 = await waitEvent(page, (e) => e.kind === 'app.crash', 15_000, 'app.crash (freeze)');
   console.log('crash 1:', crash1.data);
@@ -1028,5 +1042,191 @@ test('7b · German session: intro in German, think-aloud is not answered, "Ich b
   save('quality-de', evs);
   for (const l of modLines(evs)) expect(l).not.toMatch(/\b(the|and|you|let's|thanks)\b/i); // never switches to English
   void studyId;
+  await context.close();
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Regressions from the real CrossWeave session P-XKC5 (tests/fixtures/real-sessions).
+
+/** Moderator caption on screen vs. how long the moderator's audio has been playing. */
+async function sampleCaptions(page: Page, ms: number) {
+  const out: { words: number; playedSec: number; full: number }[] = [];
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    const x = await page.evaluate(() => {
+      const r = (window as unknown as { __taRunner?: { queue: { now(): number; log: { kind: string; t: number; data: Record<string, unknown> }[] }; snapshot: { captions: { role: string; text: string; final: boolean }[] } } }).__taRunner;
+      if (!r) return null;
+      const log = r.queue.log;
+      const starts = log.filter((e) => e.kind === 'speech.start' && e.data.who === 'moderator');
+      const stops = log.filter((e) => e.kind === 'speech.stop' && e.data.who === 'moderator');
+      const last = starts.at(-1);
+      const playing = Boolean(last && !stops.some((s) => s.t >= last.t));
+      const cap = r.snapshot.captions.filter((c) => c.role === 'moderator').at(-1);
+      return { playing, playedSec: last ? (r.queue.now() - last.t) / 1000 : 0, words: cap ? cap.text.split(/\s+/).filter(Boolean).length : 0, final: Boolean(cap?.final) };
+    });
+    if (x?.playing && !x.final) out.push({ words: x.words, playedSec: x.playedSec, full: 0 });
+    await page.waitForTimeout(150);
+  }
+  return out;
+}
+
+test('8 · "I\'m done": paced captions, the question comes at once, a paused answer is not cut off, silence → "Okay, let\'s continue."', async () => {
+  test.setTimeout(8 * 60_000);
+  const task1 = shopTask({ id: 'task_find', title: 'Find a lamp', instruction: 'Imagine you want a new lamp for your desk. Find the Aurora desk lamp.', startPath: '/', successRules: [], askSEQ: true });
+  const task2 = shopTask({ id: 'task_decor', title: 'Decor', instruction: 'Have a look at the decor section.', startPath: '/', successRules: [], askSEQ: false });
+  const { token, studyId } = await createStudy('Done wrap-up', protocol({ steps: [task1, task2, wrapup], moderation: { probingLevel: 'none' } }));
+  const { context, page } = await newSessionPage(browser);
+  await enterSession(page, token);
+
+  // Captions follow the voice: never more words on screen than could have been spoken.
+  const samples = await sampleCaptions(page, 14_000);
+  console.log('caption samples:', samples.slice(0, 40).map((x) => `${x.playedSec.toFixed(1)}s:${x.words}w`).join(' '));
+  expect(samples.length).toBeGreaterThan(5);
+  for (const x of samples) expect(x.words).toBeLessThanOrEqual(Math.ceil(x.playedSec * 4.5) + 3);
+  const intro = await waitEvent(page, (e) => e.kind === 'transcript.moderator', 60_000, 'intro');
+  const introWords = String(intro.data.text).split(/\s+/).length;
+  // While it was playing, the caption was a growing prefix — not the whole intro at once.
+  expect(samples.some((x) => x.words < introWords * 0.6)).toBe(true);
+  await waitModeratorIdle(page);
+  await speak(page, 'ready');
+  await waitEvent(page, (e) => e.kind === 'moderator.tool' && e.data.name === 'complete_step' && e.data.ok === true, 45_000, 'complete_step after intro');
+
+  const session = page.getByTestId('session');
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 40_000 });
+  await waitModeratorIdle(page);
+  await page.getByTestId('im-done').click();
+  const pressed = await waitEvent(page, (e) => e.kind === 'observation' && e.data.kind === 'participant_done_button', 10_000, 'done button');
+  const ask = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > pressed.t && /how do you feel/i.test(String(e.data.text)), 30_000, 'how did it go');
+  const askStart = (await log(page)).find((e) => e.kind === 'speech.start' && e.data.who === 'moderator' && e.t > pressed.t)!;
+  console.log(`question started ${((askStart.t - pressed.t) / 1000).toFixed(1)}s after the button`);
+  expect(askStart.t - pressed.t).toBeLessThan(6000); // was 17 s in the real session
+  await waitModeratorIdle(page, 800);
+
+  // A paused answer: "Well, the interface was kind of, um," … 3 s … "confusing at first, but …".
+  await speak(page, 'went_part1');
+  await page.waitForTimeout(3000);
+  await speak(page, 'went_part2');
+  const end1 = await waitEvent(page, (e) => e.kind === 'task.end' && e.stepId === 'task_find', 45_000, 'task.end 1');
+  let evs = await log(page);
+  const part2 = evs.find((e) => e.kind === 'transcript.participant' && /confusing|search/i.test(String(e.data.text)));
+  expect(part2, 'second half of the answer transcribed').toBeTruthy();
+  expect(end1.t).toBeGreaterThan(part2!.t); // not judged on the fragment
+  expect(String(end1.data.evidence)).toMatch(/confusing|search/i);
+  // Nothing was said to the participant between the question and the end of their answer.
+  expect(modLines(evs.filter((e) => e.t < part2!.t), ask.t)).toEqual([]);
+  const after1 = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > end1.t, 30_000, 'line after task 1');
+  console.log('after answer:', after1.data.text);
+  save('done-wrapup', await log(page));
+  expect(String(after1.data.text)).not.toMatch(/let'?s continue/i); // they answered: a thank-you, not the no-answer line
+  // SEQ card → click.
+  await expect(page.getByTestId('question-card')).toBeVisible({ timeout: 20_000 });
+  await page.locator('[data-testid=question-card] [data-value="6"]').click();
+
+  // Task 2: done, then silence.
+  await expect(session).toHaveAttribute('data-step', 'task_decor', { timeout: 60_000 });
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 40_000 });
+  await waitModeratorIdle(page);
+  await page.getByTestId('im-done').click();
+  const ask2 = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_decor' && /how do you feel/i.test(String(e.data.text)), 30_000, 'how did it go 2');
+  const end2 = await waitEvent(page, (e) => e.kind === 'task.end' && e.stepId === 'task_decor', 60_000, 'task.end 2');
+  expect(end2.t - ask2.t).toBeGreaterThan(9000); // waited ~10 s for an answer
+  const after2 = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > end2.t, 30_000, 'line after silence');
+  console.log('after silence:', after2.data.text);
+  // No answer → never "Thanks", but the neutral "Okay, let's continue."
+  expect(String(after2.data.text)).not.toMatch(/^thank/i);
+  expect(String(after2.data.text)).toMatch(/^okay,? let'?s continue/i);
+  evs = await log(page);
+  save('done-wrapup', evs);
+  expect(evs.filter((e) => e.kind === 'session.error')).toEqual([]);
+  void studyId;
+  await context.close();
+});
+
+test('9 · verbal completion, plain answers instead of deflection, skip reminder, cards + "I don\'t know" after a skipped task', async () => {
+  test.setTimeout(9 * 60_000);
+  const price = shopTask({ id: 'task_price', title: 'Price', instruction: 'Open the Aurora desk lamp and tell me what it costs.', startPath: '/', successCriteria: 'Says the lamp costs 89.', successRules: [], askSEQ: false });
+  const poster = shopTask({
+    id: 'task_poster',
+    title: 'Posters',
+    instruction: 'Find the poster section of this shop and tell me which poster you like best.',
+    startPath: '/',
+    successCriteria: 'Names a poster (there are none: this tests what people do when something is missing).',
+    successRules: [],
+    askSEQ: false,
+    postTaskQuestions: [
+      { id: 'who', prompt: 'Who do you think designed the posters?', kind: 'open', required: true },
+      { id: 'liked', prompt: 'Did you like the posters?', kind: 'yes_no', required: true },
+    ],
+  });
+  const proto = protocol({
+    steps: [price, poster, wrapup],
+    moderation: { probingLevel: 'none', customRules: ["Never explain what the badges mean; if asked, reply 'What do you think it means?'"] },
+  });
+  const { token, studyId } = await createStudy('Verbal + neutrality', proto);
+  const { context, page } = await newSessionPage(browser);
+  await enterSession(page, token);
+  await passIntro(page);
+  const session = page.getByTestId('session');
+  const app = page.frameLocator('[data-testid=app-frame]');
+
+  // (a) Tell-me task: the spoken answer completes it — no "I'm done" button, no "done".
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 40_000 });
+  await waitModeratorIdle(page);
+  await app.getByRole('link', { name: 'Lighting' }).click();
+  await app.getByRole('link', { name: /Aurora desk lamp/ }).click();
+  await page.waitForTimeout(1500);
+  await speak(page, 'price_told');
+  const end1 = await waitEvent(page, (e) => e.kind === 'task.end' && e.stepId === 'task_price', 45_000, 'task.end by verbal delivery');
+  expect(end1.data.source).toBe('ai');
+  let evs = await log(page);
+  expect(evs.some((e) => e.kind === 'observation' && e.data.kind === 'participant_done_button')).toBe(false);
+
+  // (b) Observation, question about the task, frustration.
+  await expect(session).toHaveAttribute('data-step', 'task_poster', { timeout: 60_000 });
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 40_000 });
+  await waitModeratorIdle(page);
+  const from = (await log(page)).at(-1)!.t;
+  await speak(page, 'no_poster');
+  await page.waitForTimeout(5000);
+  await waitModeratorIdle(page, 1200);
+  await speak(page, 'what_again');
+  const reread = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > from && /poster/i.test(String(e.data.text)), 30_000, 'task re-read');
+  console.log('answer to "what am I supposed to do":', reread.data.text);
+  await waitModeratorIdle(page, 1200);
+  await speak(page, 'annoyed');
+  await page.waitForTimeout(8000);
+  await waitModeratorIdle(page, 1200);
+  evs = await log(page);
+  const lines = modLines(evs, from);
+  console.log('moderator during poster task:', lines);
+  for (const l of lines) expect(l).not.toMatch(/if I weren'?t here|feels natural|what do you think it means/i);
+  expect(lines.some((l) => /skip/i.test(l)) || evs.some((e) => e.kind === 'observation' && e.data.kind === 'skip_reminder')).toBe(true);
+
+  // (c) Skip → every post-task question has a card; "I don't know" is accepted for open and yes/no.
+  await page.getByTestId('skip-task').click();
+  const card = page.getByTestId('question-card');
+  await expect(card).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByTestId('question-prompt')).toHaveText('Who do you think designed the posters?');
+  await expect(page.getByTestId('decline-question')).toBeVisible();
+  await shot(page, 'post-skip-card');
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && /designed the posters/i.test(String(e.data.text)), 30_000, 'open question asked');
+  await waitModeratorIdle(page, 1000);
+  await speak(page, 'dont_know');
+  const a1 = await waitEvent(page, (e) => e.kind === 'answer' && e.data.questionId === 'who', 45_000, 'who answered');
+  expect(a1.data.declined).toBe(true);
+  await expect(page.getByTestId('question-prompt')).toHaveText('Did you like the posters?', { timeout: 30_000 });
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && /like the posters/i.test(String(e.data.text)), 30_000, 'yes/no asked');
+  await waitModeratorIdle(page, 1000);
+  await speak(page, 'dont_know');
+  const a2 = await waitEvent(page, (e) => e.kind === 'answer' && e.data.questionId === 'liked', 45_000, 'liked answered');
+  expect(a2.data.declined).toBe(true);
+  await waitEvent(page, (e) => e.kind === 'step.enter' && e.stepId === 'wrapup', 60_000, 'next step');
+  evs = await log(page);
+  save('verbal-neutral', evs);
+  const failed = evs.filter((e) => e.kind === 'moderator.tool' && e.data.name === 'record_answer' && e.data.ok === false);
+  expect(failed.map((e) => e.data.error)).toEqual([]);
+  for (const prompt of [/designed the posters/i, /like the posters/i]) expect(modLines(evs).filter((l) => prompt.test(l)).length).toBeLessThanOrEqual(2);
+  const d = await lastSession(studyId);
+  expect(d.taskResults.find((r) => r.stepId === 'task_poster')).toMatchObject({ outcome: 'abandoned' });
   await context.close();
 });

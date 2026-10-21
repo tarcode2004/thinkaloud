@@ -22,7 +22,7 @@ const SHOTS = path.join(ROOT, 'tests/e2e/participant-screens');
 // Load .env for OPENAI_API_KEY (fixtures) without extra deps.
 for (const line of fs.readFileSync(path.join(ROOT, '.env'), 'utf8').split('\n')) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
-  if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+  if (m && !(m[1] in process.env)) process.env[m[1]] = m[2];
 }
 
 const procs: ChildProcess[] = [];

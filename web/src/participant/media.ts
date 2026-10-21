@@ -24,6 +24,13 @@ export class LevelMeter {
     this.src.connect(this.analyser);
     this.buf = new Float32Array(this.analyser.fftSize);
   }
+  /** Instantaneous level (0..1), no smoothing and no side effects on `read()`. */
+  raw(): number {
+    this.analyser.getFloatTimeDomainData(this.buf);
+    let sum = 0;
+    for (let i = 0; i < this.buf.length; i++) sum += this.buf[i] * this.buf[i];
+    return Math.min(1, Math.sqrt(sum / this.buf.length) * 6);
+  }
   read(): number {
     this.analyser.getFloatTimeDomainData(this.buf);
     let sum = 0;
