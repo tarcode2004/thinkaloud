@@ -1,0 +1,54 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', 'Inter', system-ui, sans-serif;
+  /* Accent: Apple system blue */
+  --color-brand-50: #eef6ff;
+  --color-brand-100: #dcecff;
+  --color-brand-200: #b9d9ff;
+  --color-brand-300: #84bcff;
+  --color-brand-400: #3d97ff;
+  --color-brand-500: #0071e3;
+  --color-brand-600: #0066cc;
+  --color-brand-700: #0057b0;
+  --color-brand-800: #004a94;
+  --color-brand-900: #003a75;
+  /* Semantic */
+  --color-label: #1d1d1f;
+  --color-secondary: #6e6e73;
+  --color-tertiary: #86868b;
+  --color-canvas: #f5f5f7;
+  --color-surface: #ffffff;
+  --color-fill: #f0f0f2;
+  --color-separator: rgba(0, 0, 0, 0.08);
+  --color-sys-green: #34c759;
+  --color-sys-orange: #ff9f0a;
+  --color-sys-red: #ff3b30;
+  --color-sys-yellow: #ffcc00;
+  --color-sys-teal: #30b0c7;
+  --color-sys-indigo: #5856d6;
+  --color-sys-pink: #ff2d55;
+  --ease-apple: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+html, body { min-height: 100%; }
+#root { min-height: 100vh; }
+body { @apply bg-canvas text-label antialiased; font-feature-settings: 'ss01', 'cv11'; -webkit-font-smoothing: antialiased; }
+.material { @apply bg-white/72 backdrop-blur-xl backdrop-saturate-[1.8] border-separator; }
+.material-dark { @apply bg-black/55 backdrop-blur-2xl backdrop-saturate-[1.8]; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+
+.prose-ta h1 { @apply text-xl font-semibold mt-4 mb-2; }
+.prose-ta h2 { @apply text-lg font-semibold mt-4 mb-2; }
+.prose-ta h3 { @apply font-semibold mt-3 mb-1; }
+.prose-ta p { @apply my-2 leading-relaxed; }
+.prose-ta ul { @apply list-disc pl-5 my-2 space-y-1; }
+.prose-ta ol { @apply list-decimal pl-5 my-2 space-y-1; }
+.prose-ta strong { @apply font-semibold; }
+.prose-ta a { @apply text-brand-600 underline; }
+.prose-ta code { @apply bg-slate-100 rounded px-1 text-sm; }
+
+@keyframes ta-pulse { 0%,100% { transform: scale(1); opacity: .9 } 50% { transform: scale(1.08); opacity: 1 } }
+
+@keyframes ta-fade { from { opacity: 0 } to { opacity: 1 } }
+@keyframes ta-sheet { from { opacity: 0; transform: translateY(8px) scale(.98) } to { opacity: 1; transform: none } }

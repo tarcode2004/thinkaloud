@@ -1,0 +1,33 @@
+{
+  "name": "@thinkaloud/web",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@rrweb/replay": "^2.1.7",
+    "@thinkaloud/shared": "*",
+    "@types/qrcode": "^1.5.6",
+    "lucide-react": "^1.61.0",
+    "marked": "^16.0.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router": "^7.18.4",
+    "recharts": "^3.10.1",
+    "rrweb-player": "^2.1.7",
+    "webgazer": "^3.5.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.3.5"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "@thinkaloud/probe",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@thinkaloud/shared": "*",
+    "@rrweb/record": "^2.1.7"
+  },
+  "devDependencies": { "vite": "^8.3.5" }
+}

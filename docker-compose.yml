@@ -1,0 +1,12 @@
+services:
+  thinkaloud:
+    build: .
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      BUILD_MODE: local
+    ports: ["4000:4000", "4001:4001"]
+    volumes: ["thinkaloud-data:/data"]
+    restart: unless-stopped
+volumes:
+  thinkaloud-data:

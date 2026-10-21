@@ -1,0 +1,31 @@
+{
+  "name": "thinkaloud",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "server",
+    "web",
+    "probe"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,web,probe -c blue,magenta,yellow \"npm:dev -w server\" \"npm:dev -w web\" \"npm:dev -w probe\"",
+    "build": "npm run build -w probe && npm run build -w web",
+    "start": "npm run start -w server",
+    "typecheck": "tsc -p shared --noEmit && tsc -p server --noEmit && tsc -p web --noEmit && tsc -p probe --noEmit",
+    "test": "npm test -w server",
+    "e2e": "playwright test",
+    "share": "bash scripts/share.sh",
+    "seed": "tsx --env-file-if-exists=.env scripts/seed-demo.ts"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6",
+    "typescript": "~6.0.3",
+    "@playwright/test": "^1.64.1",
+    "@types/node": "^24.0.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
