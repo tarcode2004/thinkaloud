@@ -94,18 +94,22 @@ function clickHandler(e: MouseEvent) {
     emit('app.rage_click', { ...data, count: recentClicks.length });
   }
 
-  // Dead clicks: non-interactive target and nothing happens within ~500ms.
-  if (!interactive && !isSelectingText()) {
+  // Dead clicks: nothing happens (no DOM change, no navigation) after the click — within ~500ms on
+  // a non-interactive target, within ~1s on something that looks clickable (a "button" that does
+  // nothing). Form controls change state without DOM mutations, so they are never dead.
+  if (!isSelectingText() && !(interactive && FORM_CONTROL_RE.test(el.tagName)) && !(interactive && el.closest('label,summary,[contenteditable="true"]'))) {
     const m0 = mutationCount;
     const u0 = urlChangeCount;
     setTimeout(
       safe(() => {
-        if (mutationCount === m0 && urlChangeCount === u0) emit('app.dead_click', data);
+        if (mutationCount === m0 && urlChangeCount === u0 && document.visibilityState === 'visible') emit('app.dead_click', { ...data, ...(interactive ? { interactive: true } : {}) });
       }),
-      500,
+      interactive ? 1000 : 500,
     );
   }
 }
+
+const FORM_CONTROL_RE = /^(INPUT|SELECT|TEXTAREA|OPTION|LABEL|SUMMARY|VIDEO|AUDIO)$/;
 
 function isSelectingText(): boolean {
   try {
@@ -225,6 +229,7 @@ function errorHandler(e: ErrorEvent | Event) {
     return;
   }
   const ee = e as ErrorEvent;
+  setTimeout(safe(() => checkBlank(true)), 300);
   emit('app.error', {
     message: collapse(ee.message || String(ee.error || 'Error'), 500),
     stack: ee.error?.stack ? String(ee.error.stack).slice(0, 2000) : undefined,
@@ -375,6 +380,50 @@ export function flushPoints() {
   const batch = points;
   points = [];
   emit('mouse', { points: batch, vw: window.innerWidth, vh: window.innerHeight, path: currentPath(), scrollX: Math.round(window.scrollX), scrollY: Math.round(window.scrollY) });
+}
+
+// ── White screen (the app tore down its UI, e.g. an unhandled React render error) ──
+let hadContent = false;
+let blankSince = 0;
+let blankReported = false;
+let blankCheckedAt = -1;
+
+function visibleArea(el: Element): number {
+  const r = el.getBoundingClientRect();
+  if (r.width < 2 || r.height < 2) return 0;
+  const cs = getComputedStyle(el);
+  if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) === 0) return 0;
+  return r.width * r.height;
+}
+
+function pageIsBlank(): boolean {
+  const b = document.body;
+  if (!b) return true;
+  if ((b.innerText || '').trim().length > 0) return false;
+  const media = b.querySelectorAll('img,svg,canvas,video,iframe,input,button,textarea,select,embed,object');
+  for (let i = 0; i < media.length && i < 200; i++) if (visibleArea(media[i]) > 400) return false;
+  return true;
+}
+
+/** Called every second: reports `app.crash` once when a page that had content stays blank for ~1.5s. */
+export function checkBlank(force = false) {
+  if (state.paused || document.visibilityState !== 'visible') return;
+  if (!force && mutationCount === blankCheckedAt && !blankSince) return; // nothing changed since the last check
+  blankCheckedAt = mutationCount;
+  const blank = pageIsBlank();
+  const t = now();
+  if (!blank) {
+    hadContent = true;
+    blankSince = 0;
+    blankReported = false;
+    return;
+  }
+  if (!hadContent) return; // still loading, or blank by design
+  if (!blankSince) blankSince = t;
+  if (!blankReported && t - blankSince >= 1500) {
+    blankReported = true;
+    emit('app.crash', { reason: 'blank screen', path: currentPath() });
+  }
 }
 
 // ── Install ─────────────────────────────────────────────────────────────────

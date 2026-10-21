@@ -3,7 +3,7 @@ import { Link } from 'react-router';
 import { ChevronRight } from 'lucide-react';
 import { Bar, BarChart, CartesianGrid, ErrorBar, LabelList, ReferenceLine, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis, ZAxis } from 'recharts';
 import { api } from '../lib/api.ts';
-import { useAsync, timeAgo } from '../lib/hooks.ts';
+import { plural, useAsync, timeAgo } from '../lib/hooks.ts';
 import { FullPageSpinner, cn } from '../ui/index.tsx';
 import { ResultsPage, useResults } from './ResultsRoutes.tsx';
 import { CIBar, Dot, Empty, ExportMenu, OutcomeBar, Panel, SectionTitle, Segmented, Switch } from './components.tsx';
@@ -43,7 +43,7 @@ export default function Overview() {
       title="Results"
       subtitle={
         <span className="tabular-nums">
-          {a.totals.sessions} sessions · {Math.round(a.confidenceLevel * 100)}% confidence intervals · updated {timeAgo(a.generatedAt)}
+          {plural(a.totals.sessions, 'session')} · {Math.round(a.confidenceLevel * 100)}% confidence intervals · updated {timeAgo(a.generatedAt)}
         </span>
       }
       actions={actions}

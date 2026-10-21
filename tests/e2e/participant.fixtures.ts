@@ -12,6 +12,11 @@ export const CLIPS = {
   think: 'Okay, so I need to find a desk lamp. I can see Furniture, Lighting and Decor at the top. Lighting seems like the right place, so I will click that.',
   seq: 'I would say a six. It was pretty easy.',
   interview: 'Honestly, nothing was really confusing. The categories made sense and the add to cart button was easy to find.',
+  // Fern & Co demo shop (tests/e2e/fullloop.spec.ts).
+  explore: 'It looks like a plant shop. There are categories at the top, like indoor plants and pet-friendly, and some bestsellers further down.',
+  think_shop: "Okay, let me have a look. I'll try the pet-friendly section at the top, that seems like the right place, and then open one of the plants.",
+  went_ok: 'I think it went fine. It took me a moment, but I found what I was looking for.',
+  probe_answer: "I mostly looked at the menu at the top first, because that's where I'd expect the categories to be.",
 } as const;
 
 export type ClipName = keyof typeof CLIPS;
@@ -65,7 +70,7 @@ export function writeWav(file: string, w: Wav) {
   fs.writeFileSync(file, Buffer.concat([h, w.data]));
 }
 
-async function tts(text: string): Promise<Buffer> {
+export async function tts(text: string): Promise<Buffer> {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error('OPENAI_API_KEY missing (needed to generate speech fixtures)');
   const res = await fetch('https://api.openai.com/v1/audio/speech', {
@@ -105,6 +110,20 @@ export async function ensureFixtures(): Promise<void> {
     writeWav(FAKE_MIC, { ...w, data: silence });
     console.log('[fixtures] fake-mic.wav written');
   }
+}
+
+/** Extra clips for other specs: `tests/fixtures/<name>.wav`, generated once with TTS. */
+export async function ensureClip(name: string, text: string): Promise<string> {
+  fs.mkdirSync(FIXTURES_DIR, { recursive: true });
+  const file = path.join(FIXTURES_DIR, `${name}.wav`);
+  const meta = `${file}.txt`;
+  if (fs.existsSync(file) && fs.statSync(file).size > 1000 && fs.existsSync(meta) && fs.readFileSync(meta, 'utf8') === text) return file;
+  const w = parseWav(await tts(text));
+  if (w.bits !== 16) throw new Error(`expected 16-bit PCM, got ${w.bits}`);
+  writeWav(file, w);
+  fs.writeFileSync(meta, text);
+  console.log(`[fixtures] ${name}.wav ${(w.data.length / (w.sampleRate * 2)).toFixed(1)}s`);
+  return file;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

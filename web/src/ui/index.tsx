@@ -1,6 +1,6 @@
 // ThinkAloud UI kit. Small, dependency-free, Tailwind-based. Use these everywhere
 // instead of ad-hoc styling so the product feels consistent.
-import { forwardRef, useEffect, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react';
+import { forwardRef, useEffect, useId, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react';
 import { Loader2, X } from 'lucide-react';
 
 export function cn(...parts: (string | false | null | undefined)[]) {
@@ -163,6 +163,7 @@ export function EmptyState({ icon, title, description, action }: { icon?: ReactN
 }
 
 export function Modal({ open, onClose, title, children, footer, width = 'max-w-lg' }: { open: boolean; onClose: () => void; title?: ReactNode; children: ReactNode; footer?: ReactNode; width?: string }) {
+  const titleId = useId();
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
@@ -172,10 +173,10 @@ export function Modal({ open, onClose, title, children, footer, width = 'max-w-l
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4 backdrop-blur-[2px] animate-[ta-fade_.2s_ease-out]" onMouseDown={onClose}>
-      <div className={cn('flex max-h-[90vh] w-full flex-col rounded-[28px] bg-surface shadow-[0_24px_80px_rgba(0,0,0,.25)] animate-[ta-sheet_.35s_cubic-bezier(0.32,0.72,0,1)]', width)} onMouseDown={(e) => e.stopPropagation()}>
+      <div className={cn('flex max-h-[90vh] w-full flex-col rounded-[28px] bg-surface shadow-[0_24px_80px_rgba(0,0,0,.25)] animate-[ta-sheet_.35s_cubic-bezier(0.32,0.72,0,1)]', width)} onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby={title ? titleId : undefined}>
         {title && (
           <div className="flex items-center justify-between px-6 pt-6 pb-2">
-            <h2 className="text-[22px] font-semibold tracking-[-0.02em]">{title}</h2>
+            <h2 id={titleId} className="text-[22px] font-semibold tracking-[-0.02em]">{title}</h2>
             <button onClick={onClose} className="rounded-full bg-fill p-1.5 text-secondary transition-colors hover:bg-black/10" aria-label="Close">
               <X className="size-4" strokeWidth={2.25} />
             </button>

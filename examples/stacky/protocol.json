@@ -1,0 +1,229 @@
+{
+  "schemaVersion": 1,
+  "title": "Stacky Social: related posts & AI provenance (formative)",
+  "researchGoals": [
+    "Can people understand why a related post is relevant without coaching?",
+    "Does the 'Modified by AI' disclosure increase comprehension without implying the original author wrote the added words?",
+    "Can people distinguish the compact contextual edit from the canonical full post?",
+    "Do pagination, loading and empty-related states feel responsive and trustworthy?",
+    "Can people complete ordinary social tasks (like, bookmark, reply) while exploring related posts?"
+  ],
+  "productContext": "Stacky Social (crossweave) is a Mastodon-compatible social reader. The left pane is a feed; the right pane shows 'stacks' of related posts connected to the post being read, with highlighted phrases explaining the relation. Some related posts are compact contextual edits marked 'Modified by AI' with track-changes style green text. Offline research feeds: /ChineseEVs (#ChineseEVs), /AIWorkforce. Likes, bookmarks and replies persist locally.",
+  "intro": "Hi, and thanks for joining! I'm an AI moderator, and I'll guide you through this session. We're testing a social media reading app, not you, so there are no wrong answers. As you use it, please think out loud: tell me what you're looking at, what you're trying to do, and what you expect to happen. Honest reactions, good or bad, help the most. I can't help with the tasks, but you can always say if you'd like to skip one. Ready to begin?",
+  "closing": "That's everything. Thank you so much for your time and your honest thoughts, it really helps the team improve the app. You can close this window now.",
+  "moderation": {
+    "style": "think_aloud_concurrent",
+    "probingLevel": "moderate",
+    "allowClosedQuestions": true,
+    "silencePromptSeconds": 15,
+    "maxProbesPerStep": 2,
+    "probeOnBehavior": true,
+    "language": "en",
+    "voice": "marin",
+    "tone": "warm, calm, curious and strictly neutral",
+    "customRules": [
+      "Never explain what the highlights, stacks or the 'Modified by AI' badge mean; if asked, reply 'What do you think it means?'",
+      "Do not use the words 'related', 'AI-added' or 'original author' before the participant does, except when reading a task or question verbatim."
+    ],
+    "allowTextFallback": true
+  },
+  "consent": {
+    "text": "## Before we start\n\nThanks for helping us improve **Stacky Social**. An **AI moderator** will guide you through a few short activities in a social reading app. **We are testing the app, not you.**\n\n**What we collect**\n- Your voice and a transcript of what you say\n- How you use the app (clicks, scrolling, pages). Text you type, including replies, is masked.\n- Your answers to a few questions\n- Optional: estimated gaze position from your webcam, computed on your device. No video is stored.\n\n**Your rights**\n- Taking part is voluntary. You can stop at any time with **Stop & withdraw** and your data is deleted.\n- Data is used only for this research and identified by a random ID. Voice audio is processed by OpenAI to run the conversation.\n\nBy continuing you confirm you are 18 or older and agree to take part.",
+    "storeAudio": true,
+    "recordScreen": true,
+    "offerEyeTracking": true,
+    "ageGate": true,
+    "version": "stacky-1"
+  },
+  "randomizeTasks": false,
+  "estimatedMinutes": 25,
+  "steps": [
+    {
+      "id": "warmup",
+      "type": "question",
+      "title": "Warm-up",
+      "question": {
+        "id": "warmup_q",
+        "prompt": "To start, how do you usually read discussions on social media, and what kinds of long threads do you follow?",
+        "kind": "open",
+        "required": false,
+        "allowFollowUp": true,
+        "intent": "Segment: frequent social users vs long-thread readers."
+      }
+    },
+    {
+      "id": "t_find",
+      "type": "task",
+      "title": "Find the discussion",
+      "instruction": "Imagine a friend told you there's an interesting discussion about Chinese electric vehicles on this app. Find that discussion.",
+      "startPath": "/home",
+      "successCriteria": "Participant reaches the #ChineseEVs feed.",
+      "successRules": [
+        {
+          "type": "url_matches",
+          "pattern": "^/ChineseEVs"
+        }
+      ],
+      "timeLimitSec": 180,
+      "probes": [
+        "How did you decide where to look?"
+      ],
+      "askSEQ": true
+    },
+    {
+      "id": "t_claim",
+      "type": "task",
+      "title": "Main claim",
+      "instruction": "Look at the post that's in focus at the top of this discussion. In one sentence, tell me what its main claim is. Say 'done' when you've told me.",
+      "startPath": "/ChineseEVs",
+      "successCriteria": "Participant states the focus post's main claim accurately (scored blind later).",
+      "timeLimitSec": 180,
+      "probes": [],
+      "askSEQ": false
+    },
+    {
+      "id": "t_related",
+      "type": "task",
+      "title": "Why is it connected",
+      "instruction": "On the right side you'll see other posts. Pick one that interests you and explain to me how, if at all, it's connected to the post you just summarised.",
+      "successCriteria": "Participant opens/selects a post in the right pane and gives a plausible explanation of the relation (relation-comprehension accuracy scored blind).",
+      "timeLimitSec": 240,
+      "probes": [
+        "What on the screen told you that?",
+        "What did you expect to see when you picked it?"
+      ],
+      "askSEQ": true,
+      "postTaskQuestions": [
+        {
+          "id": "trust_related",
+          "prompt": "How confident are you that the posts on the right are actually connected to the post you were reading?",
+          "kind": "rating",
+          "required": true,
+          "scale": {
+            "min": 1,
+            "max": 7,
+            "minLabel": "Not at all confident",
+            "maxLabel": "Very confident"
+          }
+        }
+      ]
+    },
+    {
+      "id": "t_ai",
+      "type": "task",
+      "title": "AI disclosure",
+      "instruction": "Find a post on the right that is marked as modified by AI. Take a close look at it and tell me which words came from the person who wrote the post and which did not.",
+      "successCriteria": "Participant locates a 'Modified by AI' card, inspects the disclosure, and correctly identifies the AI-added (green) words vs the author's original words.",
+      "successRules": [
+        {
+          "type": "click_matches",
+          "text": "Modified by AI"
+        }
+      ],
+      "timeLimitSec": 240,
+      "probes": [
+        "What makes you say that?"
+      ],
+      "askSEQ": false,
+      "postTaskQuestions": [
+        {
+          "id": "who_green",
+          "prompt": "Who do you think wrote the highlighted green text?",
+          "kind": "open",
+          "required": true,
+          "allowFollowUp": true,
+          "intent": "AI provenance comprehension (target >=80% correct: the AI, not the author)."
+        },
+        {
+          "id": "orig_changed",
+          "prompt": "Was the original post itself changed?",
+          "kind": "yes_no",
+          "required": true,
+          "intent": "Expected: no, only the contextual copy is edited."
+        }
+      ]
+    },
+    {
+      "id": "t_full",
+      "type": "task",
+      "title": "Full post and back",
+      "instruction": "Open that post on its own full page. Find a post it was replying to, and a reply to it. Then go back to where you were before.",
+      "successCriteria": "Participant opens the full post page, identifies an ancestor and a descendant, and returns to the same panel state.",
+      "successRules": [],
+      "timeLimitSec": 300,
+      "probes": [
+        "Is this where you expected to end up?"
+      ],
+      "askSEQ": true
+    },
+    {
+      "id": "t_social",
+      "type": "task",
+      "title": "Like, bookmark, reply",
+      "instruction": "Pick any post you like. Like it, bookmark it, and write a short reply. Then check that all three were saved.",
+      "successCriteria": "Like, bookmark and reply are performed and the participant verifies they persisted (e.g. via Liked / Bookmarks pages).",
+      "timeLimitSec": 300,
+      "probes": [
+        "How could you tell it worked?"
+      ],
+      "askSEQ": true
+    },
+    {
+      "id": "t_more",
+      "type": "task",
+      "title": "Keep reading",
+      "instruction": "Keep scrolling and reading further down the discussion for a little while, and tell me how it feels as more posts load.",
+      "successCriteria": "Participant reaches later feed / related pages (pagination).",
+      "timeLimitSec": 150,
+      "probes": [],
+      "askSEQ": false,
+      "postTaskQuestions": [
+        {
+          "id": "speed",
+          "prompt": "How quick or slow did the app feel as you kept reading?",
+          "kind": "rating",
+          "required": true,
+          "scale": {
+            "min": 1,
+            "max": 7,
+            "minLabel": "Very slow",
+            "maxLabel": "Very fast"
+          }
+        }
+      ]
+    },
+    {
+      "id": "t_empty",
+      "type": "task",
+      "title": "Nothing related",
+      "instruction": "Try to find a post that has nothing shown on the right side. When you find one, tell me what you think is going on and what you'd expect to happen next.",
+      "successCriteria": "Participant finds a post with an empty related panel and does NOT interpret it as a crash (target: zero participants say it's broken).",
+      "timeLimitSec": 240,
+      "probes": [
+        "What would you do now?"
+      ],
+      "askSEQ": false
+    },
+    {
+      "id": "umux",
+      "type": "questionnaire",
+      "title": "UMUX-Lite",
+      "instrument": "UMUX_LITE",
+      "productName": "Stacky",
+      "onScreen": true
+    },
+    {
+      "id": "wrap",
+      "type": "interview",
+      "title": "Preference interview",
+      "goal": "Overall impression of related-post exploration and AI provenance; what to change.",
+      "questions": [
+        "Overall, how would you describe reading discussions this way?",
+        "What, if anything, was confusing about the posts on the right?",
+        "How do you feel about posts being modified by AI in this way?",
+        "If you could change one thing, what would it be?"
+      ],
+      "maxFollowUps": 1
+    }
+  ]
+}

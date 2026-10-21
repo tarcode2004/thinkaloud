@@ -4,7 +4,7 @@
 // Contract: docs/API.md "Probe ↔ wrapper bridge", ProbeToHost/HostToProbe in shared types.
 import type { HostToProbe } from '@thinkaloud/shared';
 import { embedded, emit, flush, onHostMessage, post, state } from './bridge.ts';
-import { flushPoints, installCapture, scrollState, setMouseSampleMs } from './capture.ts';
+import { checkBlank, flushPoints, installCapture, scrollState, setMouseSampleMs } from './capture.ts';
 import { resnapshot, startRecording, stopRecording, flushRrweb } from './recorder.ts';
 import { collapse, currentPath, now, safe, sanitize } from './util.ts';
 
@@ -59,6 +59,18 @@ function hostNavigate(path: string) {
     window.location.hash = '#' + url.pathname + url.search;
     return;
   }
+  // Next.js (app + pages router) exposes its router: a synthetic popstate would make the app
+  // router restore the *old* tree (history.state.__NA) or reload, so use router.push instead.
+  const nextRouter = (window as unknown as { next?: { router?: { push?: (href: string) => unknown } } }).next?.router;
+  if (typeof nextRouter?.push === 'function') {
+    nextRouter.push(target);
+    return;
+  }
+  const st = history.state as { __NA?: boolean } | null;
+  if (st && st.__NA) {
+    window.location.assign(target); // Next app router without a reachable router instance
+    return;
+  }
   history.pushState(history.state, '', target);
   window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
 }
@@ -110,9 +122,59 @@ function installTrackApi() {
   for (const [n, d] of queued) track(n, d);
 }
 
+/**
+ * Hosted by the ThinkAloud app host (tag has data-ta-hosted): disable service workers. A worker
+ * registered by one build keeps serving its cached files after a rebuild on the same origin, and
+ * can bypass the injected probe. register() returns a promise that never settles (no error noise).
+ */
+function disableServiceWorkers() {
+  const sw = navigator.serviceWorker;
+  if (!sw) return;
+  try {
+    sw.getRegistrations?.().then((regs) => regs.forEach((r) => r.unregister()), () => {});
+    const never = new Promise<ServiceWorkerRegistration>(() => {});
+    Object.defineProperty(sw, 'register', { configurable: true, value: () => never });
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Hosted + framed: the study wrapper is often a different site, where Lax/unspecified cookies set
+ * from JS are silently dropped. Rewrite them to SameSite=None; Secure; Partitioned (CHIPS) so apps
+ * that keep state in document.cookie still work inside the frame. Secure contexts only.
+ */
+function partitionDocumentCookies() {
+  if (!window.isSecureContext) return;
+  const desc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
+  if (!desc?.get || !desc.set) return;
+  Object.defineProperty(document, 'cookie', {
+    configurable: true,
+    get() {
+      return desc.get!.call(document);
+    },
+    set(v: string) {
+      let c = String(v);
+      try {
+        if (!(/;\s*samesite\s*=\s*none/i.test(c) && /;\s*partitioned/i.test(c))) {
+          c = c.replace(/;\s*samesite\s*=\s*\w+/gi, '') + '; SameSite=None';
+          if (!/;\s*secure(\s*;|\s*$)/i.test(c)) c += '; Secure';
+          if (!/;\s*partitioned/i.test(c)) c += '; Partitioned';
+        }
+      } catch {
+        c = String(v);
+      }
+      desc.set!.call(document, c);
+    },
+  });
+}
+
 function init() {
   if (window.__THINKALOUD_PROBE__) return; // injected twice (e.g. host injection + snippet)
   window.__THINKALOUD_PROBE__ = VERSION;
+  const hosted = (document.currentScript as HTMLScriptElement | null)?.hasAttribute('data-ta-hosted');
+  if (hosted) safe(disableServiceWorkers)();
+  if (hosted && embedded) safe(partitionDocumentCookies)();
   installTrackApi();
   if (!embedded) return; // top-level window: nothing to talk to
 
@@ -140,7 +202,13 @@ function init() {
     }),
     500,
   );
-  setInterval(safe(() => post({ type: 'heartbeat', at: now(), path: currentPath() })), 1000);
+  setInterval(
+    safe(() => {
+      post({ type: 'heartbeat', at: now(), path: currentPath() });
+      checkBlank();
+    }),
+    1000,
+  );
   window.addEventListener('pagehide', safe(flushAll));
 }
 

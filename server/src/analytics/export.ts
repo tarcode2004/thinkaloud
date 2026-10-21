@@ -1,6 +1,6 @@
 // CSV / JSON export of sessions, tasks, answers and events.
 import type { Step } from '@thinkaloud/shared';
-import { questionnaireItems } from '@thinkaloud/shared';
+import { stepQuestions } from '@thinkaloud/shared';
 import { db } from '../db.ts';
 import { eventFromRow, type Row } from '../lib/repo.ts';
 import { loadAnswers, loadSessions, loadTaskResults, loadVariants } from './data.ts';
@@ -34,12 +34,9 @@ function stepTitles(steps: Step[]) {
   const prompts = new Map<string, string>();
   for (const st of steps) {
     titles.set(st.id, st.title);
-    if (st.type === 'question') prompts.set(`${st.id}:${st.question.id}`, st.question.prompt);
-    if (st.type === 'questionnaire') for (const q of questionnaireItems(st)) prompts.set(`${st.id}:${q.id}`, q.prompt);
-    if (st.type === 'task') {
-      prompts.set(`${st.id}:seq`, 'Overall, how difficult or easy was the task to complete?');
-      for (const q of st.postTaskQuestions ?? []) prompts.set(`${st.id}:${q.id}`, q.prompt);
-    }
+    if (st.type === 'task') prompts.set(`${st.id}:seq`, 'Overall, how difficult or easy was the task to complete?');
+    // stepQuestions covers every step kind, incl. interview questions ("<step>_q1").
+    for (const q of stepQuestions(st)) prompts.set(`${st.id}:${q.id}`, q.prompt);
   }
   return { titles, prompts };
 }

@@ -29,7 +29,7 @@ export default function RecruitPage() {
     }
   };
   const remove = async (l: LinkWithUrl) => {
-    if (l.sessionCount > 0 && !confirm(`${l.sessionCount} participants used this link. Delete it anyway? Their sessions are kept.`)) return;
+    if (l.sessionCount > 0 && !confirm(`${l.sessionCount === 1 ? '1 participant' : `${l.sessionCount} participants`} used this link. Delete it anyway? Their sessions are kept.`)) return;
     try {
       await api.del(`/api/links/${l.id}`);
       update((d) => ({ ...d, links: d.links.filter((x) => x.id !== l.id) }));
@@ -70,7 +70,7 @@ export default function RecruitPage() {
                   </div>
                   <div className="mt-0.5 flex flex-wrap gap-x-3 text-[13px] text-secondary">
                     <span>{v ? `Variant ${v.name}` : 'Auto-balance across variants'}</span>
-                    <span className="tabular-nums">{l.sessionCount}{l.maxParticipants ? ` / ${l.maxParticipants}` : ''} participants</span>
+                    <span className="tabular-nums">{l.sessionCount}{l.maxParticipants ? ` / ${l.maxParticipants}` : ''} {l.sessionCount === 1 && !l.maxParticipants ? 'participant' : 'participants'}</span>
                     {l.expiresAt && <span>{expired ? 'Expired' : 'Expires'} {new Date(l.expiresAt).toLocaleDateString()}</span>}
                     {l.redirectUrl && <span className="max-w-64 truncate">Redirects to {new URL(l.redirectUrl, location.href).host}</span>}
                   </div>

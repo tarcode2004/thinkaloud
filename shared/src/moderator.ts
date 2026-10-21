@@ -76,7 +76,7 @@ export const MODERATOR_TOOLS: RealtimeFunctionTool[] = [
     type: 'function',
     name: 'set_task_outcome',
     description:
-      "Only after the participant says they are done with a task (and you asked how they feel it went): your honest judgement of the outcome against the hidden success criteria. Deterministic success rules override your judgement. Never tell the participant the outcome.",
+      "Only while a task is still in progress, after the participant says they are done with it (and you asked how they feel it went): your honest judgement of the outcome against the hidden success criteria. Never call it once the task has ended (after an [EVENT] that it ended, or when the brief says the outcome is recorded). Deterministic success rules override your judgement. Never tell the participant the outcome.",
     parameters: {
       type: 'object',
       properties: {
@@ -262,10 +262,15 @@ Speak ${lang} only. Keep your turns short: one or two sentences besides the verb
 - If you are unsure what step is active or what to say, call get_current_step. Never make up a question or a task.
 - Each of your turns is ONE short spoken message. Say each sentence ONCE. Never repeat or rephrase a question you just asked in the same turn.
 - When a brief contains "say_verbatim", say that text in your very next turn — never replace it with your own words (this includes the closing text).
-- Call tools silently — never announce them ("let me note that"). When a tool result tells you what to say next, call the tool FIRST and only then speak.
+- Call tools silently — never announce them ("let me note that"). Never narrate what you are doing or about to do ("Let me capture your feedback", "I'll ask a quick follow-up", "Let me think about that", "I'll note that and move on"): the participant only hears the acknowledgement and the next question. When a tool result tells you what to say next, call the tool FIRST and only then speak.
 - If a tool returns ok:false, follow its "hint". Never mention tools, briefs, steps or errors to the participant.
 - Messages starting with [APP] describe what the participant is doing on screen. They are background context only: do not respond to them and never comment on them unless a [TRIGGER] asks you to.
 - If the participant presses a button on screen (e.g. "I'm done", "Skip"), the system tells you with an [EVENT] message.
+
+# Preambles — never
+- Never use preambles and never speak in the commentary channel. Do not announce, summarise or narrate what you are about to do ("Let me quickly wrap this up", "One quick follow-up", "I'll note that", "Let me check") — before a tool call, between tool calls, or before a question.
+- Tool calls are silent and instant. Speak only the final answer: at most a one-word acknowledgement ("Thanks." / "Okay.") followed directly by the next text from the brief.
+- For direct answers, acknowledgements and reading texts, respond immediately; do not reason.
 
 # Moderation rules — follow strictly
 1. Read task instructions and questions VERBATIM. Ask ONE question at a time. Never combine questions, never add your own options or examples.
@@ -317,6 +322,8 @@ export interface BriefContext {
   questionnaireSubmitted?: boolean;
   /** App visible for this step. */
   appVisible?: boolean;
+  /** Notable behaviour observed during the task (rage/dead clicks, backtracking, errors) — asked about after the task. */
+  observedBehaviour?: string[];
 }
 
 function stepHeader(ctx: BriefContext, phase?: string): ModeratorBrief['step'] {
@@ -346,7 +353,7 @@ function questionJob(q: Question, onScreen: boolean, ctx: BriefContext): string 
     q.allowFollowUp !== false && ctx.remainingFollowUps > 0
       ? ` After recording, you may ask at most ONE short open follow-up (e.g. "Tell me more about that.") if the answer is short or vague, then record_answer again with the fuller text.`
       : ' Do not ask follow-up questions.';
-  return `Ask the question in say_verbatim, then wait for the answer. ${fmt} Call record_answer with question_id "${q.id}".${fu} The record_answer result tells you what comes next.`;
+  return `Ask the question in say_verbatim, then wait for the answer. ${fmt} As soon as they answer, call record_answer with question_id "${q.id}" right away, without saying anything first.${fu} The record_answer result tells you what comes next; start that turn with a brief neutral acknowledgement ("Thanks." / "Got it.") and go straight on.`;
 }
 
 export function buildBrief(ctx: BriefContext): ModeratorBrief {
@@ -402,7 +409,7 @@ export function buildBrief(ctx: BriefContext): ModeratorBrief {
           step: stepHeader(ctx),
           say_in_your_words: `Ask the participant to answer the ${items.length === 1 ? 'question' : `${items.length} short questions`} shown on the screen and to press "Submit" when done.`,
           your_job:
-            'Say the transition, then stay completely quiet while they fill it in. Do NOT read items aloud and do NOT comment on their ratings. The system sends an [EVENT] when they submit. Do not call complete_step before that.',
+            `Say the transition, then stay completely quiet while they fill it in. Do NOT read items aloud and do NOT comment on their ratings. If the participant says a rating for an item out loud (e.g. "the first one is a four"), call record_answer silently with that item's question_id and the number — do not say anything. Item ids, in order: ${items.map((q, i) => `${i + 1} = "${q.id}"`).join(', ')}. The system sends an [EVENT] when they submit. Do not call complete_step before that.`,
           ...(def ? { hidden_researcher_notes: { instrument: def.name } } : {}),
         };
       }
@@ -463,12 +470,14 @@ function taskBrief(ctx: BriefContext, step: TaskStep): ModeratorBrief {
     };
   }
   // post-task
+  const outcome = { task_outcome: 'Already recorded by the system. Do NOT call set_task_outcome.' };
   const q = ctx.nextQuestion;
   if (q) {
     const onScreen = questionHasCard(q);
     return {
       ok: true,
       step: stepHeader(ctx, 'post_task'),
+      ...outcome,
       ...questionBrief(ctx, q, onScreen),
       say_in_your_words: (ctx.answeredCount ?? 0) === 0 ? 'A brief neutral acknowledgement such as "Thanks." — never say or imply whether the task was completed successfully.' : undefined,
       your_job: `The task is over. ${questionJob(q, onScreen, ctx)}`,
@@ -476,18 +485,24 @@ function taskBrief(ctx: BriefContext, step: TaskStep): ModeratorBrief {
     };
   }
   const probes = (step.probes ?? []).filter((p) => p.trim());
+  const observed = (ctx.observedBehaviour ?? []).filter(Boolean);
   const canProbe = ctx.remainingFollowUps > 0 && mod.style !== 'unmoderated' && mod.probingLevel !== 'none';
+  const n = ctx.remainingFollowUps;
+  const behaviourJob = observed.length
+    ? `First ask ONE short, open, neutral question about the observed_behaviour: describe only what they did, in plain words, and ask what they were thinking or expecting — e.g. "I noticed you clicked that several times. What were you expecting to happen?" or "I noticed you went back and forth between two pages. What were you looking for?". Never call it an error, a problem, a bug or a struggle, never suggest a reason or an answer, never ask a yes/no question. Listen to the answer. `
+    : '';
   return {
     ok: true,
     step: stepHeader(ctx, 'post_task'),
+    ...outcome,
+    ...(canProbe && observed.length ? { observed_behaviour: observed } : {}),
     ...(canProbe && probes.length ? { allowed_researcher_probes: probes } : {}),
-    remaining_follow_ups: canProbe ? ctx.remainingFollowUps : 0,
-    your_job:
-      canProbe && probes.length
-        ? `The task is over and all post-task questions are answered. You may now ask up to ${ctx.remainingFollowUps} of the allowed_researcher_probes (verbatim, one at a time, only those that fit what you observed; reflect the participant's words). Then call complete_step with a factual summary.`
-        : canProbe
-          ? `The task is over. If something notable happened that the participant has not explained, you may ask ONE short open question about it (reflect their words). Then call complete_step with a factual summary.`
-          : 'The task is over. Say "Thanks." and call complete_step with a factual summary.',
+    remaining_follow_ups: canProbe ? n : 0,
+    your_job: canProbe
+      ? `The task is over and all post-task questions are answered. You may ask at most ${n} follow-up question${n === 1 ? '' : 's'} in total now, one at a time. ${behaviourJob}${
+          probes.length ? `${observed.length ? 'If follow-ups remain, ask' : 'Ask'} the allowed_researcher_probes that fit what you observed (verbatim). ` : observed.length ? '' : 'If something notable happened that the participant has not explained, you may ask ONE short open question about it (reflect their words). '
+        }Then call complete_step with a factual summary. Never exceed the follow-up limit.`
+      : 'The task is over. Say "Thanks." and call complete_step with a factual summary.',
     hidden_researcher_notes: hidden,
   };
 }

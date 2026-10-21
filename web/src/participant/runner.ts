@@ -10,6 +10,7 @@ import {
   buildModeratorInstructions,
   describeScale,
   followUpBudget,
+  languageName,
   MODERATOR_TOOLS,
   questionHasCard,
   questionnaireOnScreen,
@@ -91,6 +92,8 @@ export interface RunnerState {
   exploreEndsAt: number | null;
   ended: boolean;
   recording: boolean;
+  /** The app iframe: `key` changes to remount it (fresh renderer process); `src` null = unmounted. */
+  appFrame: { key: number; src: string | null };
 }
 
 export interface RunnerOptions {
@@ -109,7 +112,6 @@ export interface RunnerOptions {
 }
 
 const akey = (stepId: string, qid: string) => `${stepId}::${qid}`;
-const QUIET_RESPONSE_GRACE_MS = 600;
 
 export class SessionRunner {
   readonly queue: EventQueue;
@@ -130,11 +132,12 @@ export class SessionRunner {
   private skipped = new Set<string>();
   private followUpsUsed = 0;
   private followUpQuestionId: string | null = null;
-  private behaviourProbes = 0;
   private heardSinceStep = false;
   private questionnaireSubmitted = false;
   private stepEnteredAt = 0;
   private briefDelivered = false;
+  /** The moderator actually read the current task instruction (gates the 'briefed' task start). */
+  private instructionHeard = false;
   private exploreTimer: ReturnType<typeof setTimeout> | null = null;
   private exploreDone = false;
 
@@ -142,6 +145,7 @@ export class SessionRunner {
   private taskWallStart = 0;
   private taskOutcome: { outcome: TaskOutcome; source: 'rule' | 'ai' | 'participant' } | null = null;
   private doneRequested = false;
+  private taskEndedAt = 0;
   private ignoreNavUntil = 0;
   private domPollBusy = false;
   private taskActivateTimer: ReturnType<typeof setTimeout> | null = null;
@@ -157,15 +161,23 @@ export class SessionRunner {
   private appFeed: string[] = [];
   private recentNavs: { path: string; at: number }[] = [];
   private recentDead: number[] = [];
+  private recentPops: number[] = [];
   private recentErrors: number[] = [];
-  private pendingProbe: { reason: string; at: number } | null = null;
+  /** Notable behaviour seen during the current task (by kind), asked about after the task. */
+  private observed = new Map<string, string>();
+  private behaviourProbeAsked = false;
+  private lastClickDesc = '';
   private crashReported = false;
+  private crashAt = 0;
+  private crashNoticePending = false;
   private helloTimer: ReturnType<typeof setTimeout> | null = null;
   private transcriptLog: { role: string; text: string }[] = [];
   private closingSpoken = false;
   private finishing = false;
   private gazeBuf: [number, number, number][] = [];
   private captionSeq = 0;
+  /** Quiet-phase turn-taking decisions (debug / tests). */
+  readonly turnChecks: { text: string; addressed: boolean; via: string; verdict: string | null; at: number }[] = [];
 
   constructor(private opts: RunnerOptions) {
     this.steps = opts.start.steps;
@@ -195,6 +207,7 @@ export class SessionRunner {
       exploreEndsAt: null,
       ended: false,
       recording: false,
+      appFrame: { key: 0, src: opts.start.appUrl ?? null },
     };
     this.bridge = new ProbeBridge({
       onHello: (path) => this.onProbeHello(path),
@@ -258,7 +271,10 @@ export class SessionRunner {
     this.timers.push(setInterval(() => this.flushAppFeed(), 3000));
     this.timers.push(setInterval(() => void this.pollDomRules(), 1500));
     this.timers.push(setInterval(() => this.flushGaze(), 1000));
-    if (this.opts.eye?.running) this.opts.eye.onGaze((x, y) => this.onGaze(x, y));
+    if (this.opts.eye?.running) {
+      this.opts.eye.frameMs = 100; // ~10 fps is plenty for heatmaps; keeps CPU low next to the app + audio
+      this.opts.eye.onGaze((x, y) => this.onGaze(x, y));
+    }
 
     if (this.opts.consent.audio && this.protocol.consent.storeAudio) {
       this.recorder = new MixedRecorder(this.opts.auth);
@@ -334,7 +350,7 @@ export class SessionRunner {
         onUserTranscriptDelta: (itemId, delta) => this.caption('participant', itemId, delta, false, true),
         onUserTranscript: (itemId, text) => this.onUserTranscript(itemId, text),
         onAssistantTranscriptDelta: (rid, delta) => this.caption('moderator', rid, delta, false, true),
-        onAssistantTranscript: (rid, text) => this.onAssistantTranscript(rid, text),
+        onAssistantTranscript: (rid, text, phase) => this.onAssistantTranscript(rid, text, phase),
         onAssistantAudioStart: () => {
           this.lastAssistantAudio = performance.now();
           this.queue.push('speech.start', { who: 'moderator' });
@@ -356,7 +372,7 @@ export class SessionRunner {
       },
     });
     this.rt = rt;
-    await rt.connect();
+    await rt.connectWithRetry();
   }
 
   private onRealtimeReady(reconnected: boolean) {
@@ -435,23 +451,62 @@ export class SessionRunner {
     this.transcriptLog.push({ role: 'participant', text });
     this.queue.push('transcript.participant', { text, itemId, startT: this.userSpeechStartT ?? undefined, endT: this.queue.now(), source: 'voice' });
     // In quiet phases the VAD doesn't auto-respond; respond only when addressed.
-    if (this.quiet && this.rt && addressedToModerator(text)) {
-      setTimeout(() => this.rt?.requestResponse(), QUIET_RESPONSE_GRACE_MS);
-    }
+    if (this.quiet && this.rt) void this.respondIfAddressed(text);
   }
 
-  private onAssistantTranscript(rid: string, text: string) {
+  /**
+   * Quiet phases (active task, exploration, on-screen questionnaire): should the moderator answer
+   * this utterance? Decided by the model itself in a silent out-of-band check (works in any
+   * language, and it hears the audio); falls back to punctuation / English keywords on timeout.
+   */
+  private async respondIfAddressed(text: string) {
+    const rt = this.rt;
+    if (!rt) return;
+    const stepId = this.step?.id;
+    const onScreenForm = this.step?.type === 'questionnaire';
+    const verdict = await rt.classify(
+      `You are a silent turn-taking classifier for a usability-test moderator — you are NOT talking to anyone. The participant is ${
+        onScreenForm ? 'filling in an on-screen questionnaire' : 'working on a task and thinking aloud'
+      }. Their most recent utterance (it may be in any language) was transcribed as: "${text.replace(/"/g, "'")}".
+Answer YES if they are addressing the moderator and expect a reply or an action: a question to the moderator, a request for help or to repeat something, saying they are done / finished / want to skip, stop or give up${
+        onScreenForm ? ', or saying a rating or answer for one of the on-screen items' : ''
+      }. Answer NO if they are thinking aloud, describing what they see or do, reading text aloud, or asking themselves a question.
+Reply with exactly one word: YES or NO.`,
+      4000,
+    );
+    let addressed: boolean;
+    let via: 'model' | 'fallback';
+    if (verdict && /^\W*(yes|no)\b/i.test(verdict)) {
+      addressed = /^\W*yes/i.test(verdict);
+      via = 'model';
+    } else {
+      addressed = /[?？؟¿]/.test(text) || ((this.mod.language ?? 'en').toLowerCase().startsWith('en') && addressedToModerator(text));
+      via = 'fallback';
+    }
+    this.turnChecks.push({ text, addressed, via, verdict, at: this.queue.now() });
+    if (this.turnChecks.length > 50) this.turnChecks.shift();
+    if (addressed && this.quiet && this.rt === rt && this.step?.id === stepId) rt.requestResponse();
+  }
+
+  private onAssistantTranscript(rid: string, text: string, phase?: string) {
     this.caption('moderator', rid, text, true, false);
     if (!text) return;
     this.transcriptLog.push({ role: 'moderator', text });
-    this.queue.push('transcript.moderator', { text, responseId: rid });
+    this.queue.push('transcript.moderator', { text, responseId: rid, ...(phase ? { phase } : {}) });
+    if (this.step?.type === 'task' && this.state.taskPhase === 'briefing' && isReadingOf(text, (this.step as TaskStep).instruction)) this.instructionHeard = true;
     // Follow-up accounting: a question that isn't a reading of the current prompt counts as a follow-up.
-    if (text.includes('?') && this.step && this.state.index >= 0) {
+    if (/[?？؟]/.test(text) && this.step && this.state.index >= 0) {
       const q = this.nextQuestion();
       const prompts = [q?.prompt, this.step.type === 'task' ? (this.step as TaskStep).instruction : undefined].filter(Boolean) as string[];
       const isPrompt = prompts.some((p) => isReadingOf(text, p));
       const countable = this.step.type !== 'task' || this.state.taskPhase === 'post';
-      if (!isPrompt && countable && this.briefDelivered) this.followUpsUsed++;
+      if (!isPrompt && countable && this.briefDelivered) {
+        this.followUpsUsed++;
+        if (this.step.type === 'task' && !q && this.observed.size && !this.behaviourProbeAsked) {
+          this.behaviourProbeAsked = true;
+          this.queue.push('moderator.probe', { reason: [...this.observed.keys()].join(','), observed: [...this.observed.values()], text, phase: 'post_task' });
+        }
+      }
     }
     if (this.state.index >= this.steps.length && isReadingOf(text, this.protocol.closing)) this.closingSpoken = true;
   }
@@ -467,6 +522,10 @@ export class SessionRunner {
   private isHandled(q: Question) {
     const s = this.step!;
     return Boolean(this.state.answers[akey(s.id, q.id)]) || this.skipped.has(q.id);
+  }
+
+  private queueAnswered() {
+    return this.questionQueue().filter((q) => this.isHandled(q)).length;
   }
 
   private nextQuestion(): Question | null {
@@ -502,6 +561,7 @@ export class SessionRunner {
       taskOutcomeSet: Boolean(this.taskOutcome),
       questionnaireSubmitted: this.questionnaireSubmitted,
       appVisible: this.state.appVisible,
+      observedBehaviour: this.step?.type === 'task' && this.state.taskPhase === 'post' && !this.behaviourProbeAsked ? [...this.observed.values()] : undefined,
     };
   }
 
@@ -514,7 +574,7 @@ export class SessionRunner {
    * mode 'announce' → inject the brief as a system item + ask for a response (runner-initiated).
    * mode 'return' → the caller (a tool handler) returns the brief as tool output.
    */
-  private enterStep(index: number, mode: 'announce' | 'return', prefix?: string): ModeratorBrief {
+  private enterStep(index: number, mode: 'announce' | 'return', prefix?: string, ack?: string): ModeratorBrief {
     const prev = this.step;
     if (prev) this.queue.push('step.exit', { index: this.state.index, type: prev.type }, { stepId: prev.id });
     this.clearStepTimers();
@@ -522,16 +582,17 @@ export class SessionRunner {
     this.skipped = new Set();
     this.followUpsUsed = 0;
     this.followUpQuestionId = null;
-    this.behaviourProbes = 0;
     this.heardSinceStep = false;
     this.questionnaireSubmitted = false;
     this.exploreDone = false;
     this.stepEnteredAt = performance.now();
     this.briefDelivered = false;
+    this.instructionHeard = false;
     this.taskOutcome = null;
     this.doneRequested = false;
     this.nudgesThisTask = 0;
-    this.pendingProbe = null;
+    this.observed = new Map();
+    this.behaviourProbeAsked = false;
     this.queue.stepId = step?.id ?? (index < 0 ? 'intro' : 'closing');
     const showApp = Boolean(step && this.opts.start.appUrl && (step.type === 'task' || (step.type === 'instruction' && step.showApp)));
     this.set({
@@ -563,20 +624,28 @@ export class SessionRunner {
     const brief = this.brief();
     if (mode === 'announce' && this.rt && index >= this.steps.length) {
       this.rt.cancelResponse();
-      this.sayClosing();
+      this.sayClosing(ack);
       this.briefDelivered = true;
       return brief;
     }
     if (mode === 'announce' && this.rt) {
       this.rt.addSystemItem(`${prefix ? `${prefix}\n` : ''}[STEP] ${JSON.stringify(brief)}`);
-      this.rt.requestResponse();
+      // Verbatim text known: dictate this turn (no improvisation, no tool calls, no double reading).
+      if (brief.say_verbatim) this.directed(`${ack ? `${this.ackPhrase(ack)}, then say` : 'Say'} the following text verbatim, completely and only once, and nothing else:\n"${brief.say_verbatim}"`);
+      else this.rt.requestResponse();
       this.briefDelivered = true;
     } else this.briefDelivered = true;
     return brief;
   }
 
-  private sayClosing() {
-    this.directed(`The session is over. Say exactly the following text, verbatim, and nothing else:\n"${this.protocol.closing}"`);
+  /** "Say "<ack>"" — or its equivalent in the session language. */
+  private ackPhrase(ack: string) {
+    const lang = this.mod.language?.toLowerCase().split(/[-_]/)[0] ?? 'en';
+    return lang === 'en' ? `Say "${ack}"` : `Say a short, natural ${languageName(this.mod.language)} equivalent of "${ack}"`;
+  }
+
+  private sayClosing(ack?: string) {
+    this.directed(`The session is over. ${ack ? `${this.ackPhrase(ack)}, then say` : 'Say'} exactly the following text, verbatim, and nothing else:\n"${this.protocol.closing}"`);
   }
 
   private clearStepTimers() {
@@ -589,7 +658,9 @@ export class SessionRunner {
   /** Called whenever the moderator stops talking. */
   private onModeratorFinishedSpeaking() {
     const s = this.step;
-    if (s?.type === 'task' && this.state.taskPhase === 'briefing' && performance.now() - this.stepEnteredAt > 1500) this.activateTask('briefed');
+    // Only a finished reading of the instruction starts the task. A leftover line from the previous
+    // step (or an interrupted reading) must not start the clock; the 25 s timeout is the fallback.
+    if (s?.type === 'task' && this.state.taskPhase === 'briefing' && this.instructionHeard && performance.now() - this.stepEnteredAt > 1500) this.activateTask('briefed');
     if (s?.type === 'instruction' && (s.exploreSeconds ?? 0) > 0 && !this.state.exploreEndsAt && performance.now() - this.stepEnteredAt > 1500) this.startExplore();
     if (this.state.index >= this.steps.length && this.closingSpoken) {
       // Fallback if the model never calls end_session.
@@ -597,7 +668,6 @@ export class SessionRunner {
         if (!this.finishing && this.state.index >= this.steps.length && !this.rt?.assistantAudioPlaying) void this.finish();
       }, 1500);
     }
-    this.maybeFirePendingProbe();
   }
 
   private startExplore() {
@@ -620,14 +690,14 @@ export class SessionRunner {
     const go = () => {
       if (this.disposed || this.step?.type !== 'instruction') return;
       if (this.rt?.userSpeaking || this.rt?.assistantAudioPlaying) return void setTimeout(go, 800);
-      this.advance('[EVENT] The exploration time is over. Briefly thank the participant neutrally ("Thanks."), then continue with the next step below.');
+      this.advance('[EVENT] The exploration time is over. Briefly thank the participant neutrally ("Thanks."), then continue with the next step below.', 'Thanks.');
     };
     go();
   }
 
   /** Runner-initiated advance to the next step (announces the brief). */
-  private advance(prefix?: string) {
-    this.enterStep(this.state.index + 1, 'announce', prefix);
+  private advance(prefix?: string, ack?: string) {
+    this.enterStep(this.state.index + 1, 'announce', prefix, ack);
   }
 
   private activateTask(reason: 'briefed' | 'interaction' | 'timeout' | 'manual') {
@@ -649,6 +719,7 @@ export class SessionRunner {
     if (s?.type !== 'task' || this.state.taskPhase === 'post') return;
     if (this.state.taskPhase === 'briefing') this.activateTask('interaction');
     const endedAt = Date.now();
+    this.taskEndedAt = endedAt;
     this.taskOutcome = { outcome, source };
     this.queue.push('task.end', {
       outcome,
@@ -666,14 +737,34 @@ export class SessionRunner {
     this.refreshManualPrompt();
   }
 
-  private announceTaskEnd(text: string, ack: string) {
+  /**
+   * The runner ended the task (rule, timeout, skip button). If the step still has something to
+   * ask (post-task questions, or follow-ups when `allowProbes`), the moderator acknowledges and
+   * asks it; otherwise the runner moves on to the next step itself (one acknowledgement + the next
+   * step's text — no improvised filler, no redundant tool calls).
+   */
+  private announceTaskEnd(text: string, ack: string, allowProbes = true) {
     if (!this.rt) return;
+    this.rt.cancelResponse();
+    if (!this.nextQuestion() && !(allowProbes && this.postTaskProbesAvailable())) {
+      this.queue.push('observation', { kind: 'step_summary', note: text.split('. ')[0] });
+      this.advance(`[EVENT] ${text} This task is finished; move on to the next step below.`, ack);
+      return;
+    }
     const b = this.brief();
     this.rt.addSystemItem(`[EVENT] ${text}\n[STEP] ${JSON.stringify(b)}`);
-    this.rt.cancelResponse();
     // The runner knows exactly what must be said next: direct it (no improvisation, no tools).
-    if (b.say_verbatim) this.directed(`Say "${ack}" and then ask this question verbatim: "${b.say_verbatim}". Say nothing else.`);
+    if (b.say_verbatim) this.directed(`${this.ackPhrase(ack)} and then ask this question verbatim: "${b.say_verbatim}". Say nothing else.`);
     else this.rt.requestResponse();
+  }
+
+  /** Follow-up probes the post-task brief would offer (researcher probes or observed behaviour). */
+  private postTaskProbesAvailable() {
+    const s = this.step;
+    if (s?.type !== 'task') return false;
+    const mod = this.mod;
+    if (mod.style === 'unmoderated' || mod.probingLevel === 'none' || this.remainingFollowUps() <= 0) return false;
+    return (s.probes ?? []).some((p) => p.trim()) || this.observed.size > 0;
   }
 
   /** A response whose content the runner dictates (full rules + a NOW section, tools disabled). */
@@ -764,7 +855,8 @@ export class SessionRunner {
       case 'set_task_outcome': {
         if (s?.type !== 'task') return this.err('The current step is not a task.');
         if (this.state.taskPhase === 'post') {
-          return { output: { ...this.brief(), note: 'The task outcome is already recorded. Continue with this brief.' }, respond: true };
+          // Redundant call (a rule, the time limit or a button already decided): ignored, outcome unchanged.
+          return { output: { ...this.brief(), ignored: true, note: 'Ignored: the system already recorded the outcome of this task. Never call set_task_outcome after a task has ended. Continue with this brief.' }, respond: true };
         }
         const outcome = String(args.outcome);
         if (!['success', 'partial', 'failure'].includes(outcome)) return this.err('outcome must be success, partial or failure.');
@@ -791,6 +883,10 @@ export class SessionRunner {
           this.endTask('abandoned', 'participant', reason ? `Participant asked to skip: ${reason}` : 'Participant asked to skip');
           return { output: { ...this.brief(), note: 'Task skipped. Continue with this brief.' }, respond: true };
         }
+        if (s?.type === 'task' && this.taskOutcome?.source === 'participant' && Date.now() - this.taskEndedAt < 15_000 && !(this.queueAnswered() > 0)) {
+          // Reaction to the "Skip task" button: the task is already skipped — never skip the post-task question too.
+          return { output: { ...this.brief(), ignored: true, note: 'The task was already skipped by the participant. Continue with this brief.' }, respond: true };
+        }
         const q = this.nextQuestion();
         if (q) {
           this.skipped.add(q.id);
@@ -798,6 +894,7 @@ export class SessionRunner {
           this.updateCard();
           return { output: { ...this.brief(), note: 'Question skipped.' }, respond: true };
         }
+        if (s?.type === 'task') return { output: { ...this.brief(), ignored: true, note: 'Nothing to skip: the task has already ended. Continue with this brief.' }, respond: true };
         return this.err('There is nothing to skip right now.');
       }
 
@@ -861,7 +958,8 @@ export class SessionRunner {
       const next = this.nextQuestion();
       return this.err(`Unknown question_id "${qid}" for the current step.`, next ? `The current question_id is "${next.id}".` : 'This step has no open question. Follow the brief.');
     }
-    if (s.type === 'questionnaire' && questionnaireOnScreen(s)) return this.err('This questionnaire is answered on screen only.', 'Stay quiet until it is submitted.');
+    const onScreenForm = s.type === 'questionnaire' && questionnaireOnScreen(s);
+    if (onScreenForm && this.questionnaireSubmitted) return this.err('The questionnaire was already submitted.', 'Follow the current brief.');
     const prevAns = this.state.answers[akey(s.id, q.id)];
     // Follow-up enrichment: keep the earlier value/choices when only text is added.
     const parsed = this.validateAnswer(q, { text: args.text, value: args.value ?? prevAns?.value, choices: args.choices ?? prevAns?.choices });
@@ -875,7 +973,9 @@ export class SessionRunner {
       source: prev?.source === 'screen' && parsed.value == null && !parsed.choices ? 'screen' : this.state.mode === 'text' ? 'text' : 'voice',
     };
     this.storeAnswer(s.id, q, merged);
-    return { output: { ...this.brief(), recorded: q.id }, respond: true };
+    // On-screen questionnaire answered aloud: the card shows it; stay quiet while they fill in the rest.
+    if (onScreenForm) return { output: { ok: true, recorded: q.id, note: 'Recorded and shown on screen. Say nothing; let them continue.' }, respond: false };
+    return { output: { ...this.brief(), recorded: q.id, acknowledge: 'Begin your next turn with a brief neutral acknowledgement ("Thanks." / "Got it."), then continue. Never narrate what you are doing.' }, respond: true };
   }
 
   private validateAnswer(q: Question, a: { text?: unknown; value?: unknown; choices?: unknown }): Omit<AnswerValue, 'source'> | { error: string } {
@@ -948,7 +1048,7 @@ export class SessionRunner {
     const scale = describeScale(q);
     if (wasCurrent && !prev) {
       this.rt.addSystemItem(
-        `[EVENT] The participant answered on screen: question_id "${q.id}" ("${q.prompt}") → ${label}${scale ? ` (${scale})` : ''}. It is recorded — do not call record_answer for it and do not ask it again. Do not comment on the rating itself.\n[STEP] ${JSON.stringify(this.brief())}`,
+        `[EVENT] The participant answered on screen: question_id "${q.id}" ("${q.prompt}") → ${label}${scale ? ` (${scale})` : ''}. It is recorded — do not call record_answer for it and do not ask it again. Start with a brief neutral acknowledgement ("Thanks.") and go straight on with the brief below. Never comment on the rating and never narrate (no "I have what I need", "noted", "let me note that").\n[STEP] ${JSON.stringify(this.brief())}`,
       );
       this.rt.requestResponse();
     } else {
@@ -965,7 +1065,7 @@ export class SessionRunner {
     this.queue.push('observation', { kind: 'questionnaire_submitted', instrument: s.instrument });
     this.applyTurnDetection();
     if (this.state.mode === 'manual') return void this.enterStep(this.state.index + 1, 'announce');
-    this.advance('[EVENT] The participant submitted the questionnaire (answers recorded). Say "Thanks." and continue with the next step below.');
+    this.advance('[EVENT] The participant submitted the questionnaire (answers recorded). Say "Thanks." and continue with the next step below.', 'Thanks.');
   }
 
   /** "I'm done" button during a task. */
@@ -996,7 +1096,7 @@ export class SessionRunner {
     const s = this.step;
     if (s?.type !== 'task' || this.state.taskPhase === 'post') return;
     this.endTask('abandoned', 'participant', 'Participant pressed "Skip task".');
-    if (this.state.mode !== 'manual') this.announceTaskEnd('The participant pressed "Skip task". Say neutrally that this is completely fine (e.g. "No problem, let\'s move on."). Never imply they failed.', "No problem, let's move on.");
+    if (this.state.mode !== 'manual') this.announceTaskEnd('The participant pressed "Skip task". Say neutrally that this is completely fine (e.g. "No problem, let\'s move on."). Never imply they failed.', "No problem, let's move on.", false);
   }
 
   /** Typed message (text fallback). */
@@ -1054,6 +1154,7 @@ export class SessionRunner {
 
   // ── app / probe ────────────────────────────────────────────────────────────
   attachIframe(el: HTMLIFrameElement | null) {
+    if (el === this.iframe) return;
     this.iframe = el;
     this.bridge.attach(el);
     if (el && this.opts.start.appInstrumented) this.armHelloTimer();
@@ -1074,16 +1175,31 @@ export class SessionRunner {
     if (!base) return null;
     if (!path) return base;
     try {
-      return new URL(path, base).toString();
+      return new URL(this.withVariantParams(path), base).toString();
     } catch {
       return base;
+    }
+  }
+
+  /** Keep the variant's launch params (e.g. ?flags=…) on every in-app navigation we initiate. */
+  private withVariantParams(path: string) {
+    const base = this.opts.start.appUrl;
+    if (!base) return path;
+    try {
+      const params = new URL(base).searchParams;
+      if (![...params.keys()].length) return path;
+      const u = new URL(path, 'http://x');
+      for (const [k, v] of params) if (!u.searchParams.has(k)) u.searchParams.set(k, v);
+      return u.pathname + u.search + u.hash;
+    } catch {
+      return path;
     }
   }
 
   private navigateApp(path?: string) {
     const target = path || '/';
     this.ignoreNavUntil = Date.now() + 2000;
-    if (this.bridge.connected) this.bridge.navigate(target);
+    if (this.bridge.connected) this.bridge.navigate(this.withVariantParams(target));
     else if (this.iframe && path) {
       this.iframe.src = this.appUrlFor(path) ?? this.iframe.src;
       if (this.opts.start.appInstrumented) this.armHelloTimer();
@@ -1096,19 +1212,30 @@ export class SessionRunner {
     this.crashReported = false;
     this.recentErrors = [];
     this.bridge.connected = false;
-    this.set({ appStatus: this.opts.start.appInstrumented ? 'loading' : 'limited' });
     this.queue.push('observation', { kind: 'app_reload' });
-    if (this.iframe && url) {
-      this.iframe.src = 'about:blank';
-      setTimeout(() => {
-        if (this.iframe) this.iframe.src = url;
-      }, 50);
-    }
-    if (this.opts.start.appInstrumented) this.armHelloTimer();
+    if (!url) return;
+    // A frozen app keeps its renderer process busy forever, and a same-site document loaded into
+    // the same frame would land in that hung process. Unmount the iframe, give the browser a
+    // moment to drop the process, then mount a fresh one.
+    const key = this.state.appFrame.key + 1;
+    this.set({ appStatus: this.opts.start.appInstrumented ? 'loading' : 'limited', appFrame: { key, src: null } });
+    setTimeout(() => {
+      if (this.disposed || this.state.appFrame.key !== key) return;
+      this.set({ appFrame: { key, src: url } });
+      if (this.opts.start.appInstrumented) this.armHelloTimer();
+    }, 700);
   }
 
   private onProbeHello(path: string) {
     if (this.helloTimer) clearTimeout(this.helloTimer);
+    if (this.crashAt) {
+      // Recovered from a crash: the downtime does not count against the task time limit.
+      const down = Date.now() - this.crashAt;
+      this.crashAt = 0;
+      this.crashNoticePending = false;
+      if (this.state.taskDeadline && this.state.taskPhase === 'active') this.set({ taskDeadline: this.state.taskDeadline + down });
+      this.rt?.addSystemItem('[APP] The website was reloaded and is working again. Do not comment on it; let the participant continue.');
+    }
     if (this.state.appStatus !== 'ready') this.set({ appStatus: 'ready' });
     if (this.crashReported) this.crashReported = false;
     this.queue.push('app.ready', { path });
@@ -1128,7 +1255,7 @@ export class SessionRunner {
         if (e.kind === 'mouse') this.queue.push('mouse', this.normalizePoints(data as unknown as PointBatchData) as unknown as Record<string, unknown>, { at: e.at });
         continue;
       }
-      this.queue.push(e.kind, data, { at: e.at });
+      if (e.kind !== 'app.crash') this.queue.push(e.kind, data, { at: e.at }); // reportCrash logs crashes (once)
       this.onBehaviour(e.kind, data);
     }
   }
@@ -1156,11 +1283,16 @@ export class SessionRunner {
         // Back-and-forth: A → B → A → B within 30s, or 2+ "pop" navigations within 20s.
         const p = this.recentNavs.map((n) => n.path);
         const n = p.length;
-        if (inTask && n >= 4 && p[n - 1] === p[n - 3] && p[n - 2] === p[n - 4] && p[n - 1] !== p[n - 2]) this.queueProbe(`moved back and forth between ${p[n - 2]} and ${p[n - 1]}`);
+        if (inTask && n >= 4 && p[n - 1] === p[n - 3] && p[n - 2] === p[n - 4] && p[n - 1] !== p[n - 2]) this.queueProbe('backtrack', `went back and forth between the pages ${p[n - 2]} and ${p[n - 1]}`);
+        if (inTask && data.kind === 'pop') {
+          this.recentPops = [...this.recentPops.filter((t) => now - t < 20_000), now];
+          if (this.recentPops.length >= 2) this.queueProbe('back', 'went back to previous pages several times');
+        }
         break;
       }
       case 'app.click': {
         const el = data.el as ElementDescriptor | undefined;
+        this.lastClickDesc = describeElement(el);
         if (appActive) this.feed(`clicked ${describeElement(el)} on ${String(data.path ?? this.bridge.lastPath)}`);
         if (el && inTask) this.evaluateClickRules(el);
         break;
@@ -1171,14 +1303,14 @@ export class SessionRunner {
         this.recentDead = [...this.recentDead.filter((t) => now - t < 10_000), now];
         if (inTask && this.recentDead.length >= 3) {
           this.recentDead = [];
-          this.queueProbe(`clicked several times on things that did not respond (e.g. ${describeElement(el)})`);
+          this.queueProbe('dead', `clicked ${describeElement(el)} several times and nothing happened on screen`);
         }
         break;
       }
       case 'app.rage_click': {
         const el = data.el as ElementDescriptor | undefined;
         if (appActive) this.feed(`rage-clicked ${describeElement(el)}`);
-        if (inTask) this.queueProbe(`clicked ${describeElement(el)} many times in a row quickly`);
+        if (inTask) this.queueProbe('rage', `clicked ${describeElement(el)} many times in quick succession`);
         break;
       }
       case 'app.error':
@@ -1188,7 +1320,11 @@ export class SessionRunner {
         if (kind === 'app.error') {
           this.recentErrors = [...this.recentErrors.filter((t) => now - t < 5000), now];
           if (this.recentErrors.length >= 5) this.reportCrash('error storm');
-          else if (inTask) this.queueProbe('saw an error in the app');
+          else if (inTask)
+            this.queueProbe(
+              'error',
+              `clicked ${this.lastClickDesc || 'something'} and the app had a technical error at that moment (the participant may not have noticed it — ask what they expected to happen there, never mention the error)`,
+            );
         }
         break;
       }
@@ -1276,8 +1412,11 @@ export class SessionRunner {
     if (this.disposed || this.state.ended) return;
     const s = this.step;
     const now = Date.now();
+    // Gaze is only recorded over the app: don't run face tracking while it is hidden.
+    this.opts.eye?.setSuspended(!this.state.appVisible);
     // Time limit
-    if (s?.type === 'task' && this.state.taskPhase === 'active' && this.state.taskDeadline && now >= this.state.taskDeadline) {
+    // (Let the participant finish their sentence first — up to 8 s past the limit.)
+    if (s?.type === 'task' && this.state.taskPhase === 'active' && this.state.taskDeadline && now >= this.state.taskDeadline && this.state.appStatus !== 'crashed' && (!this.rt?.userSpeaking || now - this.state.taskDeadline > 8000)) {
       this.endTask('timeout', 'rule', `Time limit of ${s.timeLimitSec}s reached.`);
       this.announceTaskEnd('The time limit for this task was reached. Say neutrally that we will stop this task there and move on (e.g. "Let\'s stop this one here."). No judgement, never imply failure.', "Let's stop this one here.");
       return;
@@ -1286,8 +1425,8 @@ export class SessionRunner {
     if (this.state.appVisible && this.bridge.connected && this.state.appStatus === 'ready' && document.visibilityState === 'visible' && now - this.bridge.lastHeartbeat > 4000) {
       this.reportCrash('heartbeat lost');
     }
+    this.maybeAnnounceCrash();
     this.maybeNudge();
-    this.maybeFirePendingProbe();
   }
 
   private someoneTalking() {
@@ -1319,47 +1458,44 @@ export class SessionRunner {
     rt.requestResponse();
   }
 
-  private queueProbe(reason: string) {
+  /**
+   * Remember notable behaviour (rage/dead clicks, backtracking, errors). Probes about it are asked
+   * AFTER the task (never mid-task: that would distort time-on-task and interrupt the participant),
+   * within the step's follow-up budget (probingLevel / maxProbesPerStep).
+   */
+  private queueProbe(kind: string, reason: string) {
     const mod = this.mod;
-    if (!this.rt || this.state.mode === 'manual') return;
-    if (!mod.probeOnBehavior || mod.style === 'think_aloud_retrospective' || mod.style === 'unmoderated' || mod.probingLevel === 'none') return;
-    if (this.behaviourProbes >= Math.max(0, mod.maxProbesPerStep)) return;
-    if (this.pendingProbe) return;
-    this.pendingProbe = { reason, at: performance.now() };
-  }
-
-  private maybeFirePendingProbe() {
-    const p = this.pendingProbe;
-    const rt = this.rt;
-    if (!p || !rt) return;
-    const nowP = performance.now();
-    if (nowP - p.at > 15_000 || this.step?.type !== 'task' || this.state.taskPhase !== 'active' || this.doneRequested) {
-      this.pendingProbe = null;
-      return;
-    }
-    if (nowP - p.at < 1500) return; // let the behaviour settle
-    if (this.someoneTalking() || nowP - this.lastTrigger < 25_000 || nowP - this.lastUserSpeech < 1500) return;
-    this.pendingProbe = null;
-    this.behaviourProbes++;
-    this.lastTrigger = nowP;
-    this.queue.push('moderator.probe', { reason: p.reason, n: this.behaviourProbes });
-    rt.addSystemItem(
-      `[TRIGGER] Notable behaviour: the participant ${p.reason}. Ask ONE short, neutral, open question about it, e.g. "What are you trying to do right now?" or "What did you expect to happen there?". Do not suggest that anything is wrong, do not hint at a solution, do not mention errors unless they did.`,
-    );
-    rt.requestResponse();
+    if (!mod.probeOnBehavior || mod.style === 'unmoderated' || mod.probingLevel === 'none') return;
+    if (this.observed.has(kind)) return;
+    this.observed.set(kind, reason);
+    this.queue.push('observation', { kind: 'behaviour', behaviour: kind, note: reason, source: 'system' });
   }
 
   private reportCrash(reason: string) {
     if (this.crashReported) return;
     this.crashReported = true;
+    this.crashAt = Date.now();
     this.set({ appStatus: 'crashed' });
     this.queue.push('app.crash', { reason, path: this.bridge.lastPath });
-    if (this.rt && this.state.appVisible) {
-      this.rt.addSystemItem(
-        '[EVENT] The app seems to have stopped responding. Gently tell the participant it is not their fault and that they can press the "Reload app" button on screen. Keep it to one or two sentences and do not discuss it further.',
-      );
-      this.rt.requestResponse();
+    this.crashNoticePending = Boolean(this.rt && this.state.appVisible);
+    this.maybeAnnounceCrash();
+  }
+
+  /** Tell the moderator about a crash — but never while the participant is mid-sentence. */
+  private maybeAnnounceCrash() {
+    const rt = this.rt;
+    if (!this.crashNoticePending || !rt) return;
+    if (this.state.appStatus !== 'crashed' || !this.state.appVisible) {
+      this.crashNoticePending = false;
+      return;
     }
+    if (rt.userSpeaking) return;
+    this.crashNoticePending = false;
+    this.lastTrigger = performance.now();
+    rt.addSystemItem(
+      '[EVENT] The website being tested stopped responding (a technical problem, not caused by the participant). In ONE or two short sentences, gently tell the participant that this is not their fault and that they can press the "Reload website" button on the screen. Do not speculate about the cause and do not discuss it further. The task is still running.',
+    );
+    rt.requestResponse();
   }
 
   // ── app context feed (no response) ─────────────────────────────────────────

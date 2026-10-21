@@ -51,3 +51,6 @@ export function timeAgo(at: number): string {
   if (d < 864e5) return `${Math.floor(d / 3600e3)}h ago`;
   return new Date(at).toLocaleDateString();
 }
+
+/** "1 session", "2 sessions". */
+export const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;

@@ -9,3 +9,5 @@ data-*
 tests/e2e/screenshots
 tests/e2e/participant-screens
 tests/fixtures/*.wav
+tests/fixtures/*.y4m
+tests/fixtures/*.png

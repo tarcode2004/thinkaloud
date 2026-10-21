@@ -2,7 +2,7 @@
 
 AI-moderated, voice-first usability and user studies for any web app.
 
-1. **Upload a build.** Upload a `.zip` (Vite, CRA, Next static export, Expo / React Native for web, or a prebuilt static site), connect a git repo, or paste a URL. ThinkAloud builds the app in Docker and hosts it on its own isolated origin, with the recording probe injected automatically.
+1. **Upload a build.** Upload a `.zip` (Vite, CRA, Next.js (static export or a running `next start` server), Remix / React Router / Nuxt / Node servers, Angular, Expo / React Native for web, or a prebuilt static site), connect a git repo, or paste a URL. ThinkAloud builds the app in Docker and hosts it on its own isolated origin, with the recording probe injected automatically.
 2. **Write a protocol.** Add tasks with hidden success criteria and automatic success rules, questions, interviews, and standard questionnaires (SUS, SEQ, UMUX-Lite, NASA-TLX, NPS). Write it yourself or have AI draft and refine it, then run the methodology check. The researcher stays in control: the AI moderator only ever sees the current step and reads tasks verbatim.
 3. **A/B test.** Variants pair a protocol with an app build and have weights. Participants are assigned between-subjects, balanced by weight.
 4. **Share links.** Each link can be auto-balanced or pinned to one variant, with a participant cap, an expiry, a redirect (e.g. Prolific completion) and URL-parameter capture. Each link also has a QR code.

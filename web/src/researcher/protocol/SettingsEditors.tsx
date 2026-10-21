@@ -80,7 +80,7 @@ export function ModerationSettingsEditor({ p, onChange }: P) {
               key={s.value}
               type="button"
               onClick={() => set({ style: s.value })}
-              className={cn('rounded-[14px] border p-3.5 text-left transition', m.style === s.value ? 'border-brand-500 bg-brand-500/[0.08]0/[0.04] ring-2 ring-brand-500/20' : 'border-separator hover:border-black/15')}
+              className={cn('rounded-[14px] border p-3.5 text-left transition', m.style === s.value ? 'border-brand-500 bg-brand-500/[0.04] ring-2 ring-brand-500/20' : 'border-separator hover:border-black/15')}
             >
               <div className="flex items-center gap-2 text-sm font-semibold">
                 <span className={cn('size-3.5 rounded-full border-2', m.style === s.value ? 'border-brand-600 bg-brand-600 shadow-[inset_0_0_0_2px_white]' : 'border-black/15')} />

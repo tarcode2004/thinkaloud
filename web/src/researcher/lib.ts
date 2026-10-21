@@ -28,7 +28,8 @@ export const rApi = {
 
 export function errorMessage(e: unknown): string {
   if (e instanceof ApiError) {
-    if (e.status === 404) return 'This feature is not available on the server yet (404).';
+    // Only an unknown route means "not implemented"; resource 404s carry their own message ("Study not found").
+    if (e.status === 404 && (!e.message || e.message === 'Unknown API route' || e.message === 'Not Found')) return 'This feature is not available on the server yet (404).';
     if (e.status === 503) return e.message || 'AI is not configured on the server (missing OpenAI key).';
     const d = e.details;
     if (Array.isArray(d) && d.length) return `${e.message}: ${d.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join('; ')}`;

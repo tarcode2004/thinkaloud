@@ -209,8 +209,23 @@ export interface ProtocolRecord {
 }
 
 export type AppSourceKind = 'upload' | 'url' | 'git';
-export type AppFramework = 'vite' | 'cra' | 'next-static' | 'expo-web' | 'static' | 'unknown';
+export type AppFramework = 'vite' | 'cra' | 'next-static' | 'next-server' | 'node-server' | 'expo-web' | 'static' | 'unknown';
 export type BuildStatus = 'queued' | 'building' | 'ready' | 'failed';
+
+export interface AppBuildSettings {
+  /** Build-time (and, for server apps, runtime) environment variables, e.g. VITE_API_URL, EXPO_PUBLIC_*, NEXT_PUBLIC_*. */
+  env?: Record<string, string>;
+  /** Replaces the framework's build step; dependencies are still installed first. */
+  buildCommand?: string;
+  /** Folder (relative to the project root) holding index.html after the build. */
+  outputDir?: string;
+  /** Server apps: how to start the server (must listen on $PORT). */
+  startCommand?: string;
+  /** 'auto' (default) detects; 'static' forces static hosting; 'server' runs a Node server. */
+  mode?: 'auto' | 'static' | 'server';
+  /** Node.js major, e.g. "20". Default: .nvmrc / engines.node, else 22. */
+  nodeVersion?: string;
+}
 
 export interface AppBuild {
   id: ID;
@@ -227,6 +242,10 @@ export interface AppBuild {
   url?: string;
   /** Whether the probe is injected (hosted builds) — external URLs need the snippet. */
   instrumented: boolean;
+  /** Researcher build settings (uploads/git): env vars, command/output overrides, hosting mode, Node version. */
+  buildSettings?: AppBuildSettings;
+  /** Server apps (next-server / node-server): state of the app's server container. */
+  runtime?: { state: 'stopped' | 'starting' | 'running' | 'failed'; error?: string; container?: string };
   createdAt: Millis;
   updatedAt: Millis;
 }
@@ -242,6 +261,8 @@ export interface Variant {
   weight: number;
   active: boolean;
   createdAt: Millis;
+  /** Query string added to every app URL for this variant, e.g. "flags=summaryCard:1" (A/B conditions via URL flags). */
+  appParams?: string;
 }
 
 export interface StudyLink {

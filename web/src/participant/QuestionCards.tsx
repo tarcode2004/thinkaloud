@@ -224,6 +224,11 @@ export function QuestionnaireCard({
               {q.prompt}
             </p>
             <AnswerInput q={q} answer={answers(q.id)} onAnswer={(a) => onAnswer(q, a)} allowOpenInput compact />
+            {answers(q.id) && answers(q.id)!.source !== 'screen' && (
+              <p className="mt-2 flex items-center gap-1.5 text-[12px] text-tertiary" data-testid="voice-answer">
+                <span className="size-1.5 rounded-full bg-sys-green" /> From your voice — tap to change
+              </p>
+            )}
           </li>
         ))}
       </ol>

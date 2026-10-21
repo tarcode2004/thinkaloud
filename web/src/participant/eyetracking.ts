@@ -14,6 +14,16 @@ export class EyeTracker {
   sampleMs = 100;
   latest: { x: number; y: number; at: number } | null = null;
   running = false;
+  /**
+   * CPU throttle: WebGazer runs face-mesh inference on every animation frame (~60/s). We run one
+   * inference, pause, and resume after `frameMs` — ~12 fps while calibrating, ~10 fps in session.
+   */
+  frameMs = 80;
+  /** Frames actually processed (tests / diagnostics). */
+  frames = 0;
+  private suspended = false;
+  private resumeTimer: ReturnType<typeof setTimeout> | null = null;
+  private frameStart = 0;
 
   async start(): Promise<void> {
     const mod: any = await import('webgazer');
@@ -25,6 +35,8 @@ export class EyeTracker {
     wg.applyKalmanFilter(true);
     wg.setRegression('ridge');
     wg.setGazeListener((data: { x: number; y: number } | null) => {
+      this.frames++;
+      this.throttle();
       if (!data) return;
       const now = performance.now();
       this.latest = { x: data.x, y: data.y, at: now };
@@ -45,6 +57,39 @@ export class EyeTracker {
     this.running = true;
   }
 
+  /** Called once per processed frame: pause WebGazer's loop and schedule the next frame. */
+  private throttle() {
+    const wg = this.wg;
+    if (!wg || !this.running || this.frameMs <= 0) return;
+    wg.pause();
+    if (this.resumeTimer || this.suspended) return;
+    const wait = Math.max(0, this.frameMs - (performance.now() - this.frameStart));
+    this.resumeTimer = setTimeout(() => {
+      this.resumeTimer = null;
+      if (!this.running || this.suspended) return;
+      this.frameStart = performance.now();
+      void wg.resume();
+    }, wait);
+  }
+
+  /** Stop processing frames while gaze isn't needed (e.g. the app is hidden); resume with `false`. */
+  setSuspended(suspended: boolean) {
+    if (suspended === this.suspended || !this.running) return;
+    this.suspended = suspended;
+    if (suspended) {
+      if (this.resumeTimer) clearTimeout(this.resumeTimer);
+      this.resumeTimer = null;
+      this.pause();
+    } else {
+      this.frameStart = performance.now();
+      this.resume();
+    }
+  }
+
+  get isSuspended() {
+    return this.suspended;
+  }
+
   /** Center the camera preview so the participant can position their face. */
   positionPreview(mode: 'center' | 'corner' | 'hidden') {
     const el = document.getElementById('webgazerVideoContainer');
@@ -56,6 +101,9 @@ export class EyeTracker {
     el.style.boxShadow = '0 10px 30px rgba(15,23,42,.25)';
     if (mode === 'hidden') {
       this.wg?.showVideoPreview(false);
+      // No overlay drawing while nobody sees it (saves CPU); the video keeps feeding the tracker.
+      this.wg?.showFaceOverlay(false);
+      this.wg?.showFaceFeedbackBox(false);
       el.style.opacity = '0';
       el.style.pointerEvents = 'none';
       return;
@@ -115,6 +163,8 @@ export class EyeTracker {
   stop() {
     this.running = false;
     this.listener = null;
+    if (this.resumeTimer) clearTimeout(this.resumeTimer);
+    this.resumeTimer = null;
     try {
       this.wg?.pause();
       this.wg?.end();

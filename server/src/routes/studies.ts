@@ -236,6 +236,7 @@ const VariantBody = z.object({
   appId: z.string().min(1).nullable().optional(),
   weight: z.number().min(0).max(1000).optional(),
   active: z.boolean().optional(),
+  appParams: z.string().trim().max(2000).transform((s) => s.replace(/^[?&]+/, '')).optional(),
 });
 
 studiesRouter.post('/studies/:id/variants', (req, res) => {
@@ -245,8 +246,8 @@ studiesRouter.post('/studies/:id/variants', (req, res) => {
   assertInStudy('protocols', body.protocolId, studyId, 'Protocol');
   if (body.appId) assertInStudy('apps', body.appId, studyId, 'App');
   const id = newId('var');
-  db.prepare('INSERT INTO variants (id, study_id, name, protocol_id, app_id, weight, active, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)').run(
-    id, studyId, body.name, body.protocolId, body.appId ?? null, body.weight ?? 1, Date.now(),
+  db.prepare('INSERT INTO variants (id, study_id, name, protocol_id, app_id, weight, active, created_at, app_params) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)').run(
+    id, studyId, body.name, body.protocolId, body.appId ?? null, body.weight ?? 1, Date.now(), body.appParams ?? '',
   );
   touchStudy(studyId);
   res.status(201).json({ variant: variantFromRow(db.prepare('SELECT * FROM variants WHERE id = ?').get(id) as Row) });
@@ -265,9 +266,10 @@ studiesRouter.patch('/variants/:vid', (req, res) => {
     appId: body.appId === undefined ? v.appId : body.appId,
     weight: body.weight ?? v.weight,
     active: body.active ?? v.active,
+    appParams: body.appParams ?? v.appParams ?? '',
   };
-  db.prepare('UPDATE variants SET name = ?, protocol_id = ?, app_id = ?, weight = ?, active = ? WHERE id = ?').run(
-    next.name, next.protocolId, next.appId, next.weight, next.active ? 1 : 0, v.id,
+  db.prepare('UPDATE variants SET name = ?, protocol_id = ?, app_id = ?, weight = ?, active = ?, app_params = ? WHERE id = ?').run(
+    next.name, next.protocolId, next.appId, next.weight, next.active ? 1 : 0, next.appParams, v.id,
   );
   touchStudy(studyId);
   res.json({ variant: variantFromRow(db.prepare('SELECT * FROM variants WHERE id = ?').get(v.id) as Row) });

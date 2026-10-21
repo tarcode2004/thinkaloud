@@ -69,7 +69,19 @@
           <button class="btn" id="add-to-cart" data-id="${m[1]}">Add to cart</button>`;
       } else if (path === '/cart') {
         document.title = 'Cart – Lumen Home';
-        app.innerHTML = `<h1>Your cart</h1>${cart.length ? `<ul id="cart-items">${cart.map((id) => `<li>${products[id].name}</li>`).join('')}</ul>` : '<p>Your cart is empty.</p>'}`;
+        app.innerHTML = `<h1>Your cart</h1>${cart.length ? `<ul id="cart-items">${cart.map((id) => `<li>${products[id].name}</li>`).join('')}</ul>` : '<p>Your cart is empty.</p>'}
+          <p><a href="/checkout" data-link id="checkout-link">Checkout</a></p>`;
+      } else if (path === '/checkout') {
+        // Deliberately glitchy controls for robustness tests (tests/e2e/participant-hardening.spec.ts).
+        document.title = 'Checkout – Lumen Home';
+        app.innerHTML = `<h1>Checkout</h1>
+          <p class="price">Delivery in 3–5 days.</p>
+          <div class="card" id="gift-wrap" style="cursor:pointer;display:inline-block">Add gift wrap</div>
+          <p style="margin-top:20px;display:flex;gap:12px;flex-wrap:wrap">
+            <button class="btn" id="apply-coupon">Apply coupon</button>
+            <button class="btn" id="place-order">Place order</button>
+            <button class="btn" id="track-order">Track order</button>
+          </p>`;
       } else {
         app.innerHTML = '<h1>Page not found</h1>';
       }
@@ -84,6 +96,21 @@
         e.preventDefault();
         go(a.getAttribute('href'));
         return;
+      }
+      if (e.target.closest('#apply-coupon')) {
+        // Uncaught runtime error (the page stays usable).
+        setTimeout(() => { const coupon = null; coupon.code.trim(); }, 0);
+        return;
+      }
+      if (e.target.closest('#place-order')) {
+        // Freeze: the main thread never yields again.
+        for (;;) {}
+      }
+      if (e.target.closest('#track-order')) {
+        // White screen: the app tears down its UI and throws (like an unhandled React render error).
+        document.querySelector('header').remove();
+        document.getElementById('app').remove();
+        throw new Error("Cannot read properties of undefined (reading 'status')");
       }
       const add = e.target.closest('#add-to-cart');
       if (add) {

@@ -24,7 +24,8 @@ export interface RealtimeHandlers {
   onUserTranscriptDelta?: (itemId: string, delta: string) => void;
   onUserTranscript?: (itemId: string, text: string) => void;
   onAssistantTranscriptDelta?: (responseId: string, delta: string) => void;
-  onAssistantTranscript?: (responseId: string, text: string) => void;
+  /** `phase`: gpt-realtime-2 marks spoken preambles as 'commentary' and the actual reply as 'final_answer'. */
+  onAssistantTranscript?: (responseId: string, text: string, phase?: string) => void;
   onAssistantAudioStart?: () => void;
   onAssistantAudioStop?: () => void;
   onResponseStart?: () => void;
@@ -58,6 +59,12 @@ export class RealtimeClient {
   private pendingCallOutputs = 0;
   private respondAfterCalls = false;
   private reconnects = 0;
+  private connectedAt = 0;
+  /** Out-of-band (conversation: 'none', text-only) classification requests, by our id / by response id. */
+  private oob = new Map<string, { resolve: (text: string | null) => void; text: string }>();
+  private oobByResponse = new Map<string, string>();
+  private oobSeq = 0;
+  private itemPhase = new Map<string, string>();
   private closedByUs = false;
   assistantAudioPlaying = false;
   userSpeaking = false;
@@ -134,17 +141,42 @@ export class RealtimeClient {
     await pc.setRemoteDescription({ type: 'answer', sdp });
     await opened;
     this.activeResponse = false;
+    this.connectedAt = Date.now();
     this.setStatus('connected');
     const queued = this.outbox.splice(0);
     this.opts.handlers.onReady?.(this.reconnects > 0);
     for (const q of queued) this.send(q);
   }
 
+  /**
+   * Initial connect with one retry (fresh token + SDP exchange) before giving up, so a transient
+   * failure does not drop the participant into the on-screen fallback.
+   */
+  async connectWithRetry(): Promise<void> {
+    try {
+      await this.connect();
+    } catch (e) {
+      if (this.closedByUs) throw e;
+      console.warn('[realtime] connect failed, retrying once:', (e as Error).message);
+      this.teardown();
+      await new Promise((r) => setTimeout(r, 1500));
+      if (this.closedByUs) throw e;
+      this.reconnects++;
+      try {
+        await this.connect();
+      } catch (e2) {
+        this.teardown();
+        throw e2;
+      }
+    }
+  }
+
   private async handleDrop(reason: string) {
     if (this.closedByUs) return;
     console.warn('[realtime] connection dropped:', reason);
     this.teardown();
-    if (this.reconnects >= 1) {
+    // One reconnect attempt per drop; a connection that drops again within a minute is given up.
+    if (this.reconnects >= 1 && Date.now() - this.connectedAt < 60_000) {
       this.setStatus('failed', reason);
       return;
     }
@@ -161,6 +193,9 @@ export class RealtimeClient {
     const pc = this.pc;
     this.pc = null;
     this.dc = null;
+    for (const o of this.oob.values()) o.resolve(null);
+    this.oob.clear();
+    this.oobByResponse.clear();
     this.activeResponse = false;
     this.assistantAudioPlaying = false;
     try {
@@ -201,6 +236,46 @@ export class RealtimeClient {
     }
     if (this.dc?.readyState === 'open') this.dc.send(JSON.stringify(ev));
     else if (this.status === 'connecting' || this.status === 'reconnecting') this.outbox.push(ev);
+  }
+
+  /**
+   * Ask the model a side question without speaking and without touching the conversation
+   * (out-of-band response: conversation 'none', text output). It still sees the conversation so
+   * far, including the participant's latest audio. Resolves null on timeout / no connection.
+   */
+  classify(instructions: string, timeoutMs = 4000): Promise<string | null> {
+    if (this.dc?.readyState !== 'open') return Promise.resolve(null);
+    const id = `ta_oob_${++this.oobSeq}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => done(null), timeoutMs);
+      const done = (t: string | null) => {
+        clearTimeout(timer);
+        if (!this.oob.has(id)) return;
+        this.oob.delete(id);
+        for (const [rid, oid] of this.oobByResponse) if (oid === id) this.oobByResponse.delete(rid);
+        resolve(t);
+      };
+      this.oob.set(id, { resolve: done, text: '' });
+      this.dc!.send(
+        JSON.stringify({
+          type: 'response.create',
+          event_id: id,
+          response: { conversation: 'none', metadata: { ta_oob: id }, output_modalities: ['text'], instructions, tool_choice: 'none', max_output_tokens: 400 },
+        }),
+      );
+    });
+  }
+
+  private oobOf(ev: ServerEvent): { id: string; o: { resolve: (t: string | null) => void; text: string } } | null {
+    const resp = ev.response as { id?: string; metadata?: Record<string, string> | null } | undefined;
+    const rid = (ev.response_id as string | undefined) ?? resp?.id;
+    let id = rid ? this.oobByResponse.get(rid) : undefined;
+    if (!id && resp?.metadata?.ta_oob) {
+      id = resp.metadata.ta_oob;
+      if (rid) this.oobByResponse.set(rid, id);
+    }
+    const o = id ? this.oob.get(id) : undefined;
+    return id && o ? { id, o } : id ? { id, o: { resolve: () => {}, text: '' } } : null;
   }
 
   updateSession(session: Record<string, unknown>) {
@@ -276,6 +351,19 @@ export class RealtimeClient {
   private handle(ev: ServerEvent) {
     const h = this.opts.handlers;
     h.onServerEvent?.(ev);
+    // Out-of-band classification responses never affect the conversation state or captions.
+    if (ev.type.startsWith('response.')) {
+      const oob = this.oobOf(ev);
+      if (oob) {
+        if (ev.type === 'response.output_text.delta') oob.o.text += (ev.delta as string) ?? '';
+        if (ev.type === 'response.done') {
+          const resp = ev.response as { output?: { content?: { text?: string; transcript?: string }[] }[] } | undefined;
+          const text = resp?.output?.flatMap((i) => i.content ?? []).map((c) => c.text ?? c.transcript ?? '').join('') || oob.o.text;
+          oob.o.resolve(text.trim());
+        }
+        return;
+      }
+    }
     switch (ev.type) {
       case 'response.created':
         this.createdSeen++;
@@ -296,8 +384,14 @@ export class RealtimeClient {
       case 'response.function_call_arguments.done':
         this.onCall(ev.call_id as string, ev.name as string, (ev.arguments as string) ?? '{}');
         break;
+      case 'response.output_item.added':
       case 'response.output_item.done': {
-        const item = ev.item as { type?: string; call_id?: string; name?: string; arguments?: string } | undefined;
+        const item = ev.item as { id?: string; type?: string; call_id?: string; name?: string; arguments?: string; phase?: string } | undefined;
+        if (item?.type === 'message' && item.id && item.phase) {
+          this.itemPhase.set(item.id, item.phase);
+          if (this.itemPhase.size > 200) this.itemPhase.delete(this.itemPhase.keys().next().value!);
+        }
+        if (ev.type === 'response.output_item.added') break;
         if (item?.type === 'function_call' && item.call_id) this.onCall(item.call_id, item.name ?? '', item.arguments ?? '{}');
         break;
       }
@@ -320,10 +414,10 @@ export class RealtimeClient {
         h.onAssistantTranscriptDelta?.(`${ev.response_id as string}:${(ev.item_id as string) ?? ''}`, (ev.delta as string) ?? '');
         break;
       case 'response.output_audio_transcript.done':
-        h.onAssistantTranscript?.(`${ev.response_id as string}:${(ev.item_id as string) ?? ''}`, ((ev.transcript as string) ?? '').trim());
+        h.onAssistantTranscript?.(`${ev.response_id as string}:${(ev.item_id as string) ?? ''}`, ((ev.transcript as string) ?? '').trim(), this.itemPhase.get(ev.item_id as string));
         break;
       case 'response.output_text.done':
-        h.onAssistantTranscript?.(`${ev.response_id as string}:${(ev.item_id as string) ?? ''}`, ((ev.text as string) ?? '').trim());
+        h.onAssistantTranscript?.(`${ev.response_id as string}:${(ev.item_id as string) ?? ''}`, ((ev.text as string) ?? '').trim(), this.itemPhase.get(ev.item_id as string));
         break;
       case 'output_audio_buffer.started':
         this.assistantAudioPlaying = true;
@@ -337,8 +431,13 @@ export class RealtimeClient {
         }
         break;
       case 'error': {
-        const err = ev.error as { message?: string; code?: string } | undefined;
+        const err = ev.error as { message?: string; code?: string; event_id?: string } | undefined;
         const code = err?.code;
+        if (err?.event_id?.startsWith('ta_oob_')) {
+          console.warn('[realtime] classification failed', err.message);
+          this.oob.get(err.event_id)?.resolve(null);
+          break;
+        }
         if (code === 'conversation_already_has_active_response') {
           // Our response.create raced with a VAD-created response: retry after it ends.
           this.activeResponse = true;

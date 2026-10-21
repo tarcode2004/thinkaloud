@@ -3,7 +3,7 @@
 // cited time; unverifiable evidence is dropped and insights without evidence are discarded.
 import OpenAI, { APIError } from 'openai';
 import type { Answer, SessionEvent, Step, TaskResult } from '@thinkaloud/shared';
-import { newId, questionnaireItems } from '@thinkaloud/shared';
+import { newId, stepQuestions } from '@thinkaloud/shared';
 import { verifyInsights, type ProposedInsight, type SessionCorpus, type SynthesisX, type TranscriptLine } from './verify.ts';
 import { db, json } from '../db.ts';
 import { config } from '../lib/config.ts';
@@ -149,9 +149,7 @@ function sessionBlock(
   const titles = new Map(s.steps.map((st) => [st.id, st.title]));
   const prompts = new Map<string, string>();
   for (const st of s.steps) {
-    if (st.type === 'question') prompts.set(`${st.id}:${st.question.id}`, st.question.prompt);
-    if (st.type === 'questionnaire') for (const q of questionnaireItems(st)) prompts.set(`${st.id}:${q.id}`, q.prompt);
-    if (st.type === 'task') for (const q of st.postTaskQuestions ?? []) prompts.set(`${st.id}:${q.id}`, q.prompt);
+    for (const q of stepQuestions(st)) prompts.set(`${st.id}:${q.id}`, q.prompt); // incl. interview questions
   }
   const sc = scoreSession(answers);
   const dur = sessionDurationMs(s);

@@ -3,16 +3,21 @@
 // See ./README.md for URL schemes and deployment.
 import fs from 'node:fs';
 import path from 'node:path';
-import { Readable } from 'node:stream';
+import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
 import express, { type Request, type Response } from 'express';
 import { db } from '../db.ts';
 import { config } from '../lib/config.ts';
 import { paths } from '../lib/paths.ts';
 import { readMeta } from '../builds/meta.ts';
+import { guardedLookup, isPrivateAddress, privateProxyAllowed, SsrfError } from '../lib/ssrf.ts';
 import { appHostBaseHostname, appHostRouting, appIdFromLabel, hostedAppBase } from './urls.ts';
+import { proxyServerApp, upgradeServerApp } from './serverProxy.ts';
 
 const PROBE_PATH = '/__thinkaloud/probe.js';
-const PROBE_TAG = `<script src="${PROBE_PATH}"></script>`;
+// data-ta-hosted: the probe also disables service workers (they would serve stale builds after a rebuild).
+const PROBE_TAG = `<script src="${PROBE_PATH}" data-ta-hosted></script>`;
 const FRAME_ANCESTORS = process.env.APP_FRAME_ANCESTORS || '*';
 const APP_COOKIE = 'ta_app';
 const APP_ID_RE = /^[a-z]+_[a-z0-9]+$/;
@@ -133,21 +138,103 @@ function statFile(p: string): fs.Stats | undefined {
   }
 }
 
+/** The file must really live inside dist: a symlinked *directory* on the way (dist/x → /) is not followed. */
+function insideDist(dist: string, p: string): string | undefined {
+  try {
+    const realDist = fs.realpathSync(dist);
+    const real = fs.realpathSync(p);
+    return real === realDist || real.startsWith(realDist + path.sep) ? p : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function resolveFile(dist: string, urlPath: string): string | undefined {
   const p = safeJoin(dist, urlPath);
   if (!p) return undefined;
   const st = statFile(p);
-  if (st?.isFile()) return p;
+  if (st?.isFile()) return insideDist(dist, p);
   if (st?.isDirectory()) {
     const idx = path.join(p, 'index.html');
-    if (statFile(idx)?.isFile()) return idx;
+    if (statFile(idx)?.isFile()) return insideDist(dist, idx);
   }
   if (!path.extname(p)) {
     const html = p.replace(/\/$/, '') + '.html'; // Next static export: /about → about.html
-    if (statFile(html)?.isFile()) return html;
+    if (statFile(html)?.isFile()) return insideDist(dist, html);
+    const dyn = resolveDynamic(dist, urlPath);
+    if (dyn) return insideDist(dist, dyn);
   }
   return undefined;
 }
+
+/**
+ * Pre-rendered dynamic routes (Expo Router static export, some SSGs): /post/123 → post/[id].html,
+ * /docs/a/b → docs/[...slug].html. Literal names win over [param] names at every level.
+ */
+export function resolveDynamic(dist: string, urlPath: string): string | undefined {
+  let segs: string[];
+  try {
+    segs = decodeURIComponent(urlPath).split('/').filter(Boolean);
+  } catch {
+    return undefined;
+  }
+  if (!segs.length || segs.some((x) => x === '..' || x.includes('\0'))) return undefined;
+  const walk = (dir: string, i: number): string | undefined => {
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      return undefined;
+    }
+    const seg = segs[i];
+    const last = i === segs.length - 1;
+    const tryHtml = (n: string) => {
+      const f = path.join(dir, n);
+      return statFile(f)?.isFile() ? f : undefined;
+    };
+    if (last && names.includes(seg + '.html')) return tryHtml(seg + '.html');
+    if (names.includes(seg) && statFile(path.join(dir, seg))?.isDirectory()) {
+      const r = last ? tryHtml(path.join(seg, 'index.html')) : walk(path.join(dir, seg), i + 1);
+      if (r) return r;
+    }
+    for (const n of names) {
+      const m = /^\[([^\]]+)\](\.html)?$/.exec(n);
+      if (!m || m[1].startsWith('...') || m[1].startsWith('[')) continue;
+      if (m[2] && last) return tryHtml(n);
+      if (!m[2] && statFile(path.join(dir, n))?.isDirectory()) {
+        const r = last ? tryHtml(path.join(n, 'index.html')) : walk(path.join(dir, n), i + 1);
+        if (r) return r;
+      }
+    }
+    const catchAll = names.find((n) => /^\[\[?\.\.\.[^\]]+\]\]?\.html$/.test(n));
+    return catchAll ? tryHtml(catchAll) : undefined;
+  };
+  return walk(dist, 0);
+}
+
+const MIME_OVERRIDES: Record<string, string> = {
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.cjs': 'text/javascript; charset=utf-8',
+  '.wasm': 'application/wasm',
+  '.webmanifest': 'application/manifest+json',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.map': 'application/json; charset=utf-8',
+  '.avif': 'image/avif',
+  '.glb': 'model/gltf-binary',
+  '.gltf': 'model/gltf+json',
+  '.hbc': 'application/octet-stream',
+};
+
+/** fetch()/XHR (not a page load): never answer with the SPA's index.html. */
+const isDataRequest = (req: Request) => {
+  const dest = req.get('sec-fetch-dest');
+  if (dest) return dest === 'empty';
+  const accept = req.get('accept') || '';
+  return accept.includes('application/json') && !accept.includes('text/html');
+};
 
 const PAGE_STYLE =
   "body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f5f7;color:#1d1d1f;font:15px/1.5 -apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',system-ui,sans-serif;-webkit-font-smoothing:antialiased}" +
@@ -180,13 +267,17 @@ function serveBuild(app: AppRow, urlPath: string, req: Request, res: Response, s
   if (app.status !== 'ready') return sendHtml(res, buildingPage(app), 503);
   const dist = path.resolve(paths.appDist(app.id as string));
   if (req.method !== 'GET' && req.method !== 'HEAD') {
-    res.status(405).type('text/plain').send('Method not allowed');
+    res.status(405).json({ error: 'Method not allowed', thinkaloud: `This app is hosted as static files, so ${req.method} ${urlPath} has no backend. Point the app at a reachable API (env var), or host it as a server app.` });
     return;
   }
   let file = resolveFile(dist, urlPath);
   if (!file) {
     const ext = path.extname(urlPath.split('?')[0]);
     const wantsHtml = !ext || ext === '.html' || ext === '.htm';
+    if (wantsHtml && !ext && isDataRequest(req)) {
+      res.status(404).json({ error: 'Not found', thinkaloud: `No file at ${urlPath}. This app is hosted as static files; relative API calls have no backend.` });
+      return;
+    }
     if (!wantsHtml) {
       res.status(404).type('text/plain').send('Not found');
       return;
@@ -204,6 +295,8 @@ function serveBuild(app: AppRow, urlPath: string, req: Request, res: Response, s
   if (/\.html?$/i.test(file)) return sendHtml(res, withPrefixStrip(readInjected(file), stripPrefixOf));
   const rel = path.relative(dist, file).split(path.sep).join('/');
   res.setHeader('Cache-Control', HASHED_RE.test(rel) ? 'public, max-age=31536000, immutable' : 'no-cache');
+  const mime = MIME_OVERRIDES[path.extname(file).toLowerCase()];
+  if (mime) res.setHeader('Content-Type', mime);
   res.sendFile(file, { dotfiles: 'allow', cacheControl: false, lastModified: true, etag: true });
 }
 
@@ -218,38 +311,48 @@ async function proxyExternal(app: AppRow, urlPath: string, search: string, req: 
   const target = new URL(String(app.source_url));
   const upstream = new URL(urlPath + search, target.origin);
   const selfBase = hostedAppBase(app.id as string).replace(/\/$/, '');
-  const headers = new Headers();
-  for (const [k, v] of Object.entries(req.headers)) {
-    if (v === undefined || ['host', 'connection', 'accept-encoding', 'content-length', 'cookie'].includes(k)) continue;
-    headers.set(k, Array.isArray(v) ? v.join(', ') : v);
+  // SSRF: IP-literal hosts never hit DNS, so check them here; hostnames are checked at connect time by guardedLookup.
+  const bareHost = upstream.hostname.replace(/^\[|\]$/g, '');
+  if (!privateProxyAllowed() && (net.isIP(bareHost) ? isPrivateAddress(bareHost) : /(^|\.)(localhost|internal|local)$/.test(bareHost))) {
+    res.status(403).type('text/plain').send(`Refusing to proxy ${upstream.host}: private or internal address (set ALLOW_PRIVATE_PROXY=1 for local development)`);
+    return;
   }
+  const headers: http.OutgoingHttpHeaders = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (v === undefined || ['host', 'connection', 'accept-encoding', 'content-length', 'cookie', 'keep-alive', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'proxy-authorization', 'proxy-connection'].includes(k)) continue;
+    headers[k] = v;
+  }
+  headers.host = upstream.host;
+  headers['accept-encoding'] = 'identity';
   const cookie = req.headers.cookie
     ?.split(';')
     .filter((c) => c.trim().split('=')[0] !== APP_COOKIE)
     .join(';');
-  if (cookie) headers.set('cookie', cookie);
-  if (headers.has('origin')) headers.set('origin', target.origin);
-  if (headers.has('referer')) headers.set('referer', target.origin + '/');
+  if (cookie) headers.cookie = cookie;
+  if (headers.origin) headers.origin = target.origin;
+  if (headers.referer) headers.referer = target.origin + '/';
   const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
-  let r: globalThis.Response;
-  try {
-    r = await fetch(upstream, {
-      method: req.method,
-      headers,
-      body: hasBody ? (Readable.toWeb(req) as ReadableStream) : undefined,
-      redirect: 'manual',
-      // @ts-expect-error Node fetch needs duplex for streamed bodies
-      duplex: hasBody ? 'half' : undefined,
-    });
-  } catch (e) {
-    res.status(502).type('text/plain').send(`Could not reach ${target.origin}: ${(e as Error).message}`);
+  if (hasBody && req.headers['content-length']) headers['content-length'] = req.headers['content-length'];
+  else if (hasBody && req.headers['transfer-encoding']) headers['transfer-encoding'] = req.headers['transfer-encoding'];
+  const mod = upstream.protocol === 'https:' ? https : http;
+  // Redirects are never followed here: Location is rewritten and the browser re-requests through this proxy (re-checked).
+  const r = await new Promise<http.IncomingMessage | Error>((resolve) => {
+    const up = mod.request(upstream, { method: req.method, headers, lookup: guardedLookup, timeout: 30_000 }, resolve);
+    up.on('timeout', () => up.destroy(new Error('timed out')));
+    up.on('error', resolve);
+    if (hasBody) req.pipe(up);
+    else up.end();
+  });
+  if (r instanceof Error) {
+    const blocked = r instanceof SsrfError;
+    res.status(blocked ? 403 : 502).type('text/plain').send(blocked ? `Refusing to proxy: ${r.message}` : `Could not reach ${target.origin}: ${r.message}`);
     return;
   }
-  res.status(r.status);
-  r.headers.forEach((v, k) => {
-    if (!HOP_HEADERS.has(k)) res.setHeader(k, v);
-  });
-  const loc = r.headers.get('location');
+  res.status(r.statusCode || 502);
+  for (const [k, v] of Object.entries(r.headers)) {
+    if (v !== undefined && !HOP_HEADERS.has(k)) res.setHeader(k, v as string | string[]);
+  }
+  const loc = r.headers.location;
   if (loc) {
     try {
       const l = new URL(loc, upstream);
@@ -258,7 +361,7 @@ async function proxyExternal(app: AppRow, urlPath: string, search: string, req: 
       /* keep */
     }
   }
-  const cookies = r.headers.getSetCookie?.() ?? [];
+  const cookies = r.headers['set-cookie'] ?? [];
   if (cookies.length) {
     res.setHeader(
       'set-cookie',
@@ -269,9 +372,11 @@ async function proxyExternal(app: AppRow, urlPath: string, search: string, req: 
       }),
     );
   }
-  const ct = r.headers.get('content-type') || '';
-  if (ct.includes('text/html') && r.body) {
-    let html = await r.text();
+  const ct = String(r.headers['content-type'] || '');
+  if (ct.includes('text/html') && req.method !== 'HEAD') {
+    const chunks: Buffer[] = [];
+    for await (const c of r) chunks.push(c as Buffer);
+    let html = Buffer.concat(chunks).toString('utf8');
     const originRe = new RegExp(target.origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
     const protoRelRe = new RegExp(`(["'(])//${target.host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'g');
     html = html.replace(originRe, selfBase).replace(protoRelRe, `$1${selfBase}`);
@@ -281,11 +386,12 @@ async function proxyExternal(app: AppRow, urlPath: string, search: string, req: 
     res.send(injectProbe(html));
     return;
   }
-  if (!r.body || req.method === 'HEAD') {
+  if (req.method === 'HEAD') {
+    r.resume();
     res.end();
     return;
   }
-  Readable.fromWeb(r.body as never).pipe(res);
+  r.pipe(res);
 }
 
 // ── Server ──────────────────────────────────────────────────────────────────
@@ -297,6 +403,14 @@ function serveApp(app: AppRow, urlPath: string, search: string, req: Request, re
   if (app.source_kind === 'url') {
     if (!readMeta(app.id as string).proxy) return notHosted(res, 'This app is an external URL and is not proxied.');
     return proxyExternal(app, urlPath, search, req, res);
+  }
+  if (app.status === 'ready' && readMeta(app.id as string).server) {
+    return proxyServerApp(app.id as string, urlPath, search, req, res, {
+      inject: injectProbe,
+      statusPage,
+      prefix: stripPrefixOf ? `/a/${stripPrefixOf}` : undefined,
+      extraHead: stripPrefixOf ? (html) => withPrefixStrip(html, stripPrefixOf) : undefined,
+    });
   }
   return serveBuild(app, urlPath, req, res, stripPrefixOf);
 }
@@ -370,5 +484,17 @@ export function startAppHost() {
     console.log(`ThinkAloud app host on ${config.appHostUrl} (port ${config.appHostPort}, ${appHostRouting} routing, e.g. ${hostedAppBase('app_example')})`);
   });
   server.on('error', (e) => console.error('[apphost] failed to start:', e));
+  // WebSocket upgrades for server apps (subdomain routing).
+  server.on('upgrade', (req, socket, head) => {
+    try {
+      const host = String(req.headers.host || '').split(':')[0].toLowerCase();
+      const label = host !== appHostBaseHostname && host.includes('.') ? host.split('.')[0] : '';
+      const row = /^[a-z]+-[a-z0-9]+$/.test(label) ? loadApp(appIdFromLabel(label)) : undefined;
+      if (!row || row.status !== 'ready' || !readMeta(row.id as string).server) return void socket.destroy();
+      upgradeServerApp(row.id as string, req, socket, head, req.url || '/');
+    } catch {
+      socket.destroy();
+    }
+  });
   return server;
 }

@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlertCircle, ExternalLink, FileArchive, MoreHorizontal, RefreshCw, ScrollText, Trash2, Upload } from 'lucide-react';
-import type { AppBuild } from '@thinkaloud/shared';
+import { AlertCircle, ExternalLink, FileArchive, MoreHorizontal, RefreshCw, ScrollText, SlidersHorizontal, Trash2, Upload } from 'lucide-react';
+import type { AppBuild, AppBuildSettings } from '@thinkaloud/shared';
 import { api } from '../../lib/api.ts';
 import { timeAgo, useInterval } from '../../lib/hooks.ts';
-import { Button, cn, Field, Input, Modal, Spinner } from '../../ui/index.tsx';
+import { Button, cn, Field, Input, Modal, Spinner, Textarea } from '../../ui/index.tsx';
 import { useToast } from '../../ui/toast.tsx';
 import { Callout, Group, Menu, MenuItem, Segmented, Switch } from '../components/index.tsx';
 import { copy, errorMessage } from '../lib.ts';
@@ -12,7 +12,22 @@ import { useStudy } from './StudyContext.tsx';
 type App = AppBuild & { proxy?: boolean };
 type Source = 'upload' | 'url' | 'git';
 
-const FRAMEWORK: Record<string, string> = { vite: 'Vite', cra: 'Create React App', 'next-static': 'Next.js static', 'expo-web': 'Expo web', static: 'Static site', unknown: 'Detecting…' };
+const FRAMEWORK: Record<string, string> = { vite: 'Vite', cra: 'Create React App', 'next-static': 'Next.js static', 'next-server': 'Next.js server', 'node-server': 'Node server', 'expo-web': 'Expo web', static: 'Static site', unknown: 'Detecting…' };
+const RUNTIME: Record<string, string> = { running: 'Server running', starting: 'Server starting', stopped: 'Server stopped', failed: 'Server failed' };
+
+/** "KEY=value" lines ↔ env object. Blank lines and # comments are ignored. */
+export function parseEnv(text: string): { env: Record<string, string>; error?: string } {
+  const env: Record<string, string> = {};
+  for (const [i, raw] of text.split('\n').entries()) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!m) return { env, error: `Line ${i + 1}: use KEY=value` };
+    env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
+  }
+  return { env };
+}
+const formatEnv = (env?: Record<string, string>) => Object.entries(env ?? {}).map(([k, v]) => `${k}=${v}`).join('\n');
 const STATUS: Record<string, { label: string; dot: string }> = {
   queued: { label: 'Queued', dot: 'bg-tertiary' },
   building: { label: 'Building', dot: 'bg-sys-orange animate-pulse' },
@@ -26,6 +41,7 @@ export default function AppsPage() {
   const toast = useToast();
   const [logApp, setLogApp] = useState<App | null>(null);
   const [openApp, setOpenApp] = useState<App | null>(null);
+  const [settingsApp, setSettingsApp] = useState<App | null>(null);
   const pending = apps.filter((a) => a.status === 'queued' || a.status === 'building');
 
   const setApp = (a: App) => update((d) => ({ ...d, apps: d.apps.some((x) => x.id === a.id) ? d.apps.map((x) => (x.id === a.id ? a : x)) : [a, ...d.apps] }));
@@ -87,7 +103,7 @@ export default function AppsPage() {
             ) : (
               <Group className="mt-3">
                 {apps.map((a) => (
-                  <AppRow key={a.id} a={a} usedBy={detail.variants.filter((v) => v.appId === a.id).map((v) => v.name)} onLog={() => setLogApp(a)} onOpen={() => setOpenApp(a)} onRebuild={() => rebuild(a)} onDelete={() => remove(a)} onProxy={(proxy) => patch(a, { proxy })} />
+                  <AppRow key={a.id} a={a} usedBy={detail.variants.filter((v) => v.appId === a.id).map((v) => v.name)} onLog={() => setLogApp(a)} onOpen={() => setOpenApp(a)} onRebuild={() => rebuild(a)} onDelete={() => remove(a)} onProxy={(proxy) => patch(a, { proxy })} onSettings={() => setSettingsApp(a)} />
                 ))}
               </Group>
             )}
@@ -101,7 +117,8 @@ export default function AppsPage() {
               {[
                 ['Vite', 'React, Vue, Svelte. We run the build script and serve dist/.'],
                 ['Create React App', 'Built with react-scripts and served from build/.'],
-                ['Next.js', 'Static export only (output: "export"). Server components and API routes are not supported.'],
+                ['Next.js', 'Static export when output is "export". Apps with route handlers, server actions or redirects run as a server (next start).'],
+                ['Remix, React Router, Nuxt, Node', 'Run as a server app with the start script. SPA mode (ssr: false) is served as static files.'],
                 ['Expo / React Native', 'Exported for the web via react-native-web (npx expo export -p web).'],
                 ['Prebuilt static', 'Zip a folder that contains index.html and we serve it as is.'],
               ].map(([t, d]) => (
@@ -116,6 +133,7 @@ export default function AppsPage() {
             <h3 className="text-[15px] font-semibold text-label">Tips</h3>
             <ul className="mt-2 list-disc space-y-1.5 pl-4">
               <li>Leave out node_modules. We install dependencies.</li>
+              <li>Set VITE_*, EXPO_PUBLIC_* or NEXT_PUBLIC_* values under Build settings.</li>
               <li>Absolute asset paths like /assets/… work.</li>
               <li>Client-side routing is supported through an SPA fallback.</li>
               <li>Use mock data or a test account. Participants will see real data.</li>
@@ -126,11 +144,12 @@ export default function AppsPage() {
 
       <LogModal app={logApp} onClose={() => setLogApp(null)} />
       <OpenModal app={openApp} onClose={() => setOpenApp(null)} />
+      <SettingsModal app={settingsApp} onClose={() => setSettingsApp(null)} onSaved={(a, rebuilt) => { setApp(a); toast(rebuilt ? 'Saved. Rebuilding…' : 'Build settings saved'); }} />
     </div>
   );
 }
 
-function AppRow({ a, usedBy, onLog, onOpen, onRebuild, onDelete, onProxy }: { a: App; usedBy: string[]; onLog: () => void; onOpen: () => void; onRebuild: () => void; onDelete: () => void; onProxy: (v: boolean) => void }) {
+function AppRow({ a, usedBy, onLog, onOpen, onRebuild, onDelete, onProxy, onSettings }: { a: App; usedBy: string[]; onLog: () => void; onOpen: () => void; onRebuild: () => void; onDelete: () => void; onProxy: (v: boolean) => void; onSettings: () => void }) {
   const toast = useToast();
   const st = STATUS[a.status] ?? STATUS.queued;
   const [snippet, setSnippet] = useState<string | null>(null);
@@ -149,6 +168,7 @@ function AppRow({ a, usedBy, onLog, onOpen, onRebuild, onDelete, onProxy }: { a:
           <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[13px] text-secondary">
             <span className="inline-flex items-center gap-1.5"><span className={cn('size-2 rounded-full', st.dot)} />{st.label}</span>
             {a.sourceKind !== 'url' && <span>{FRAMEWORK[a.framework] ?? a.framework}</span>}
+            {a.status === 'ready' && a.runtime && <span className={cn(a.runtime.state === 'failed' && 'text-[#d70015]')} title={a.runtime.error}>{RUNTIME[a.runtime.state] ?? a.runtime.state}</span>}
             <span className="max-w-[320px] truncate">{source}</span>
             <span className="text-tertiary">{timeAgo(a.updatedAt)}</span>
           </div>
@@ -160,6 +180,7 @@ function AppRow({ a, usedBy, onLog, onOpen, onRebuild, onDelete, onProxy }: { a:
             {(close) => (
               <>
                 {a.url && <MenuItem icon={<ExternalLink className="size-4" />} onClick={() => { close(); window.open(a.url, '_blank'); }}>Open in new tab</MenuItem>}
+                {a.sourceKind !== 'url' && <MenuItem icon={<SlidersHorizontal className="size-4" />} onClick={() => { close(); onSettings(); }}>Build settings</MenuItem>}
                 {a.sourceKind !== 'url' && <MenuItem icon={<RefreshCw className="size-4" />} onClick={() => { close(); onRebuild(); }}>Rebuild</MenuItem>}
                 <MenuItem danger icon={<Trash2 className="size-4" />} onClick={() => { close(); onDelete(); }}>Delete</MenuItem>
               </>
@@ -210,6 +231,8 @@ function AddApp({ onAdded }: { onAdded: (a: App) => void }) {
   const [gitUrl, setGitUrl] = useState('');
   const [branch, setBranch] = useState('');
   const [subdir, setSubdir] = useState('');
+  const [envText, setEnvText] = useState('');
+  const [showEnv, setShowEnv] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [progress, setProgress] = useState<number | null>(null);
@@ -220,9 +243,12 @@ function AddApp({ onAdded }: { onAdded: (a: App) => void }) {
 
   const upload = (file: File) => {
     if (!/\.zip$/i.test(file.name)) return setErr('Please choose a .zip file.');
+    const parsed = parseEnv(envText);
+    if (parsed.error) return setErr(`Environment variables: ${parsed.error}`);
     setErr('');
     const fd = new FormData();
     fd.append('name', name.trim() || file.name.replace(/\.zip$/i, ''));
+    if (Object.keys(parsed.env).length) fd.append('env', JSON.stringify(parsed.env));
     fd.append('file', file);
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `/api/studies/${studyId}/apps`);
@@ -235,6 +261,7 @@ function AddApp({ onAdded }: { onAdded: (a: App) => void }) {
         if (xhr.status >= 200 && xhr.status < 300) {
           onAdded(j.app);
           setName('');
+          setEnvText('');
           toast('Upload complete. Building…');
         } else setErr(j.error || `Upload failed (${xhr.status})`);
       } catch {
@@ -253,14 +280,18 @@ function AddApp({ onAdded }: { onAdded: (a: App) => void }) {
     setErr('');
     if (src === 'url' && !/^https?:\/\//i.test(url.trim())) return setErr('Enter a full URL starting with https://');
     if (src === 'git' && !gitUrl.trim()) return setErr('Enter a repository URL.');
+    const parsed = parseEnv(envText);
+    if (src === 'git' && parsed.error) return setErr(`Environment variables: ${parsed.error}`);
     setBusy(true);
     try {
-      const body = src === 'url' ? { name: defaultName(), url: url.trim(), proxy } : { name: defaultName(), gitUrl: gitUrl.trim(), branch: branch.trim() || undefined, subdir: subdir.trim() || undefined };
+      const env = Object.keys(parsed.env).length ? parsed.env : undefined;
+      const body = src === 'url' ? { name: defaultName(), url: url.trim(), proxy } : { name: defaultName(), gitUrl: gitUrl.trim(), branch: branch.trim() || undefined, subdir: subdir.trim() || undefined, env };
       const { app } = await api.post<{ app: App }>(`/api/studies/${studyId}/apps`, body);
       onAdded(app);
       setName('');
       setUrl('');
       setGitUrl('');
+      if (src === 'git') setEnvText('');
       toast(src === 'url' ? 'App added' : 'Cloning and building…');
     } catch (e) {
       setErr(errorMessage(e));
@@ -334,6 +365,17 @@ function AddApp({ onAdded }: { onAdded: (a: App) => void }) {
             <Button onClick={submitJson} loading={busy} icon={<Upload className="size-4" />}>Clone and build</Button>
           </>
         )}
+        {src !== 'url' && (
+          <div>
+            {showEnv ? (
+              <Field label="Environment variables" hint="One KEY=value per line, used at build time (and at runtime for server apps). For example VITE_API_URL, EXPO_PUBLIC_*, NEXT_PUBLIC_*.">
+                <Textarea value={envText} onChange={(e) => setEnvText(e.target.value)} placeholder={'VITE_API_URL=https://staging.example.com'} spellCheck={false} className="font-mono text-[12px]" data-testid="env-input" />
+              </Field>
+            ) : (
+              <button type="button" onClick={() => setShowEnv(true)} className="text-[13px] text-brand-500 hover:underline">Add environment variables</button>
+            )}
+          </div>
+        )}
         {err && <Callout tone="error" icon={<AlertCircle className="size-4" />}>{err}</Callout>}
       </div>
     </div>
@@ -394,6 +436,84 @@ function OpenModal({ app, onClose }: { app: App | null; onClose: () => void }) {
           <iframe key={k} src={app.url} title={app.name} className="h-[68vh] w-full bg-white" />
         </div>
       )}
+    </Modal>
+  );
+}
+
+function SettingsModal({ app, onClose, onSaved }: { app: App | null; onClose: () => void; onSaved: (a: App, rebuilt: boolean) => void }) {
+  const [envText, setEnvText] = useState('');
+  const [mode, setMode] = useState<'auto' | 'static' | 'server'>('auto');
+  const [buildCommand, setBuildCommand] = useState('');
+  const [outputDir, setOutputDir] = useState('');
+  const [startCommand, setStartCommand] = useState('');
+  const [nodeVersion, setNodeVersion] = useState('');
+  const [busy, setBusy] = useState<false | 'save' | 'rebuild'>(false);
+  const [err, setErr] = useState('');
+  useEffect(() => {
+    const fill = (b: AppBuildSettings) => {
+      setEnvText(formatEnv(b.env));
+      setMode(b.mode ?? 'auto');
+      setBuildCommand(b.buildCommand ?? '');
+      setOutputDir(b.outputDir ?? '');
+      setStartCommand(b.startCommand ?? '');
+      setNodeVersion(b.nodeVersion ?? '');
+    };
+    setErr('');
+    fill(app?.buildSettings ?? {});
+    // The study payload does not carry build settings: load them from the app itself.
+    if (app) api.get<{ app: App }>(`/api/apps/${app.id}`).then(({ app: a }) => fill(a.buildSettings ?? {}), () => {});
+  }, [app?.id]);
+  const isServer = mode === 'server' || (mode === 'auto' && (app?.framework === 'next-server' || app?.framework === 'node-server'));
+  const save = async (rebuild: boolean) => {
+    if (!app) return;
+    const parsed = parseEnv(envText);
+    if (parsed.error) return setErr(`Environment variables: ${parsed.error}`);
+    setErr('');
+    setBusy(rebuild ? 'rebuild' : 'save');
+    try {
+      const body = { env: parsed.env, mode, buildCommand: buildCommand.trim() || null, outputDir: outputDir.trim() || null, startCommand: startCommand.trim() || null, nodeVersion: nodeVersion.trim() || null };
+      let { app: next } = await api.patch<{ app: App }>(`/api/apps/${app.id}`, body);
+      if (rebuild) next = (await api.post<{ app?: App }>(`/api/apps/${app.id}/rebuild`)).app ?? { ...next, status: 'queued' };
+      onSaved(next, rebuild);
+      onClose();
+    } catch (e) {
+      setErr(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal
+      open={!!app}
+      onClose={onClose}
+      width="max-w-2xl"
+      title="Build settings"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>Cancel</Button>
+          <Button variant="secondary" loading={busy === 'save'} disabled={!!busy} onClick={() => save(false)}>Save</Button>
+          <Button loading={busy === 'rebuild'} disabled={!!busy} onClick={() => save(true)} data-testid="save-rebuild">Save and rebuild</Button>
+        </div>
+      }
+    >
+      <div className="space-y-5">
+        <Field label="Environment variables" hint="One KEY=value per line. Available to the build, and to the server for server apps. Values are not written to the build log.">
+          <Textarea value={envText} onChange={(e) => setEnvText(e.target.value)} placeholder={'VITE_API_URL=https://staging.example.com\nEXPO_PUBLIC_SUPABASE_URL=…'} spellCheck={false} className="min-h-[120px] font-mono text-[12px]" data-testid="settings-env" />
+        </Field>
+        <Field label="Hosting" hint="Auto detects the framework. Server runs the app with its start script, for SSR and API routes.">
+          <Segmented<'auto' | 'static' | 'server'> value={mode} onChange={setMode} options={[{ value: 'auto', label: 'Auto' }, { value: 'static', label: 'Static files' }, { value: 'server', label: 'Server' }]} />
+        </Field>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Build command" hint="Replaces the framework build. Dependencies are installed first."><Input value={buildCommand} onChange={(e) => setBuildCommand(e.target.value)} placeholder="npm run build" spellCheck={false} className="font-mono text-[13px]" /></Field>
+          {isServer ? (
+            <Field label="Start command" hint="Must listen on $PORT."><Input value={startCommand} onChange={(e) => setStartCommand(e.target.value)} placeholder="npm run start" spellCheck={false} className="font-mono text-[13px]" /></Field>
+          ) : (
+            <Field label="Output folder" hint="Folder with index.html after the build."><Input value={outputDir} onChange={(e) => setOutputDir(e.target.value)} placeholder="dist" spellCheck={false} className="font-mono text-[13px]" /></Field>
+          )}
+          <Field label="Node.js version" hint="Default: .nvmrc or engines.node, else 22."><Input value={nodeVersion} onChange={(e) => setNodeVersion(e.target.value)} placeholder="22" inputMode="numeric" className="font-mono text-[13px]" /></Field>
+        </div>
+        {err && <Callout tone="error" icon={<AlertCircle className="size-4" />}>{err}</Callout>}
+      </div>
     </Modal>
   );
 }

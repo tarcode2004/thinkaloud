@@ -125,7 +125,7 @@ function QuestionListEditor({ questions, onChange, addLabel }: { questions: Ques
           <QuestionEditor compact q={q} onChange={(nq) => onChange(questions.map((x, j) => (j === i ? nq : x)))} />
         </div>
       ))}
-      <button type="button" onClick={() => onChange([...questions, newQuestion('open')])} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-sm font-medium text-brand-500 hover:bg-brand-500/[0.08]0/[0.08]">
+      <button type="button" onClick={() => onChange([...questions, newQuestion('open')])} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-sm font-medium text-brand-500 hover:bg-brand-500/[0.08]">
         <Plus className="size-4" /> {addLabel}
       </button>
     </div>
@@ -189,7 +189,7 @@ export function SuccessRulesEditor({ rules, onChange }: { rules: SuccessRule[]; 
             key={t.type}
             type="button"
             onClick={() => onChange([...rules, blankRule(t.type)])}
-            className="inline-flex items-center gap-1.5 rounded-full border border-separator bg-white px-2.5 py-1 text-xs font-medium text-secondary hover:border-brand-500/40 hover:bg-brand-500/[0.08]0/[0.08] hover:text-brand-500"
+            className="inline-flex items-center gap-1.5 rounded-full border border-separator bg-white px-2.5 py-1 text-xs font-medium text-secondary hover:border-brand-500/40 hover:bg-brand-500/[0.08] hover:text-brand-500"
           >
             <Plus className="size-3" /> {t.label}
           </button>

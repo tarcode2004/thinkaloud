@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router';
 import { ChevronLeft, ChevronRight, Trash2, X } from 'lucide-react';
 import type { SessionEvent, Step, TaskOutcome, TaskStep } from '@thinkaloud/shared';
-import { questionnaireItems } from '@thinkaloud/shared';
+import { stepQuestions } from '@thinkaloud/shared';
 import { api } from '../lib/api.ts';
 import { useAsync } from '../lib/hooks.ts';
 import { Button, FullPageSpinner, Modal, cn } from '../ui/index.tsx';
@@ -590,13 +590,10 @@ function stepKind(s: Step) {
 function AnswersPanel({ d }: { d: Detail }) {
   const prompts = useMemo(() => {
     const m = new Map<string, { prompt: string; max?: number }>();
+    // stepQuestions covers every kind, incl. interview questions (ids like "<step>_q1").
     for (const st of d.steps) {
-      if (st.type === 'question') m.set(`${st.id}:${st.question.id}`, { prompt: st.question.prompt, max: st.question.scale?.max });
-      if (st.type === 'questionnaire') for (const q of questionnaireItems(st)) m.set(`${st.id}:${q.id}`, { prompt: q.prompt, max: q.scale?.max });
-      if (st.type === 'task') {
-        m.set(`${st.id}:seq`, { prompt: 'Overall, how difficult or easy was the task to complete?', max: 7 });
-        for (const q of st.postTaskQuestions ?? []) m.set(`${st.id}:${q.id}`, { prompt: q.prompt, max: q.scale?.max });
-      }
+      if (st.type === 'task') m.set(`${st.id}:seq`, { prompt: 'Overall, how difficult or easy was the task to complete?', max: 7 });
+      for (const q of stepQuestions(st)) m.set(`${st.id}:${q.id}`, { prompt: q.prompt, max: q.scale?.max });
     }
     return m;
   }, [d.steps]);

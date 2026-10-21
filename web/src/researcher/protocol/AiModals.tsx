@@ -270,7 +270,7 @@ export function RefineModal({ open, onClose, current, onApply }: { open: boolean
           </Field>
           <div className="flex flex-wrap gap-1.5">
             {REFINE_CHIPS.map((c) => (
-              <button key={c} type="button" onClick={() => setInstruction(c)} className="rounded-full border border-separator bg-white px-2.5 py-1 text-xs text-secondary hover:border-brand-500/40 hover:bg-brand-500/[0.08]0/[0.08] hover:text-brand-500">
+              <button key={c} type="button" onClick={() => setInstruction(c)} className="rounded-full border border-separator bg-white px-2.5 py-1 text-xs text-secondary hover:border-brand-500/40 hover:bg-brand-500/[0.08] hover:text-brand-500">
                 {c}
               </button>
             ))}

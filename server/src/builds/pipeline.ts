@@ -11,14 +11,17 @@ import { db } from '../db.ts';
 import { config } from '../lib/config.ts';
 import { paths } from '../lib/paths.ts';
 import { hostedAppUrl } from '../apphost/urls.ts';
-import { readMeta, uploadZipPath } from './meta.ts';
+import { readMeta, uploadZipPath, writeMeta, type AppMeta } from './meta.ts';
+import { diagnose, frameworkLabel, isWorkspaceRoot, monorepoApps, workspaceDepsToBuild, EXPO_SINGLE_SCRIPT, expoApiRoutes, expoWebOutput, missingEnvHints, nextServerReasons, nodeServerFramework, pickNode, type PkgJson } from './plan.ts';
+import { ensureRuntime, startRuntimeAndWait, stopRuntime } from './runtime.ts';
 
-const CONCURRENCY = 2;
+const CONCURRENCY = Number(process.env.BUILD_CONCURRENCY || 2);
 const BUILD_TIMEOUT_MS = Number(process.env.BUILD_TIMEOUT_MS || 15 * 60 * 1000);
 const MAX_UNPACKED_BYTES = 500 * 1024 * 1024;
 const MAX_ENTRIES = 200_000;
-const BUILD_IMAGE = process.env.BUILD_IMAGE || 'node:22';
-const BUILD_MEMORY = process.env.BUILD_MEMORY || '4g';
+/** BUILD_IMAGE pins one image for every build; otherwise node:<major> from .nvmrc / engines.node (default 22). */
+const BUILD_IMAGE = process.env.BUILD_IMAGE || '';
+const BUILD_MEMORY = process.env.BUILD_MEMORY || '8g';
 const BUILD_CPUS = process.env.BUILD_CPUS || '2';
 const OUTPUT_DIRS = ['dist', 'build', 'out', 'web-build', '_site', 'public', 'www'];
 
@@ -59,7 +62,8 @@ export function safeExtractZip(zipFile: string, dest: string, onLog: (s: string)
     throw new BuildError(`Not a valid .zip file (${(e as Error).message})`);
   }
   const entries = zip.getEntries();
-  if (entries.length > MAX_ENTRIES) throw new BuildError(`Zip has too many entries (${entries.length} > ${MAX_ENTRIES})`);
+  const kept = entries.filter((e) => !e.entryName.replace(/\\/g, '/').split('/').some((seg) => SKIP_SEGMENTS.has(seg))).length;
+  if (kept > MAX_ENTRIES) throw new BuildError(`Zip has too many files (${kept} > ${MAX_ENTRIES}, not counting node_modules/.git)`);
   const root = path.resolve(dest);
   let total = 0;
   let skipped = 0;
@@ -130,15 +134,8 @@ interface Plan {
   /** Preferred output dirs, relative to the project root, in priority order. */
   outputs: string[];
   notes: string[];
-}
-
-interface PkgJson {
-  name?: string;
-  scripts?: Record<string, string>;
-  dependencies?: Record<string, string>;
-  devDependencies?: Record<string, string>;
-  packageManager?: string;
-  workspaces?: unknown;
+  /** Server app: command that starts it (listens on $PORT). */
+  start?: string;
 }
 
 function readPkg(root: string): PkgJson | null {
@@ -186,7 +183,7 @@ function viteOutDir(root: string): string | undefined {
   return undefined;
 }
 
-export function detect(root: string, top: string): Plan {
+export function detect(root: string, top: string, meta: AppMeta = {}): Plan {
   const pkg = readPkg(root);
   if (!pkg) {
     if (hasIndex(root)) return { framework: 'static', staticDir: root, outputs: [], notes: ['No package.json; serving index.html at the project root as a static site'] };
@@ -205,7 +202,24 @@ export function detect(root: string, top: string): Plan {
     return { framework: 'expo-web', pm, outputs: ['dist', 'web-build'], notes };
   }
   if (deps.next) {
+    const reasons = meta.mode === 'static' ? [] : meta.mode === 'server' ? ['Hosting mode set to "server"'] : nextServerReasons(root);
+    if (reasons.length) {
+      notes.push(`Next.js needs a running server (${reasons.join('; ')}) — building with next build and hosting it with next start`);
+      return { framework: 'next-server', pm, script: build, outputs: [], notes, start: meta.startCommand || 'exec ./node_modules/.bin/next start -p "$PORT" -H 0.0.0.0' };
+    }
     return { framework: 'next-static', pm, script: build, outputs: ['out'], notes };
+  }
+  // React Router v7 / Remix (Vite) in SPA mode (ssr: false) build a static build/client/.
+  const rrSpa = (deps['@react-router/dev'] || deps['@remix-run/dev']) && /\bssr\s*:\s*false/.test(['react-router.config.ts', 'react-router.config.js', 'vite.config.ts', 'vite.config.js'].map((f) => { try { return fs.readFileSync(path.join(root, f), 'utf8'); } catch { return ''; } }).join('\n'));
+  if (rrSpa && meta.mode !== 'server') {
+    notes.push('React Router / Remix SPA mode (ssr: false) — serving build/client/ as a static site');
+    return { framework: 'vite', pm, script: build, outputs: ['build/client', 'dist'], notes };
+  }
+  const serverFw = meta.mode === 'static' ? undefined : nodeServerFramework(pkg) || (meta.mode === 'server' ? 'Node server' : undefined);
+  if (serverFw) {
+    if (!scripts.start && !meta.startCommand) throw new BuildError(`${serverFw} app detected but package.json has no "start" script. Set a start command in Build settings (it must listen on $PORT).`);
+    notes.push(`${serverFw} — hosting as a server app (${meta.startCommand || 'npm run start'})`);
+    return { framework: 'node-server', pm, script: build, outputs: [], notes, start: meta.startCommand || 'exec npm run start' };
   }
   if (deps['react-scripts']) {
     return { framework: 'cra', pm, script: build, outputs: ['build'], notes };
@@ -224,26 +238,36 @@ export function detect(root: string, top: string): Plan {
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────
-function pmBin(pm: PM, spec?: string): string {
-  if (pm === 'npm') return 'npm';
+/** The package manager is put on PATH by pmSetup(), so tools that spawn it (expo install, turbo, scripts) find it too. */
+function pmBin(pm: PM): string {
+  return pm;
+}
+
+/** Shell prelude: make `pnpm` / `yarn` (corepack shims, honouring packageManager) or `bun` available on PATH. */
+function pmSetup(pm: PM, spec?: string): string[] {
+  if (pm === 'npm') return [];
   const versioned = spec && spec.startsWith(pm + '@') ? spec.split('+')[0] : pm;
-  if (pm === 'bun') return `npx -y ${versioned}`;
-  // corepack ships with node:22 (not with Node ≥25), fall back to npx.
-  return `$(command -v corepack >/dev/null 2>&1 && echo "corepack ${pm}" || echo "npx -y ${versioned}")`;
+  const lines = ['TA_BIN="$(mktemp -d)"; export PATH="$TA_BIN:$TA_BIN/g/bin:$PATH"'];
+  if (pm === 'pnpm' || pm === 'yarn') lines.push('if command -v corepack >/dev/null 2>&1; then corepack enable --install-directory "$TA_BIN" pnpm yarn >/dev/null 2>&1 || true; fi');
+  // No corepack (Node >= 25) or bun: install the tool into a throwaway prefix.
+  lines.push(`command -v ${pm} >/dev/null 2>&1 || npm install -g --prefix "$TA_BIN/g" --no-audit --no-fund ${versioned} >/dev/null 2>&1 || { echo "!! Could not install ${versioned}"; exit 1; }`);
+  lines.push(`echo "${pm} $(${pm} --version 2>/dev/null | tail -1)"`);
+  return lines;
 }
 
 function installCmd(pm: PM, root: string, top: string, spec?: string): string {
-  const bin = pmBin(pm, spec);
+  const bin = pmBin(pm);
   if (pm === 'npm') {
     const lock = findUp(root, top, ['package-lock.json', 'npm-shrinkwrap.json']);
-    return lock ? 'npm ci --no-audit --no-fund || npm install --no-audit --no-fund' : 'npm install --no-audit --no-fund';
+    const legacy = `{ echo '!! npm install failed; retrying with --legacy-peer-deps'; npm install --no-audit --no-fund --legacy-peer-deps; }`;
+    return lock ? `npm ci --no-audit --no-fund || npm install --no-audit --no-fund || ${legacy}` : `npm install --no-audit --no-fund || ${legacy}`;
   }
   if (pm === 'pnpm') return `${bin} install --no-frozen-lockfile`;
   if (pm === 'yarn') return `${bin} install`;
   return `${bin} install`;
 }
 
-const runScript = (pm: PM, script: string, spec?: string) => (pm === 'npm' ? `npm run ${script}` : `${pmBin(pm, spec)} run ${script}`);
+const runScript = (pm: PM, script: string, _spec?: string) => (pm === 'npm' ? `npm run ${script}` : `${pmBin(pm)} run ${script}`);
 
 /** Make `next build` produce a static export (out/) even if the config does not ask for it. */
 function forceNextExport(root: string, onLog: (s: string) => void) {
@@ -268,23 +292,64 @@ function forceNextExport(root: string, onLog: (s: string) => void) {
   onLog(`Next.js config has no output: 'export' — wrapped ${f} to force a static export (server features like API routes/SSR will not work)`);
 }
 
-function buildScript(plan: Plan, root: string, top: string, onLog: (s: string) => void): string {
+function buildScript(plan: Plan, root: string, top: string, onLog: (s: string) => void, meta: AppMeta = {}): string {
   const pkg = readPkg(root)!;
   const deps = { ...pkg.dependencies, ...pkg.devDependencies };
   const pm = plan.pm!;
-  const lines: string[] = ['set -e', 'echo "node $(node -v), npm $(npm -v)"'];
+  const lines: string[] = ['set -e', 'echo "node $(node -v), npm $(npm -v)"', ...pmSetup(pm, pkg.packageManager)];
   const run = (label: string, cmd: string) => lines.push(`echo '$ ${label.replace(/'/g, '')}'`, cmd);
-  run(installCmd(pm, root, top, pkg.packageManager), installCmd(pm, root, top, pkg.packageManager));
+  run(`${pm} install`, installCmd(pm, root, top, pkg.packageManager));
 
+  // Monorepo: build local workspace dependencies (dependencies first) so their dist/ exists.
+  if (root !== top) {
+    for (const d of workspaceDepsToBuild(top, root)) {
+      const rel = path.relative(root, path.join(top, d.rel)).split(path.sep).join('/');
+      const cmd = `(cd '${rel.replace(/'/g, '')}' && ${runScript(pm, 'build', pkg.packageManager)})`;
+      onLog(`Workspace dependency ${d.name} (${d.rel}) has a build script; building it first`);
+      run(`build workspace dependency ${d.name}`, cmd);
+    }
+  }
+  if (meta.buildCommand) {
+    onLog(`Using the build command from Build settings: ${meta.buildCommand}`);
+    run(meta.buildCommand, meta.buildCommand);
+    return lines.join('\n');
+  }
   switch (plan.framework) {
+    case 'next-server': {
+      const cmd = plan.script ? runScript(pm, plan.script, pkg.packageManager) : './node_modules/.bin/next build';
+      run(cmd, cmd);
+      break;
+    }
+    case 'node-server': {
+      if (plan.script) {
+        const cmd = runScript(pm, plan.script, pkg.packageManager);
+        run(cmd, cmd);
+      } else onLog('No "build" script; the server is started as is');
+      break;
+    }
     case 'expo-web': {
+      if (pm === 'yarn') lines.push('export YARN_NODE_LINKER=node-modules # Metro cannot resolve Yarn PnP');
       const missing = ['react-dom', 'react-native-web', '@expo/metro-runtime'].filter((d) => !deps[d]);
       if (missing.length) {
         onLog(`Expo web support needs ${missing.join(', ')} — not in package.json, running "npx expo install ${missing.join(' ')}"`);
         run(`npx expo install ${missing.join(' ')}`, `npx expo install ${missing.join(' ')} || { echo "!! Could not add Expo web dependencies (${missing.join(', ')}). Add them to package.json and re-upload."; exit 1; }`);
       }
-      if (majorOf(deps.expo) && majorOf(deps.expo) < 49) run('npx expo export:web', 'npx expo export:web');
-      else run('npx expo export --platform web --output-dir dist', 'npx expo export --platform web --output-dir dist');
+      if (majorOf(deps.expo) && majorOf(deps.expo) < 49) {
+        run('npx expo export:web', 'npx expo export:web');
+        break;
+      }
+      const output = expoWebOutput(root);
+      const exp = 'npx expo export --platform web --output-dir dist';
+      fs.writeFileSync(path.join(root, '.ta-expo-single.cjs'), EXPO_SINGLE_SCRIPT);
+      const api = expoApiRoutes(root);
+      if (output === 'server') {
+        onLog(`app.json sets web.output: "server" (needs an Expo server). Exporting as a single-page app (web.output: "single") instead${api.length ? `; API routes will NOT work: ${api.join(', ')}` : ''}`);
+        run('switch web.output to "single"', 'node .ta-expo-single.cjs');
+        run(exp, exp);
+      } else if (output === 'static') {
+        // Static rendering runs every screen in Node at build time; apps touching window/env at import time fail there.
+        run(exp, `${exp} || { echo '!! Expo static rendering failed (see above). Retrying as a single-page app (web.output: "single"), which renders in the browser only.'; node .ta-expo-single.cjs; rm -rf dist; ${exp}; }`);
+      } else run(exp, exp);
       break;
     }
     case 'next-static': {
@@ -296,7 +361,11 @@ function buildScript(plan: Plan, root: string, top: string, onLog: (s: string) =
     }
     case 'vite': {
       const cmd = plan.script ? runScript(pm, plan.script, pkg.packageManager) : 'npx vite build';
-      run(cmd, cmd);
+      const typeChecks = plan.script && /\b(tsc|vue-tsc|svelte-check)\b/.test(pkg.scripts?.[plan.script] || '');
+      const isRR = deps['@react-router/dev'] ? 'npx react-router build' : 'npx vite build';
+      // Type errors should not block a usability study: retry the plain bundler build.
+      if (typeChecks) run(cmd, `${cmd} || { echo '!! The build script failed (often TypeScript type errors from tsc). Retrying with "${isRR}" only, skipping the type check.'; ${isRR}; }`);
+      else run(cmd, cmd);
       break;
     }
     default: {
@@ -317,6 +386,9 @@ const buildEnv: Record<string, string> = {
   EXPO_NO_INTERACTIVE: '1',
   GENERATE_SOURCEMAP: 'false',
   COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
+  COREPACK_ENABLE_STRICT: '0',
+  YARN_ENABLE_IMMUTABLE_INSTALLS: 'false',
+  YARN_ENABLE_TELEMETRY: '0',
   npm_config_update_notifier: 'false',
   npm_config_fund: 'false',
   npm_config_audit: 'false',
@@ -328,7 +400,7 @@ interface Running {
 }
 const running = new Map<string, Running>();
 
-function runShell(appId: string, top: string, root: string, script: string): Promise<void> {
+function runShell(appId: string, top: string, root: string, script: string, image: string, userEnv: Record<string, string> = {}): Promise<void> {
   return new Promise((resolve, reject) => {
     const cacheDir = path.join(paths.root, 'build-cache');
     fs.mkdirSync(cacheDir, { recursive: true });
@@ -346,15 +418,18 @@ function runShell(appId: string, top: string, root: string, script: string): Pro
         '-v', `${top}:/workspace`, '-v', `${cacheDir}:/cache`,
         '-w', rel ? `/workspace/${rel}` : '/workspace',
         '-e', 'HOME=/cache/home', '-e', 'npm_config_cache=/cache/npm', '-e', 'COREPACK_HOME=/cache/corepack',
+        '-e', 'npm_config_store_dir=/cache/pnpm-store', '-e', 'BUN_INSTALL_CACHE_DIR=/cache/bun',
         ...Object.entries(buildEnv).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
-        BUILD_IMAGE, 'bash', '-c', script,
+        // Researcher env: names only in argv (values come from the docker client's env, never logged).
+        ...Object.keys(userEnv).flatMap((k) => ['-e', k]),
+        image, 'bash', '-c', script,
       ];
       log(appId, `docker ${args.slice(0, -1).join(' ')} <script>`);
-      child = spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...userEnv } });
     } else {
       child = spawn('bash', ['-c', script], {
         cwd: root,
-        env: { ...process.env, ...buildEnv, npm_config_cache: path.join(cacheDir, 'npm') },
+        env: { ...process.env, ...buildEnv, npm_config_cache: path.join(cacheDir, 'npm'), ...userEnv },
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,
       });
@@ -370,7 +445,9 @@ function runShell(appId: string, top: string, root: string, script: string): Pro
         /* already gone */
       }
     };
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       log(appId, `!! Build timed out after ${Math.round(BUILD_TIMEOUT_MS / 60000)} minutes`);
       kill();
     }, BUILD_TIMEOUT_MS);
@@ -384,17 +461,38 @@ function runShell(appId: string, top: string, root: string, script: string): Pro
       clearTimeout(timer);
       if (running.get(appId)?.cancelled) return reject(new BuildError('Build cancelled'));
       if (code === 0) resolve();
+      else if (timedOut) reject(new BuildError(`Build timed out after ${Math.round(BUILD_TIMEOUT_MS / 60000)} minutes (BUILD_TIMEOUT_MS). Make the build lighter (see below) or ask the admin to raise the limit.`));
+      else if (code === 137) reject(new BuildError('Build was killed (exit code 137): the build container ran out of memory'));
       else reject(new BuildError(`Build command failed (exit code ${code})`));
     });
   });
 }
 
-function findOutput(root: string, plan: Plan): string {
+function findOutput(root: string, plan: Plan, override?: string): string {
+  if (override) {
+    const dir = path.resolve(root, override);
+    if (dir !== root && !dir.startsWith(root + path.sep)) throw new BuildError('Output directory must be inside the project');
+    if (!hasIndex(dir)) throw new BuildError(`Output directory "${override}" (from Build settings) has no index.html after the build`);
+    return dir;
+  }
   const candidates = [...plan.outputs, ...OUTPUT_DIRS.filter((d) => !plan.outputs.includes(d))];
   for (const d of candidates) {
     const dir = path.resolve(root, d);
     if (!dir.startsWith(root)) continue;
     if (hasIndex(dir)) return dir;
+  }
+  // Nested outputs: Angular (dist/<project>/browser), React Router (build/client), multi-target builds.
+  for (const d of ['dist', 'build', 'out']) {
+    const base = path.join(root, d);
+    let subs: string[] = [];
+    try {
+      subs = fs.readdirSync(base).filter((n) => fs.statSync(path.join(base, n)).isDirectory());
+    } catch {
+      continue;
+    }
+    for (const n of subs) {
+      for (const cand of [path.join(base, n, 'browser'), path.join(base, n, 'client'), path.join(base, n)]) if (hasIndex(cand)) return cand;
+    }
   }
   if (plan.framework === 'next-static')
     throw new BuildError("Next.js build finished but no out/index.html was produced. Only static exports are supported (output: 'export'); SSR/API routes cannot be hosted.");
@@ -424,17 +522,26 @@ function dirSize(dir: string): number {
   return n;
 }
 
-function isSafeGitUrl(u: string): boolean {
-  return /^https?:\/\/[^\s]+$/i.test(u) && !u.startsWith('-');
+/** SSH clones use the server's own SSH credentials: on by default outside production, GIT_ALLOW_SSH=1/0 overrides. */
+export const gitSshAllowed = () => (process.env.GIT_ALLOW_SSH ? process.env.GIT_ALLOW_SSH === '1' : !config.isProd);
+export const SSH_GIT_RE = /^(?:ssh:\/\/[\w.-]+@[\w.-]+(?::\d+)?\/[\w./~-]+|[\w.-]+@[\w.-]+:[\w./~-]+)$/;
+
+export function isSafeGitUrl(u: string): boolean {
+  if (u.startsWith('-') || /\s/.test(u)) return false;
+  if (/^https?:\/\/[^\s]+$/i.test(u)) return true;
+  return gitSshAllowed() && SSH_GIT_RE.test(u) && !u.includes('..');
 }
 
 async function gitClone(appId: string, url: string, dest: string, branch?: string) {
-  if (!isSafeGitUrl(url)) throw new BuildError('Only http(s) git URLs are supported');
+  if (!isSafeGitUrl(url)) throw new BuildError(gitSshAllowed() ? 'Unsupported git URL. Use https://… or git@host:owner/repo.git' : 'Only http(s) git URLs are supported (SSH clones are disabled on this server; set GIT_ALLOW_SSH=1)');
   if (branch && !/^[\w./-]+$/.test(branch)) throw new BuildError('Invalid branch name');
   const args = ['-c', 'protocol.file.allow=never', '-c', 'core.symlinks=false', 'clone', '--depth', '1', '--single-branch', ...(branch ? ['--branch', branch] : []), '--', url, dest];
   log(appId, `$ git ${args.join(' ')}`);
   await new Promise<void>((resolve, reject) => {
-    const child = spawn('git', args, { env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_LFS_SKIP_SMUDGE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('git', args, {
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_LFS_SKIP_SMUDGE: '1', GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     const onData = (b: Buffer) => fs.appendFileSync(paths.appLog(appId), b);
     child.stdout.on('data', onData);
     child.stderr.on('data', onData);
@@ -442,7 +549,7 @@ async function gitClone(appId: string, url: string, dest: string, branch?: strin
     child.on('error', (e) => reject(new BuildError(`git failed: ${e.message}`)));
     child.on('close', (code) => {
       clearTimeout(timer);
-      code === 0 ? resolve() : reject(new BuildError(`git clone failed (exit code ${code}). Is the repository public and the branch correct?`));
+      code === 0 ? resolve() : reject(new BuildError(`git clone failed (exit code ${code}). Is the repository public (or, for SSH URLs, does this server's SSH key have access) and is the branch correct?`));
     });
   });
   fs.rmSync(path.join(dest, '.git'), { recursive: true, force: true });
@@ -458,7 +565,11 @@ async function runBuild(appId: string) {
   setApp(appId, { status: 'building', error: null });
   const started = Date.now();
   const source = paths.appSource(appId);
+  let plan: Plan | undefined;
+  let envMissing: string[] = [];
+  const userEnv = meta.env || {};
   try {
+    await stopRuntime(appId); // a rebuild replaces the running server (and its source tree)
     step(appId, 'Preparing source');
     fs.rmSync(source, { recursive: true, force: true });
     fs.mkdirSync(source, { recursive: true });
@@ -469,24 +580,48 @@ async function runBuild(appId: string) {
     } else if (row.source_kind === 'git') {
       await gitClone(appId, String(row.source_url || ''), source, meta.branch);
     }
-    const root = findProjectRoot(source, meta.subdir);
+    let root = findProjectRoot(source, meta.subdir);
+    const rootPkg = readPkg(root);
+    if (!meta.subdir && isWorkspaceRoot(root, rootPkg) && !frameworkLabel(rootPkg)) {
+      const apps = monorepoApps(root);
+      if (apps.length === 1) {
+        log(appId, `Monorepo: using the only app package, ${apps[0].rel} (${apps[0].label}). Set "subdir" to pick another.`);
+        root = path.join(root, apps[0].rel);
+      } else if (apps.length > 1) {
+        throw new BuildError(`This is a monorepo with several apps. Set the subdirectory (subdir) to one of: ${apps.map((a) => `${a.rel} (${a.label})`).join(', ')}`);
+      }
+    }
     log(appId, `Project root: ${path.relative(source, root) || '.'}`);
 
     step(appId, 'Detecting framework');
-    const plan = detect(root, source);
+    plan = detect(root, source, meta);
     log(appId, `Framework: ${plan.framework}${plan.pm ? `, package manager: ${plan.pm}` : ''}`);
     plan.notes.forEach((n) => log(appId, n));
     setApp(appId, { framework: plan.framework });
+    const envKeys = Object.keys(userEnv);
+    if (envKeys.length) log(appId, `Environment variables from Build settings: ${envKeys.join(', ')}`);
+    if (!plan.staticDir) {
+      envMissing = missingEnvHints(root, userEnv);
+      if (envMissing.length) log(appId, `Note: the project references ${envMissing.join(', ')} but they are not set (no .env in the upload and not in Build settings). If the app needs them, add them under Build settings → Environment variables.`);
+    }
 
     let outDir: string;
     if (plan.staticDir) {
       outDir = plan.staticDir;
     } else {
-      step(appId, `Installing dependencies and building (${config.buildMode === 'docker' ? `docker ${BUILD_IMAGE}` : 'local'})`);
-      const script = buildScript(plan, root, source, (s) => log(appId, s));
-      await runShell(appId, source, root, script);
-      outDir = findOutput(root, plan);
+      const node = pickNode(root, source, readPkg(root), meta.nodeVersion);
+      const image = BUILD_IMAGE || `node:${node.major}`;
+      log(appId, `Node.js ${node.major} (${node.source})${BUILD_IMAGE ? ` — BUILD_IMAGE=${BUILD_IMAGE} overrides it` : ''}`);
+      step(appId, `Installing dependencies and building (${config.buildMode === 'docker' ? `docker ${image}` : 'local'})`);
+      const script = buildScript(plan, root, source, (s) => log(appId, s), meta);
+      await runShell(appId, source, root, script, image, userEnv);
+      if (plan.start) {
+        await publishServer(appId, plan, root, source, image, started);
+        return;
+      }
+      outDir = findOutput(root, plan, meta.outputDir);
     }
+    writeMeta(appId, { server: undefined });
 
     step(appId, `Publishing ${path.relative(source, outDir) || '.'}/`);
     const dist = paths.appDist(appId);
@@ -504,9 +639,34 @@ async function runBuild(appId: string) {
     const msg = e instanceof Error ? e.message : String(e);
     log(appId, `\n✗ Build failed: ${msg}`);
     if (!(e instanceof BuildError) && e instanceof Error && e.stack) log(appId, e.stack);
+    let full = '';
+    try {
+      full = fs.readFileSync(paths.appLog(appId), 'utf8');
+    } catch {
+      /* none */
+    }
+    const hints = diagnose(full, { framework: plan?.framework, envMissing });
+    if (hints.length) log(appId, `\nWhat to change:\n${hints.map((h) => `  • ${h}`).join('\n')}`);
     const tail = logTail(appId);
-    setApp(appId, { status: 'failed', error: `${msg}\n\n${tail}`.slice(0, 5000) });
+    setApp(appId, { status: 'failed', error: `${msg}${hints.length ? `\n\nWhat to change:\n${hints.map((h) => `• ${h}`).join('\n')}` : ''}\n\n${tail}`.slice(0, 5000) });
   }
+}
+
+/** Server app: keep the built tree (with node_modules) in place and run it in a container. */
+async function publishServer(appId: string, plan: Plan, root: string, source: string, image: string, started: number) {
+  if (plan.framework === 'next-server') {
+    const distDir = (readMeta(appId).env || {}).NEXT_DIST_DIR || '.next';
+    if (!fs.existsSync(path.join(root, distDir, 'BUILD_ID'))) throw new BuildError(`next build finished but ${distDir}/BUILD_ID is missing`);
+  }
+  const rel = path.relative(source, root).split(path.sep).join('/');
+  writeMeta(appId, { server: { rel, start: plan.start!, image, framework: plan.framework } });
+  fs.rmSync(paths.appDist(appId), { recursive: true, force: true });
+  step(appId, `Starting the server (${plan.start})`);
+  const rt = await startRuntimeAndWait(appId);
+  if (rt.state !== 'running') throw new BuildError(`The app built, but its server did not start: ${rt.error || rt.state}`);
+  const url = hostedAppUrl(appId);
+  setApp(appId, { status: 'ready', error: null, url, instrumented: 1, framework: plan.framework });
+  step(appId, `✓ Ready in ${Math.round((Date.now() - started) / 1000)}s → ${url} (server app; the app host proxies to its container)`);
 }
 
 // ── Queue ───────────────────────────────────────────────────────────────────
@@ -554,6 +714,9 @@ setImmediate(() => {
       const want = a.source_kind === 'url' ? (readMeta(a.id).proxy ? hostedAppUrl(a.id, a.source_url) : a.source_url) : hostedAppUrl(a.id);
       if (want && want !== a.url) db.prepare('UPDATE apps SET url = ? WHERE id = ?').run(want, a.id);
     }
+    // Server apps: (re)start their containers in the background, staggered.
+    const servers = hosted.filter((a) => a.source_kind !== 'url' && readMeta(a.id).server);
+    servers.forEach((a, i) => setTimeout(() => ensureRuntime(a.id), 500 + i * 2000));
     const rows = db.prepare("SELECT id FROM apps WHERE status IN ('queued','building') AND source_kind != 'url'").all() as { id: string }[];
     for (const r of rows) enqueueBuild(r.id);
     if (rows.length) console.log(`[builds] resumed ${rows.length} interrupted build(s)`);

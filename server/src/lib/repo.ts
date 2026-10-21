@@ -95,6 +95,7 @@ export function variantFromRow(r: Row): Variant {
     weight: Number(r.weight ?? 1),
     active: Boolean(r.active),
     createdAt: Number(r.created_at),
+    appParams: str(r.app_params ?? ''),
   };
 }
 

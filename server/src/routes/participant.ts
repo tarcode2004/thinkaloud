@@ -208,7 +208,7 @@ participantRouter.post('/links/:token/sessions', (req, res) => {
     const steps = resolveStepOrder(protocol.steps, protocol.randomizeTasks);
 
     const app = variant.app_id ? (db.prepare('SELECT * FROM apps WHERE id = ?').get(variant.app_id as string) as Row | undefined) : undefined;
-    const appUrl = app && app.status === 'ready' && app.url ? String(app.url) : null;
+    const appUrl = app && app.status === 'ready' && app.url ? withAppParams(String(app.url), String(variant.app_params ?? '')) : null;
 
     let code = participantCode();
     for (let i = 0; i < 20 && db.prepare('SELECT 1 FROM sessions WHERE study_id = ? AND participant_code = ?').get(studyId, code); i++) {
@@ -505,3 +505,15 @@ participantRouter.post('/sessions/:sid/withdraw', (req, res) => {
   const link = row.link_id ? (db.prepare('SELECT redirect_url FROM links WHERE id = ?').get(row.link_id as string) as Row | undefined) : undefined;
   res.json({ ok: true, redirectUrl: row.preview ? null : ((link?.redirect_url as string | null) ?? null) });
 });
+
+/** Merge a variant's launch query string ("flags=a:1&x=2") into the app URL. */
+export function withAppParams(url: string, params: string): string {
+  if (!params.trim()) return url;
+  try {
+    const u = new URL(url);
+    for (const [k, v] of new URLSearchParams(params)) u.searchParams.set(k, v);
+    return u.toString();
+  } catch {
+    return url;
+  }
+}

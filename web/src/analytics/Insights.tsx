@@ -3,7 +3,7 @@ import { Link } from 'react-router';
 import { marked } from 'marked';
 import { Play, ShieldCheck } from 'lucide-react';
 import { api, ApiError } from '../lib/api.ts';
-import { useAsync, timeAgo } from '../lib/hooks.ts';
+import { plural, useAsync, timeAgo } from '../lib/hooks.ts';
 import { Button, FullPageSpinner, cn } from '../ui/index.tsx';
 import { useToast } from '../ui/toast.tsx';
 import { ResultsPage, useResults } from './ResultsRoutes.tsx';
@@ -81,7 +81,7 @@ export default function Insights() {
       subtitle={
         s ? (
           <span className="tabular-nums">
-            From {s.sessionCount} sessions · {s.generatedBy === 'seed' ? 'demo synthesis' : s.model} · {timeAgo(s.createdAt)}
+            From {plural(s.sessionCount, 'session')} · {s.generatedBy === 'seed' ? 'demo synthesis' : s.model} · {timeAgo(s.createdAt)}
           </span>
         ) : (
           'AI synthesis of every transcript, task outcome and behaviour event, with citations you can check.'

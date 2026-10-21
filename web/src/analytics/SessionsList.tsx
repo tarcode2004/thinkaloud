@@ -1,9 +1,9 @@
 import { useMemo, useState } from 'react';
-import { useNavigate } from 'react-router';
+import { Link, useNavigate } from 'react-router';
 import { AudioLines, MonitorPlay, Search } from 'lucide-react';
 import type { TaskOutcome } from '@thinkaloud/shared';
 import { api } from '../lib/api.ts';
-import { useAsync } from '../lib/hooks.ts';
+import { plural, useAsync } from '../lib/hooks.ts';
 import { FullPageSpinner, cn } from '../ui/index.tsx';
 import { ResultsPage, useResults } from './ResultsRoutes.tsx';
 import { Dot, Empty, ExportMenu, OutcomeDots, Panel, Segmented, Switch } from './components.tsx';
@@ -60,7 +60,7 @@ export default function SessionsList() {
   return (
     <ResultsPage
       title="Sessions"
-      subtitle={<span className="tabular-nums">{rows.length} of {all.filter((s) => includePreview || !s.preview).length} sessions</span>}
+      subtitle={<span className="tabular-nums">{rows.length} of {plural(all.filter((s) => includePreview || !s.preview).length, 'session')}</span>}
       actions={<ExportMenu studyId={studyId} includePreview={includePreview} />}
     >
       {error ? (
@@ -139,7 +139,9 @@ export default function SessionsList() {
                       className="cursor-pointer border-b border-separator/70 transition-colors last:border-0 hover:bg-black/[0.025] focus:bg-brand-500/[0.06] focus:outline-none"
                     >
                       <td className="py-3 pl-6 pr-3">
-                        <div className="font-medium tabular-nums text-label">{s.participantCode}</div>
+                        <Link to={`${base}/sessions/${s.id}`} onClick={(e) => e.stopPropagation()} tabIndex={-1} className="font-medium tabular-nums text-label hover:underline">
+                          {s.participantCode}
+                        </Link>
                         {(s.preview || s.urlParams?.PROLIFIC_PID) && (
                           <div className="text-[11px] text-tertiary">{s.preview ? 'Preview' : `Prolific ${s.urlParams.PROLIFIC_PID.slice(0, 8)}…`}</div>
                         )}

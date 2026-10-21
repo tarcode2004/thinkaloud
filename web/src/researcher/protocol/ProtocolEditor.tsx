@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import { emptyProtocol, type InstrumentId, type Protocol, type ProtocolRecord, type Step, type StepType } from '@thinkaloud/shared';
 import { api } from '../../lib/api.ts';
-import { Button, cn, Input, Modal } from '../../ui/index.tsx';
+import { Button, cn, Input, Modal, Textarea } from '../../ui/index.tsx';
 import { useToast } from '../../ui/toast.tsx';
 import { Callout, InlineEdit, KeyHint, Menu, MenuItem } from '../components/index.tsx';
 import { errorMessage } from '../lib.ts';
@@ -511,10 +511,13 @@ function StepPane({ step, index, total, issues, onChange, onDuplicate, onRemove,
       <div className="mb-5 flex items-start gap-3">
         <div className="min-w-0 flex-1">
           <div className="text-xs font-medium text-secondary">Step {index + 1} of {total} · {meta.label}</div>
-          <Input
+          {/* Wrapping single-line title: long AI-generated titles must not be clipped. */}
+          <Textarea
+            rows={1}
             value={step.title}
-            onChange={(e) => onChange({ ...step, title: e.target.value })}
-            className="-ml-3 mt-0.5 h-auto !border-transparent !bg-transparent px-3 py-1 text-[22px] font-semibold tracking-[-0.015em] hover:!bg-black/[0.03] focus:!border-brand-500 focus:!bg-white"
+            onChange={(e) => onChange({ ...step, title: e.target.value.replace(/\n/g, ' ') })}
+            onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), e.currentTarget.blur())}
+            className="-ml-3 mt-0.5 !min-h-0 resize-none [field-sizing:content] !border-transparent !bg-transparent px-3 py-1 text-[22px] font-semibold leading-snug tracking-[-0.015em] hover:!bg-black/[0.03] focus:!border-brand-500 focus:!bg-white"
             aria-label="Step title"
             data-testid="step-title"
           />
@@ -589,7 +592,7 @@ function StepList({ steps, selectedId, issues, onSelect, onMove }: { steps: Step
             data-testid="step-item"
           >
             {over?.idx === i && dragIdx !== null && (
-              <span className={cn('pointer-events-none absolute inset-x-1 z-10 h-0.5 rounded-full bg-brand-500/[0.08]0', over.after ? '-bottom-px' : '-top-px')} />
+              <span className={cn('pointer-events-none absolute inset-x-1 z-10 h-0.5 rounded-full bg-brand-500', over.after ? '-bottom-px' : '-top-px')} />
             )}
             <button
               onClick={() => onSelect(s.id)}
@@ -617,7 +620,7 @@ function AddStepMenu({ onAdd }: { onAdd: (t: StepType, inst?: InstrumentId | 'cu
     <Menu
       className="w-72"
       trigger={({ toggle }) => (
-        <button onClick={toggle} className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-[10px] border border-dashed border-black/15 py-2 text-sm font-medium text-secondary transition hover:border-brand-500/50 hover:bg-brand-500/[0.08]0/[0.08]0/[0.04] hover:text-brand-500" data-testid="add-step">
+        <button onClick={toggle} className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-[10px] border border-dashed border-black/15 py-2 text-sm font-medium text-secondary transition hover:border-brand-500/50 hover:bg-brand-500/[0.04] hover:text-brand-500" data-testid="add-step">
           <Plus className="size-4" /> Add step
         </button>
       )}

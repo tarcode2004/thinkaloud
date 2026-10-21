@@ -336,7 +336,8 @@ export function Stage({
     }
     return p;
   }, [events, c.t]);
-  const beforeReplay = hasReplay && c.t < offset;
+  // Sub-second gaps (probe boots right after the session starts) are not worth a "starts at 0:00" overlay.
+  const beforeReplay = hasReplay && offset >= 1000 && c.t < offset;
 
   return (
     <div ref={outer} className="relative h-full w-full overflow-hidden">

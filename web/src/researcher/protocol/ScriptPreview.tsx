@@ -46,7 +46,7 @@ export function ScriptPreview({ p, onJump, activeId }: { p: Protocol; onJump: (i
         type="button"
         onClick={opts.onClick}
         disabled={!opts.onClick}
-        className={cn('w-full rounded-[10px] p-2 text-left transition', opts.onClick && 'hover:bg-black/[0.03]', opts.active && 'bg-brand-500/[0.08]0/[0.06] ring-1 ring-brand-500/25')}
+        className={cn('w-full rounded-[10px] p-2 text-left transition', opts.onClick && 'hover:bg-black/[0.03]', opts.active && 'bg-brand-500/[0.06] ring-1 ring-brand-500/25')}
       >
         <div className="text-xs font-semibold text-label">{title}</div>
         <div className="mt-1.5 space-y-1.5">{body}</div>

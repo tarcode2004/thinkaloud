@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 import type { User } from '@thinkaloud/shared';
 import { db } from '../db.ts';
+import { config } from './config.ts';
 import { HttpError } from './http.ts';
 
 export const AUTH_COOKIE = 'ta_auth';
@@ -34,7 +35,7 @@ export function createAuthSession(res: Response, userId: string): string {
   const now = Date.now();
   const expires = now + SESSION_DAYS * 864e5;
   db.prepare('INSERT INTO auth_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)').run(token, userId, now, expires);
-  res.cookie(AUTH_COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: false, maxAge: SESSION_DAYS * 864e5, path: '/' });
+  res.cookie(AUTH_COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: config.publicUrl.startsWith('https://'), maxAge: SESSION_DAYS * 864e5, path: '/' });
   return token;
 }
 
@@ -84,6 +85,12 @@ export function assertChildAccess(req: Request, table: 'protocols' | 'apps' | 'v
 export function assertParticipant(req: Request, sessionId: string) {
   const secret = (req.headers['x-session-secret'] as string | undefined) || (req.query.secret as string | undefined);
   const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId) as Record<string, unknown> | undefined;
-  if (!row || !secret || row.secret !== secret) throw new HttpError(403, 'Invalid session');
+  if (!row || typeof secret !== 'string' || !secret || !safeEqual(String(row.secret), secret)) throw new HttpError(403, 'Invalid session');
   return row;
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
 }

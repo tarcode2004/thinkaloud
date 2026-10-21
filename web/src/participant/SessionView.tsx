@@ -1,6 +1,6 @@
 // Main session layout: a calm voice screen (orb + captions + cards) and, during
 // tasks, the tested app full-screen with a slim moderator dock.
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { ArrowUp, ChevronDown, ChevronUp, Keyboard, Mic, MicOff, RotateCw, X } from 'lucide-react';
 import type { Question, TaskStep } from '@thinkaloud/shared';
 import { Button, cn, Modal } from '../ui/index.tsx';
@@ -13,7 +13,7 @@ const ICON = { strokeWidth: 1.75 } as const;
 
 export function SessionView({ runner, title, preview, onWithdraw }: { runner: SessionRunner; title: string; preview: boolean; onWithdraw: () => Promise<void> }) {
   const s = useSyncExternalStore(runner.subscribe, runner.getSnapshot);
-  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const frameRef = useCallback((el: HTMLIFrameElement | null) => runner.attachIframe(el), [runner]);
   const [confirmWithdraw, setConfirmWithdraw] = useState(false);
   const [withdrawing, setWithdrawing] = useState(false);
   const [typing, setTyping] = useState(runner.snapshot.mode === 'text');
@@ -23,9 +23,6 @@ export function SessionView({ runner, title, preview, onWithdraw }: { runner: Se
   const app = s.appVisible && hasApp;
   const voice = s.mode !== 'manual';
 
-  useEffect(() => {
-    runner.attachIframe(iframeRef.current);
-  }, [runner]);
   useEffect(() => {
     if (s.mode === 'text') setTyping(true);
   }, [s.mode]);
@@ -90,14 +87,17 @@ export function SessionView({ runner, title, preview, onWithdraw }: { runner: Se
         {/* App layer (kept mounted so app state and the probe survive between steps) */}
         {hasApp && (
           <div className={cn('absolute inset-0 bg-white transition-[opacity,transform] duration-500 ease-apple', app ? 'opacity-100' : 'pointer-events-none scale-[0.985] opacity-0')} aria-hidden={!app}>
-            <iframe
-              ref={iframeRef}
-              src={appUrl!}
-              title="Website being tested"
-              className="h-full w-full border-0"
-              allow="clipboard-read; clipboard-write; fullscreen"
-              data-testid="app-frame"
-            />
+            {s.appFrame.src && (
+              <iframe
+                key={s.appFrame.key}
+                ref={frameRef}
+                src={s.appFrame.src}
+                title="Website being tested"
+                className="h-full w-full border-0"
+                allow="clipboard-read; clipboard-write; fullscreen"
+                data-testid="app-frame"
+              />
+            )}
             {s.appStatus === 'crashed' && app && (
               <div className="absolute inset-0 flex items-center justify-center bg-white/60 backdrop-blur-sm">
                 <div className="w-[min(92vw,380px)] rounded-[22px] bg-surface p-6 text-center shadow-[0_8px_40px_rgba(0,0,0,.12)]">

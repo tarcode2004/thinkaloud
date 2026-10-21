@@ -19,7 +19,7 @@ export default function VariantsPage() {
   const totalW = active.reduce((s, v) => s + (v.weight || 0), 0);
   const share = (v: Variant) => (v.active && totalW > 0 ? v.weight / totalW : 0);
 
-  const patch = async (v: Variant, body: Partial<Pick<Variant, 'name' | 'protocolId' | 'appId' | 'weight' | 'active'>>) => {
+  const patch = async (v: Variant, body: Partial<Pick<Variant, 'name' | 'protocolId' | 'appId' | 'weight' | 'active' | 'appParams'>>) => {
     update((d) => ({ ...d, variants: d.variants.map((x) => (x.id === v.id ? { ...x, ...body } : x)) }));
     try {
       const r = await api.patch<{ variant?: Variant }>(`/api/variants/${v.id}`, body);
@@ -57,7 +57,7 @@ export default function VariantsPage() {
         <div className="max-w-2xl">
           <h2 className="text-[22px] font-semibold tracking-[-0.015em]">Variants</h2>
           <p className="mt-1 text-[15px] leading-relaxed text-secondary">
-            Each participant is assigned to exactly one active variant (between-subjects). Auto-assign links keep groups balanced by weight. To compare designs, give each variant a different app build. To compare wording, give each a different protocol.
+            Each participant is assigned to exactly one active variant (between-subjects). Auto-assign links keep groups balanced by weight. To compare designs, give each variant a different app build. To compare wording, give each a different protocol. To switch a feature flag or condition in the same build, set launch parameters (added to the app URL).
           </p>
         </div>
         <Button variant="secondary" icon={<Plus className="size-4" />} loading={adding} onClick={add} disabled={!protocols.length}>Add variant</Button>
@@ -117,6 +117,19 @@ export default function VariantsPage() {
             <button onClick={() => remove(v)} disabled={variants.length <= 1} className="justify-self-end rounded-full p-1.5 text-tertiary hover:bg-sys-red/10 hover:text-sys-red disabled:opacity-30" aria-label="Delete variant" title={variants.length <= 1 ? 'A study needs at least one variant' : 'Delete variant'}>
               <Trash2 className="size-4" />
             </button>
+            {v.appId && (
+              <label className="flex items-center gap-3 md:col-span-6">
+                <span className="shrink-0 text-[12px] font-medium text-secondary">Launch parameters</span>
+                <input
+                  defaultValue={v.appParams ?? ''}
+                  placeholder="e.g. flags=summaryCard:1&theme=dark"
+                  onBlur={(e) => e.target.value.trim() !== (v.appParams ?? '') && patch(v, { appParams: e.target.value.trim() })}
+                  onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+                  className="h-8 min-w-0 flex-1 rounded-[8px] border border-black/10 bg-white px-2.5 font-mono text-[12px] text-label placeholder:text-tertiary focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/15"
+                  aria-label="Launch parameters"
+                />
+              </label>
+            )}
           </div>
         ))}
       </div>
