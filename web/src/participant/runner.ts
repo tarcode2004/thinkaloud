@@ -111,6 +111,12 @@ export interface RunnerOptions {
   calibration?: { errorPx: number; points: number } | null;
 }
 
+/** Silence nudges per task step (with backoff), then quiet. */
+const MAX_NUDGES = 3;
+/** App interaction this recent means the participant is working: no nudge, silence clock restarts. */
+const INTERACTION_GRACE_MS = 10_000;
+/** After the nudge cap: one "keep going or move on?" check-in after this much silence + inactivity. */
+const CHECK_IN_SILENCE_MS = 90_000;
 const akey = (stepId: string, qid: string) => `${stepId}::${qid}`;
 
 export class SessionRunner {
@@ -147,6 +153,8 @@ export class SessionRunner {
   private doneRequested = false;
   private taskEndedAt = 0;
   private ignoreNavUntil = 0;
+  /** Only the runner's own start-path navigation is ignored by URL rules (not the participant's clicks). */
+  private ignoreNavPath = '';
   private domPollBusy = false;
   private taskActivateTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -156,6 +164,9 @@ export class SessionRunner {
   private lastAssistantAudio = 0;
   private lastTrigger = 0;
   private nudgesThisTask = 0;
+  private checkInDone = false;
+  /** Last click / navigation / typing in the app (performance.now). */
+  private lastInteraction = 0;
   private lastAppAction = 0;
   private userSpeechStartT: number | null = null;
   private appFeed: string[] = [];
@@ -173,9 +184,15 @@ export class SessionRunner {
   private helloTimer: ReturnType<typeof setTimeout> | null = null;
   private transcriptLog: { role: string; text: string }[] = [];
   private closingSpoken = false;
+  private closingAttempts = 0;
+  private closingRequestedAt = 0;
+  private closingCheck: ReturnType<typeof setTimeout> | null = null;
   private finishing = false;
   private gazeBuf: [number, number, number][] = [];
   private captionSeq = 0;
+  private awaitingReplyUntil = 0;
+  /** `${stepId}::${questionId}` of spoken questions the moderator has fully read out. */
+  private askedQuestions = new Set<string>();
   /** Quiet-phase turn-taking decisions (debug / tests). */
   readonly turnChecks: { text: string; addressed: boolean; via: string; verdict: string | null; at: number }[] = [];
 
@@ -318,8 +335,10 @@ export class SessionRunner {
       audioEl: this.opts.audioEl,
       handlers: {
         onStatus: (s, detail) => {
+          const prev = this.state.conn;
           this.set({ conn: s });
           this.updateOrb();
+          if (s === 'reconnecting' && prev === 'connected') this.queue.push('observation', { kind: 'realtime_dropped', note: 'Voice connection dropped; reconnecting once.' });
           if (s === 'failed') {
             this.queue.push('session.error', { message: `Realtime connection failed: ${detail ?? ''}`, fallback: 'manual' });
             this.toManual('The voice connection was lost, so we continue on screen. Your progress is saved.');
@@ -385,6 +404,12 @@ export class SessionRunner {
     this.applyTurnDetection(true);
     if (!reconnected) {
       this.enterStep(-1, 'announce');
+      return;
+    }
+    this.queue.push('observation', { kind: 'realtime_reconnected' });
+    if (this.state.index >= this.steps.length) {
+      // Reconnected during the closing: just say it (again, if it was cut off).
+      if (!this.closingSpoken) this.sayClosing();
       return;
     }
     const recent = this.transcriptLog
@@ -463,12 +488,18 @@ export class SessionRunner {
     const rt = this.rt;
     if (!rt) return;
     const stepId = this.step?.id;
+    if (performance.now() < this.awaitingReplyUntil) {
+      this.awaitingReplyUntil = 0;
+      this.turnChecks.push({ text, addressed: true, via: 'reply', verdict: null, at: this.queue.now() });
+      rt.requestResponse();
+      return;
+    }
     const onScreenForm = this.step?.type === 'questionnaire';
     const verdict = await rt.classify(
       `You are a silent turn-taking classifier for a usability-test moderator — you are NOT talking to anyone. The participant is ${
         onScreenForm ? 'filling in an on-screen questionnaire' : 'working on a task and thinking aloud'
       }. Their most recent utterance (it may be in any language) was transcribed as: "${text.replace(/"/g, "'")}".
-Answer YES if they are addressing the moderator and expect a reply or an action: a question to the moderator, a request for help or to repeat something, saying they are done / finished / want to skip, stop or give up${
+Answer YES if they are addressing the moderator and expect a reply or an action: answering a question the moderator just asked, a question to the moderator, a request for help or to repeat something, saying they are done / finished / want to skip, stop or give up${
         onScreenForm ? ', or saying a rating or answer for one of the on-screen items' : ''
       }. Answer NO if they are thinking aloud, describing what they see or do, reading text aloud, or asking themselves a question.
 Reply with exactly one word: YES or NO.`,
@@ -493,6 +524,11 @@ Reply with exactly one word: YES or NO.`,
     if (!text) return;
     this.transcriptLog.push({ role: 'moderator', text });
     this.queue.push('transcript.moderator', { text, responseId: rid, ...(phase ? { phase } : {}) });
+    // Which spoken question was actually read out (an interrupted reading does not count).
+    const cur = this.step && this.state.index >= 0 ? this.nextQuestion() : null;
+    if (cur && isReadingOf(text, cur.prompt)) this.askedQuestions.add(`${this.step!.id}::${cur.id}`);
+    // The moderator asked something during a quiet phase: the next utterance is the answer.
+    this.awaitingReplyUntil = /[?？؟]/.test(text) && this.quiet ? performance.now() + 60_000 : 0;
     if (this.step?.type === 'task' && this.state.taskPhase === 'briefing' && isReadingOf(text, (this.step as TaskStep).instruction)) this.instructionHeard = true;
     // Follow-up accounting: a question that isn't a reading of the current prompt counts as a follow-up.
     if (/[?？؟]/.test(text) && this.step && this.state.index >= 0) {
@@ -591,6 +627,7 @@ Reply with exactly one word: YES or NO.`,
     this.taskOutcome = null;
     this.doneRequested = false;
     this.nudgesThisTask = 0;
+    this.checkInDone = false;
     this.observed = new Map();
     this.behaviourProbeAsked = false;
     this.queue.stepId = step?.id ?? (index < 0 ? 'intro' : 'closing');
@@ -610,7 +647,8 @@ Reply with exactly one word: YES or NO.`,
     this.queue.push('step.enter', { index, type: step?.type ?? (index < 0 ? 'intro' : 'closing'), title: step?.title ?? (index < 0 ? 'Introduction' : 'Closing') });
 
     if (step?.type === 'task') {
-      if (this.opts.start.appUrl) this.navigateApp(step.startPath);
+      // No start page = continue wherever the participant currently is in the app.
+      if (this.opts.start.appUrl && step.startPath?.trim()) this.navigateApp(step.startPath.trim());
       // Task becomes active when the moderator finished reading it, on first interaction, or after 25s.
       this.taskActivateTimer = setTimeout(() => this.activateTask('timeout'), this.state.mode === 'manual' ? 0 : 25_000);
     }
@@ -624,6 +662,7 @@ Reply with exactly one word: YES or NO.`,
     const brief = this.brief();
     if (mode === 'announce' && this.rt && index >= this.steps.length) {
       this.rt.cancelResponse();
+      this.rt.addSystemItem(`${prefix ? `${prefix}\n` : ''}[STEP] ${JSON.stringify(brief)}`);
       this.sayClosing(ack);
       this.briefDelivered = true;
       return brief;
@@ -645,6 +684,8 @@ Reply with exactly one word: YES or NO.`,
   }
 
   private sayClosing(ack?: string) {
+    this.closingAttempts++;
+    this.closingRequestedAt = performance.now();
     this.directed(`The session is over. ${ack ? `${this.ackPhrase(ack)}, then say` : 'Say'} exactly the following text, verbatim, and nothing else:\n"${this.protocol.closing}"`);
   }
 
@@ -662,6 +703,18 @@ Reply with exactly one word: YES or NO.`,
     // step (or an interrupted reading) must not start the clock; the 25 s timeout is the fallback.
     if (s?.type === 'task' && this.state.taskPhase === 'briefing' && this.instructionHeard && performance.now() - this.stepEnteredAt > 1500) this.activateTask('briefed');
     if (s?.type === 'instruction' && (s.exploreSeconds ?? 0) > 0 && !this.state.exploreEndsAt && performance.now() - this.stepEnteredAt > 1500) this.startExplore();
+    if (this.state.index >= this.steps.length && !this.closingSpoken && this.closingAttempts > 0 && !this.closingCheck) {
+      // The closing turn said something else (e.g. finished an interrupted sentence): ask once more,
+      // then end the session regardless — it must never hang at the very end.
+      this.closingCheck = setTimeout(() => {
+        this.closingCheck = null;
+        const rt = this.rt;
+        if (this.finishing || this.closingSpoken || this.state.index < this.steps.length) return;
+        if (rt?.responding || rt?.assistantAudioPlaying || performance.now() - this.closingRequestedAt < 4000) return; // still on its way
+        if (this.closingAttempts < 2) this.sayClosing();
+        else void this.finish();
+      }, 2500);
+    }
     if (this.state.index >= this.steps.length && this.closingSpoken) {
       // Fallback if the model never calls end_session.
       setTimeout(() => {
@@ -769,7 +822,7 @@ Reply with exactly one word: YES or NO.`,
 
   /** A response whose content the runner dictates (full rules + a NOW section, tools disabled). */
   private directed(now: string) {
-    this.rt?.requestResponse(`${buildModeratorInstructions(this.protocol, this.steps)}\n\n# NOW\n${now}`, 'none');
+    this.rt?.requestResponse(`${buildModeratorInstructions(this.protocol, this.steps)}\n\n# NOW\n${now}\nDo not continue, finish or repeat any earlier (interrupted) sentence of yours.`, 'none');
   }
 
   private updateCard() {
@@ -959,6 +1012,11 @@ Reply with exactly one word: YES or NO.`,
       return this.err(`Unknown question_id "${qid}" for the current step.`, next ? `The current question_id is "${next.id}".` : 'This step has no open question. Follow the brief.');
     }
     const onScreenForm = s.type === 'questionnaire' && questionnaireOnScreen(s);
+    // A spoken-only question must have been asked before it can be answered (e.g. the participant's
+    // previous answer barged in while the moderator was starting to read it).
+    const spokenOnly = !questionHasCard(q) && !(s.type === 'question') && this.state.mode === 'voice';
+    if (spokenOnly && !this.askedQuestions.has(`${s.id}::${q.id}`) && !this.state.answers[akey(s.id, q.id)])
+      return this.err(`Question "${q.id}" has not been asked yet — your reading of it was interrupted.`, `Ask it now, verbatim: "${q.prompt}", then wait for the answer. Do not record what the participant said before it.`);
     if (onScreenForm && this.questionnaireSubmitted) return this.err('The questionnaire was already submitted.', 'Follow the current brief.');
     const prevAns = this.state.answers[akey(s.id, q.id)];
     // Follow-up enrichment: keep the earlier value/choices when only text is added.
@@ -975,7 +1033,7 @@ Reply with exactly one word: YES or NO.`,
     this.storeAnswer(s.id, q, merged);
     // On-screen questionnaire answered aloud: the card shows it; stay quiet while they fill in the rest.
     if (onScreenForm) return { output: { ok: true, recorded: q.id, note: 'Recorded and shown on screen. Say nothing; let them continue.' }, respond: false };
-    return { output: { ...this.brief(), recorded: q.id, acknowledge: 'Begin your next turn with a brief neutral acknowledgement ("Thanks." / "Got it."), then continue. Never narrate what you are doing.' }, respond: true };
+    return { output: { ...this.brief(), recorded: q.id, acknowledge: 'Begin your next turn with a brief neutral acknowledgement in the session language (like "Thanks." / "Got it."), then continue. Never narrate what you are doing.' }, respond: true };
   }
 
   private validateAnswer(q: Question, a: { text?: unknown; value?: unknown; choices?: unknown }): Omit<AnswerValue, 'source'> | { error: string } {
@@ -1048,7 +1106,7 @@ Reply with exactly one word: YES or NO.`,
     const scale = describeScale(q);
     if (wasCurrent && !prev) {
       this.rt.addSystemItem(
-        `[EVENT] The participant answered on screen: question_id "${q.id}" ("${q.prompt}") → ${label}${scale ? ` (${scale})` : ''}. It is recorded — do not call record_answer for it and do not ask it again. Start with a brief neutral acknowledgement ("Thanks.") and go straight on with the brief below. Never comment on the rating and never narrate (no "I have what I need", "noted", "let me note that").\n[STEP] ${JSON.stringify(this.brief())}`,
+        `[EVENT] The participant answered on screen: question_id "${q.id}" ("${q.prompt}") → ${label}${scale ? ` (${scale})` : ''}. It is recorded — do not call record_answer for it and do not ask it again. Start with a brief neutral acknowledgement in the session language (like "Thanks.") and go straight on with the brief below. Never comment on the rating and never narrate (no "I have what I need", "noted", "let me note that").\n[STEP] ${JSON.stringify(this.brief())}`,
       );
       this.rt.requestResponse();
     } else {
@@ -1199,6 +1257,7 @@ Reply with exactly one word: YES or NO.`,
   private navigateApp(path?: string) {
     const target = path || '/';
     this.ignoreNavUntil = Date.now() + 2000;
+    this.ignoreNavPath = target.split(/[?#]/)[0];
     if (this.bridge.connected) this.bridge.navigate(this.withVariantParams(target));
     else if (this.iframe && path) {
       this.iframe.src = this.appUrlFor(path) ?? this.iframe.src;
@@ -1269,6 +1328,7 @@ Reply with exactly one word: YES or NO.`,
     const now = Date.now();
     const appActive = this.state.appVisible;
     if (['app.click', 'app.input', 'app.change', 'app.scroll', 'app.navigate', 'app.dead_click', 'app.rage_click'].includes(kind)) this.lastAppAction = performance.now();
+    if (['app.click', 'app.input', 'app.change', 'app.navigate', 'app.dead_click', 'app.rage_click'].includes(kind)) this.lastInteraction = performance.now();
     const s = this.step;
     const inTask = s?.type === 'task' && this.state.taskPhase !== 'post';
     if (inTask && this.state.taskPhase === 'briefing' && (kind === 'app.click' || kind === 'app.input')) this.activateTask('interaction');
@@ -1356,7 +1416,7 @@ Reply with exactly one word: YES or NO.`,
 
   private evaluateUrlRules(path: string) {
     const rules = this.taskRules();
-    if (!rules.length || Date.now() < this.ignoreNavUntil) return;
+    if (!rules.length || (Date.now() < this.ignoreNavUntil && path.split(/[?#]/)[0] === this.ignoreNavPath)) return;
     const hit = rules.find((r) => r.type === 'url_matches' && urlMatches(r.pattern, path));
     if (hit) this.ruleSuccess(`URL ${path} matches /${(hit as { pattern: string }).pattern}/`);
   }
@@ -1435,6 +1495,13 @@ Reply with exactly one word: YES or NO.`,
     return rt.userSpeaking || rt.assistantAudioPlaying || rt.responding;
   }
 
+  /**
+   * Silence nudges during a task: at most MAX_NUDGES per task, each after a longer silence
+   * (silencePromptSeconds × 1, 1.5, 2). Someone who is clicking or navigating is working, not stuck:
+   * app interaction in the last ~10 s resets the silence clock. After the cap the moderator stays
+   * quiet — except one neutral check-in ("keep going or move on?") after ~90 s of silence with no
+   * app activity at all.
+   */
   private maybeNudge() {
     const s = this.step;
     const rt = this.rt;
@@ -1442,18 +1509,31 @@ Reply with exactly one word: YES or NO.`,
     const mod = this.mod;
     if (!mod.silencePromptSeconds || mod.style === 'think_aloud_retrospective' || mod.style === 'unmoderated') return;
     if (this.state.muted || this.someoneTalking() || this.state.appStatus === 'crashed') return;
-    if (this.nudgesThisTask >= 6) return;
     const nowP = performance.now();
-    const threshold = mod.silencePromptSeconds * 1000 * (1 + this.nudgesThisTask * 0.5);
+    if (nowP - this.lastInteraction < INTERACTION_GRACE_MS) return; // working, not stuck
     const lastSound = Math.max(this.lastUserSpeech, this.lastAssistantAudio, this.lastTrigger, this.stepEnteredAt);
-    if (nowP - lastSound < threshold) return;
-    if (nowP - this.lastAppAction < 2500) return; // never prompt mid-action
-    this.nudgesThisTask++;
+    const silentFrom = Math.max(lastSound, this.lastInteraction);
+    const silentMs = nowP - silentFrom;
+    const silentSec = Math.round(silentMs / 1000);
+    if (this.nudgesThisTask < MAX_NUDGES) {
+      const threshold = mod.silencePromptSeconds * 1000 * (1 + this.nudgesThisTask * 0.5);
+      if (silentMs < threshold) return;
+      this.nudgesThisTask++;
+      this.lastTrigger = nowP;
+      this.queue.push('moderator.nudge', { silentSec, n: this.nudgesThisTask });
+      rt.addSystemItem(
+        `[TRIGGER] The participant has been silent for about ${silentSec} seconds while working on the task. Give ONE very short, neutral think-aloud nudge, e.g. "What are you thinking right now?" or "Remember to keep talking." Use different wording from any earlier nudge. Do not mention the task content, do not hint, do not ask about progress.`,
+      );
+      rt.requestResponse();
+      return;
+    }
+    // Cap reached: one check-in after a long, completely idle stretch.
+    if (this.checkInDone || silentMs < CHECK_IN_SILENCE_MS || nowP - this.lastAppAction < CHECK_IN_SILENCE_MS) return;
+    this.checkInDone = true;
     this.lastTrigger = nowP;
-    const silentSec = Math.round((nowP - lastSound) / 1000);
-    this.queue.push('moderator.nudge', { silentSec, n: this.nudgesThisTask });
+    this.queue.push('moderator.nudge', { silentSec, n: this.nudgesThisTask + 1, kind: 'check_in' });
     rt.addSystemItem(
-      `[TRIGGER] The participant has been silent for about ${silentSec} seconds while working on the task. Give ONE very short, neutral think-aloud nudge, e.g. "What are you thinking right now?" or "Remember to keep talking." Vary the wording. Do not mention the task content, do not hint, do not ask about progress.`,
+      `[TRIGGER] The participant has been silent and inactive for about ${silentSec} seconds. Ask ONCE, neutrally and briefly, whether they would like to keep going with this task or move on (e.g. "Would you like to keep going, or move on to the next part?"). No hints, no judgement. If they want to move on, call participant_requests_skip.`,
     );
     rt.requestResponse();
   }

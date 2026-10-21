@@ -18,7 +18,7 @@ export interface CalibrationResult {
   points: number;
 }
 
-type Phase = 'loading' | 'position' | 'calibrate' | 'validate' | 'result' | 'failed';
+type Phase = 'loading' | 'position' | 'calibrate' | 'validate' | 'result' | 'nodata' | 'failed';
 
 export function Calibration({ onDone, onSkip }: { onDone: (eye: EyeTracker, r: CalibrationResult) => void; onSkip: () => void }) {
   const eye = useRef<EyeTracker | null>(null);
@@ -36,7 +36,6 @@ export function Calibration({ onDone, onSkip }: { onDone: (eye: EyeTracker, r: C
     e.start()
       .then(() => {
         if (cancelled) return;
-        e.positionPreview('center');
         setPhase('position');
       })
       .catch((x) => {
@@ -50,6 +49,16 @@ export function Calibration({ onDone, onSkip }: { onDone: (eye: EyeTracker, r: C
       cancelled = true;
     };
   }, []);
+
+  // Show the camera preview inside the space reserved for it in the layout.
+  const previewSlot = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (phase !== 'position') return;
+    const place = () => previewSlot.current && eye.current?.positionPreview('center', previewSlot.current.getBoundingClientRect());
+    place();
+    window.addEventListener('resize', place);
+    return () => window.removeEventListener('resize', place);
+  }, [phase]);
 
   const skip = () => {
     eye.current?.stop();
@@ -92,7 +101,12 @@ export function Calibration({ onDone, onSkip }: { onDone: (eye: EyeTracker, r: C
         await sleep(60);
       }
     }
-    const mean = errs.length ? errs.reduce((a, b) => a + b, 0) / errs.length : 9999;
+    if (errs.length < 3) {
+      // No usable predictions (face lost, too dark…): say so instead of reporting a fake accuracy.
+      setPhase('nodata');
+      return;
+    }
+    const mean = errs.reduce((a, b) => a + b, 0) / errs.length;
     setErrorPx(Math.round(mean));
     setPhase('result');
   };
@@ -129,7 +143,7 @@ export function Calibration({ onDone, onSkip }: { onDone: (eye: EyeTracker, r: C
       {phase === 'position' && (
         <>
           <p className="mt-3 text-[17px] leading-relaxed text-secondary">Center your face in the preview, about an arm’s length from the screen, in good light. Then you’ll click nine dots while looking at them.</p>
-          <div className="h-[260px]" />
+          <div ref={previewSlot} className="my-6 h-[240px] w-full" data-testid="camera-preview-slot" />
           <div className="flex gap-3">
             <Button size="lg" onClick={startCal}>
               Start calibration
@@ -151,6 +165,19 @@ export function Calibration({ onDone, onSkip }: { onDone: (eye: EyeTracker, r: C
             </Button>
             <Button size="lg" variant="secondary" onClick={startCal}>
               Calibrate again
+            </Button>
+          </div>
+        </>
+      )}
+      {phase === 'nodata' && (
+        <>
+          <p className="mt-3 text-[17px] leading-relaxed text-secondary">We couldn’t follow your eyes this time. Check that your face is well lit and centered, then try again — or continue without eye tracking.</p>
+          <div className="mt-8 flex gap-3">
+            <Button size="lg" onClick={() => setPhase('position')}>
+              Try again
+            </Button>
+            <Button size="lg" variant="secondary" onClick={skip}>
+              Continue without
             </Button>
           </div>
         </>

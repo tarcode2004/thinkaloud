@@ -60,11 +60,19 @@ export class RealtimeClient {
   private respondAfterCalls = false;
   private reconnects = 0;
   private connectedAt = 0;
+  /** A session was established before (so a later onReady is a resume, not a fresh start). */
+  private everReady = false;
   /** Out-of-band (conversation: 'none', text-only) classification requests, by our id / by response id. */
   private oob = new Map<string, { resolve: (text: string | null) => void; text: string }>();
   private oobByResponse = new Map<string, string>();
   private oobSeq = 0;
   private itemPhase = new Map<string, string>();
+  /** Last ~150 client/server event types (diagnostics; read by tests). */
+  readonly trace: string[] = [];
+  private tr(line: string) {
+    this.trace.push(`${Math.round(performance.now())} ${line}`);
+    if (this.trace.length > 150) this.trace.shift();
+  }
   private closedByUs = false;
   assistantAudioPlaying = false;
   userSpeaking = false;
@@ -144,7 +152,9 @@ export class RealtimeClient {
     this.connectedAt = Date.now();
     this.setStatus('connected');
     const queued = this.outbox.splice(0);
-    this.opts.handlers.onReady?.(this.reconnects > 0);
+    const resumed = this.everReady;
+    this.everReady = true;
+    this.opts.handlers.onReady?.(resumed);
     for (const q of queued) this.send(q);
   }
 
@@ -234,6 +244,8 @@ export class RealtimeClient {
         }
       }, 8000);
     }
+    const e = ev as { type?: string; response?: { instructions?: string; tool_choice?: string } };
+    this.tr(`> ${e.type}${e.response?.tool_choice ? ` tool_choice=${e.response.tool_choice}` : ''}${e.response?.instructions ? ` NOW:${e.response.instructions.split('# NOW').pop()?.slice(0, 60).replace(/\s+/g, ' ')}` : ''}`);
     if (this.dc?.readyState === 'open') this.dc.send(JSON.stringify(ev));
     else if (this.status === 'connecting' || this.status === 'reconnecting') this.outbox.push(ev);
   }
@@ -351,6 +363,8 @@ export class RealtimeClient {
   private handle(ev: ServerEvent) {
     const h = this.opts.handlers;
     h.onServerEvent?.(ev);
+    if (!/delta$|^output_audio_buffer\.|^rate_limits|^conversation\.item\.(added|done)$|content_part|transcript\.segment/.test(ev.type) || ev.type.startsWith('output_audio_buffer.st'))
+      this.tr(`< ${ev.type}${ev.type === 'error' ? ` ${JSON.stringify(ev.error).slice(0, 160)}` : ev.type === 'response.done' ? ` ${(ev.response as { status?: string })?.status}` : ''}`);
     // Out-of-band classification responses never affect the conversation state or captions.
     if (ev.type.startsWith('response.')) {
       const oob = this.oobOf(ev);

@@ -353,7 +353,7 @@ async function stackyFlow(page: Page, stepId: string) {
     await tryClick(app.getByLabel('Read full post'));
     await page.waitForTimeout(2500);
     await wheel(500, 2);
-    await page.goBack().catch(() => {});
+    // Back inside the app (never the top page — that would leave the session).
     if (frame) await frame.evaluate(() => history.back()).catch(() => {});
   } else if (stepId === 't_social') {
     const post = app.locator('[data-testid=post]').first();

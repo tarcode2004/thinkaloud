@@ -76,12 +76,12 @@ export const MODERATOR_TOOLS: RealtimeFunctionTool[] = [
     type: 'function',
     name: 'set_task_outcome',
     description:
-      "Only while a task is still in progress, after the participant says they are done with it (and you asked how they feel it went): your honest judgement of the outcome against the hidden success criteria. Never call it once the task has ended (after an [EVENT] that it ended, or when the brief says the outcome is recorded). Deterministic success rules override your judgement. Never tell the participant the outcome.",
+      "Only while a task is still in progress, after the participant says they are done with it (and you asked how they feel it went): your honest judgement of the outcome against the hidden success criteria. Never call it once the task has ended (after an [EVENT] that it ended, or when the brief says the outcome is recorded). Base it on OBSERVED app behaviour (the [app] activity you were sent: pages visited, clicks) checked against the success criteria — never on the participant's claim alone. If the criteria require something on screen and you saw no matching app activity, choose 'partial' or 'failure' and say so in the evidence. Deterministic success rules override your judgement. Never tell the participant the outcome.",
     parameters: {
       type: 'object',
       properties: {
         outcome: { type: 'string', enum: ['success', 'partial', 'failure'] },
-        evidence: { type: 'string', description: 'What you observed / what the participant said that supports this judgement.' },
+        evidence: { type: 'string', description: 'Cite the observed app activity (pages/clicks) first, then what the participant said. Write "no matching app activity observed" when that is the case.' },
       },
       required: ['outcome', 'evidence'],
       additionalProperties: false,
@@ -356,6 +356,12 @@ function questionJob(q: Question, onScreen: boolean, ctx: BriefContext): string 
   return `Ask the question in say_verbatim, then wait for the answer. ${fmt} As soon as they answer, call record_answer with question_id "${q.id}" right away, without saying anything first.${fu} The record_answer result tells you what comes next; start that turn with a brief neutral acknowledgement ("Thanks." / "Got it.") and go straight on.`;
 }
 
+/** 'Say "Thanks."' — in the session language (models copy quoted English words literally). */
+function sayThanks(ctx: BriefContext) {
+  const lang = languageName(ctx.protocol.moderation.language);
+  return lang === 'English' ? 'Say "Thanks."' : `Say a short neutral thank-you in ${lang} (the ${lang} word for "thanks")`;
+}
+
 export function buildBrief(ctx: BriefContext): ModeratorBrief {
   const { protocol, steps } = ctx;
   if (ctx.index < 0) {
@@ -403,7 +409,7 @@ export function buildBrief(ctx: BriefContext): ModeratorBrief {
       const items = questionnaireItems(step);
       if (questionnaireOnScreen(step)) {
         if (ctx.questionnaireSubmitted)
-          return { ok: true, step: stepHeader(ctx), your_job: 'The questionnaire was submitted. Say "Thanks." and call complete_step.' };
+          return { ok: true, step: stepHeader(ctx), your_job: `The questionnaire was submitted. ${sayThanks(ctx)} and call complete_step.` };
         return {
           ok: true,
           step: stepHeader(ctx),
@@ -414,7 +420,7 @@ export function buildBrief(ctx: BriefContext): ModeratorBrief {
         };
       }
       const q = ctx.nextQuestion;
-      if (!q) return { ok: true, step: stepHeader(ctx), your_job: 'All items are answered. Say "Thanks." and call complete_step.' };
+      if (!q) return { ok: true, step: stepHeader(ctx), your_job: `All items are answered. ${sayThanks(ctx)} and call complete_step.` };
       const first = (ctx.answeredCount ?? 0) === 0;
       return {
         ok: true,
@@ -502,7 +508,7 @@ function taskBrief(ctx: BriefContext, step: TaskStep): ModeratorBrief {
       ? `The task is over and all post-task questions are answered. You may ask at most ${n} follow-up question${n === 1 ? '' : 's'} in total now, one at a time. ${behaviourJob}${
           probes.length ? `${observed.length ? 'If follow-ups remain, ask' : 'Ask'} the allowed_researcher_probes that fit what you observed (verbatim). ` : observed.length ? '' : 'If something notable happened that the participant has not explained, you may ask ONE short open question about it (reflect their words). '
         }Then call complete_step with a factual summary. Never exceed the follow-up limit.`
-      : 'The task is over. Say "Thanks." and call complete_step with a factual summary.',
+      : `The task is over. ${sayThanks(ctx)} and call complete_step with a factual summary.`,
     hidden_researcher_notes: hidden,
   };
 }

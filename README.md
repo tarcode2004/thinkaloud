@@ -38,6 +38,18 @@ Development, with hot reload: `npm run dev`, then open http://localhost:5173.
 
 Configuration lives in `.env` (see `.env.example`): `OPENAI_API_KEY`, `OPENAI_REALTIME_MODEL=gpt-realtime-2`, `OPENAI_TEXT_MODEL`, `BUILD_MODE=docker|local`, `DATA_DIR`.
 
+## Example: the Stacky Social study
+
+`examples/stacky/protocol.json` turns the formative study plan in `stacky-social/client` (`BACKEND_INTEGRATION_AND_STUDY_PLAN.md`) into a runnable protocol: warm-up, 8 tasks, comprehension and trust questions, UMUX-Lite and a preference interview.
+
+```bash
+npm start                                    # with GIT_ALLOW_SSH=1 in .env for the private repo
+npx tsx scripts/setup-stacky-study.ts        # build the app from git, create A/B variants, go live
+STACKY_LINK=<printed link> npx playwright test tests/e2e/stacky.spec.ts   # optional voice dry-run
+```
+
+Stacky needs a running Next.js server (it has route handlers), so ThinkAloud runs it in a managed container behind the app host. The variants differ by **launch parameters**. Stacky reads `?flags=key:0|1`, so variant B defaults to `flags=replyContributions:0`. Change it in the Variants tab to whichever condition you want to compare. The plan's "AI disclosure on/off" condition has no flag in Stacky yet.
+
 ## Tests
 
 ```bash

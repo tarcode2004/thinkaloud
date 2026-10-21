@@ -219,6 +219,14 @@ async function waitModeratorIdle(page: Page, quietMs = 1200, ms = 60_000) {
   }
   throw new Error('moderator never went idle');
 }
+async function waitDone(page: Page, ms = 90_000) {
+  try {
+    await expect(page.getByTestId('done')).toBeVisible({ timeout: ms });
+  } catch {
+    const trace = await page.evaluate(() => (window as unknown as { __taRunner?: { rt?: { trace: string[] } } }).__taRunner?.rt?.trace ?? []).catch(() => []);
+    throw new Error(`Session never finished. Log:\n${fmtLog(await log(page).catch(() => []))}\nRealtime trace:\n${trace.join('\n')}`);
+  }
+}
 const modLines = (evs: LogEvent[], after = -1) => evs.filter((e) => e.kind === 'transcript.moderator' && e.t > after).map((e) => String(e.data.text));
 function save(name: string, evs: LogEvent[]) {
   fs.mkdirSync(OUT, { recursive: true });
@@ -402,7 +410,7 @@ test('1 · app crash detection: error, freeze and white screen → app.crash, ge
   await expect(session).toHaveAttribute('data-task-phase', 'active');
   await waitModeratorIdle(page);
   await page.getByTestId('skip-task').click();
-  await expect(page.getByTestId('done')).toBeVisible({ timeout: 90_000 });
+  await waitDone(page);
   const d = await lastSession(studyId);
   save('crash', d.events);
   expect(d.session.status).toBe('completed');
@@ -411,6 +419,54 @@ test('1 · app crash detection: error, freeze and white screen → app.crash, ge
   expect(d.events.filter((e) => e.kind === 'observation' && e.data.kind === 'app_reload').length).toBe(2);
   expect(d.taskResults[0]).toMatchObject({ outcome: 'abandoned', source: 'participant' });
   for (const l of modLines(d.events)) expect(l).not.toMatch(JUDGEMENT);
+  await context.close();
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+test('2b · silence nudges: none while the participant is clicking, at most 3 with backoff, then one check-in after ~90 s', async () => {
+  test.setTimeout(7 * 60_000);
+  const task = shopTask({ id: 'task_quiet', title: 'Look around', instruction: 'Imagine you are furnishing a new flat. Look around the shop for anything that catches your eye.', startPath: '/' });
+  const { token } = await createStudy('Nudges', protocol({ steps: [task, wrapup], moderation: { silencePromptSeconds: 8 } }));
+  const { context, page } = await newSessionPage(browser);
+  await enterSession(page, token);
+  await passIntro(page);
+  const session = page.getByTestId('session');
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 40_000 });
+  await waitModeratorIdle(page);
+  // 30 s of silent but busy clicking: working, not stuck → no nudge.
+  const app = page.frameLocator('[data-testid=app-frame]');
+  const busyFrom = (await log(page)).at(-1)!.t;
+  for (let i = 0; i < 8; i++) {
+    await app.getByRole('link', { name: ['Lighting', 'Decor', 'Furniture'][i % 3], exact: true }).click();
+    await page.waitForTimeout(3800);
+  }
+  expect((await log(page)).filter((e) => e.kind === 'moderator.nudge' && e.t > busyFrom), 'no nudge while clicking').toEqual([]);
+  // Idle: three nudges with growing gaps, then quiet.
+  await waitEvent(page, (e) => e.kind === 'moderator.nudge' && e.data.n === 3, 90_000, 'third nudge');
+  await page.waitForTimeout(40_000);
+  let nudges = (await log(page)).filter((e) => e.kind === 'moderator.nudge');
+  expect(nudges.length, 'capped at 3').toBe(3);
+  const gaps = nudges.slice(1).map((n, i) => n.t - nudges[i].t);
+  console.log('nudge times (s):', nudges.map((n) => (n.t / 1000).toFixed(0)), 'silence (s):', nudges.map((n) => n.data.silentSec));
+  expect(Number(nudges[0].data.silentSec)).toBeGreaterThanOrEqual(8);
+  expect(Number(nudges[1].data.silentSec)).toBeGreaterThanOrEqual(12);
+  expect(Number(nudges[2].data.silentSec)).toBeGreaterThanOrEqual(16);
+  expect(gaps[1]).toBeGreaterThan(gaps[0]); // backoff
+  // One neutral check-in after ~90 s of silence and inactivity.
+  const checkIn = await waitEvent(page, (e) => e.kind === 'moderator.nudge' && e.data.kind === 'check_in', 90_000, 'check-in');
+  expect(Number(checkIn.data.silentSec)).toBeGreaterThanOrEqual(90);
+  const line = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > checkIn.t, 30_000, 'check-in line');
+  console.log('check-in:', line.data.text);
+  expect(String(line.data.text)).toMatch(/keep going|move on|continue/i);
+  expect(String(line.data.text)).not.toMatch(JUDGEMENT);
+  await waitModeratorIdle(page);
+  await page.waitForTimeout(15_000);
+  nudges = (await log(page)).filter((e) => e.kind === 'moderator.nudge');
+  expect(nudges.length, 'nothing after the check-in').toBe(4);
+  const lines = modLines(await log(page), busyFrom);
+  expect(new Set(lines).size, 'nudges are not repeated verbatim').toBe(lines.length);
+  save('nudges', await log(page));
+  await page.getByTestId('skip-task').click();
   await context.close();
 });
 
@@ -506,20 +562,6 @@ test('2 · behaviour probes: asked after the task, open + neutral, within maxPro
   }
 });
 
-test('zz debug oob', async () => {
-  test.skip(!process.env.DEBUG_OOB);
-  const { token } = await createStudy('dbg', protocol({ steps: [shopTask()] }));
-  const { context, page } = await newSessionPage(browser);
-  await enterSession(page, token);
-  await passIntro(page);
-  await expect(page.getByTestId('session')).toHaveAttribute('data-task-phase', 'active', { timeout: 40_000 });
-  await waitModeratorIdle(page);
-  await speak(page, 'rage_think');
-  await page.waitForTimeout(6000);
-  console.log(JSON.stringify(await page.evaluate(() => (window as unknown as { __taRunner: { turnChecks: unknown[] } }).__taRunner.turnChecks)));
-  await context.close();
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
 test('3 · task time limit → outcome timeout, neutral wrap-up, session continues', async () => {
   test.setTimeout(5 * 60_000);
@@ -612,7 +654,7 @@ test('4 · on-screen SUS + NASA-TLX by clicking, SUS partly by voice → ids sto
     await expect(tlx).toContainText('All answered');
     if (mode === 'click') await shot(page, 'tlx');
     await tlx.getByRole('button', { name: 'Submit' }).click();
-    await expect(page.getByTestId('done')).toBeVisible({ timeout: 90_000 });
+    await waitDone(page);
     const d = await lastSession(studyId);
     save(`questionnaire-${mode}`, d.events);
     const byId = Object.fromEntries(d.answers.map((a) => [a.questionId, a]));
@@ -629,4 +671,362 @@ test('4 · on-screen SUS + NASA-TLX by clicking, SUS partly by voice → ids sto
   const analytics = await call<{ variants: { susScores: number[]; instrumentN: Record<string, number> }[] }>('GET', `/api/studies/${studyId}/analytics`);
   expect(analytics.variants[0].susScores).toEqual([85, 85]);
   expect(analytics.variants[0].instrumentN).toMatchObject({ SUS: 2, NASA_TLX: 2 });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+const CALLS = 'https://api.openai.com/v1/realtime/calls';
+const lampTask = shopTask({
+  id: 'task_lamp',
+  title: 'Find a desk lamp',
+  instruction: 'Imagine you want a new lamp for your desk. Find the Aurora desk lamp and add it to your cart.',
+  startPath: '/',
+  successCriteria: 'The Aurora desk lamp is in the cart.',
+  successRules: [{ type: 'url_matches', pattern: '^/cart' }],
+  askSEQ: false,
+});
+const rtTrace = (page: Page) => page.evaluate(() => (window as unknown as { __taRunner?: { rt?: { trace: string[] } } }).__taRunner?.rt?.trace ?? []);
+
+test('5a · realtime unavailable: one retry, then on-screen mode with the step content, session completes', async () => {
+  test.setTimeout(4 * 60_000);
+  // Second task has no startPath: it must continue where the participant is (the cart), not reset to "/".
+  const continueTask = shopTask({ id: 'task_continue', title: 'Continue', instruction: 'Now continue to checkout from where you are.', startPath: undefined, askSEQ: false });
+  const { token, studyId } = await createStudy('Realtime down', protocol({ steps: [lampTask, continueTask, wrapup] }));
+  const { context, page } = await newSessionPage(browser);
+  let attempts = 0;
+  await context.route(CALLS, (r) => {
+    attempts++;
+    return r.abort('connectionfailed');
+  });
+  await enterSession(page, token);
+  const session = page.getByTestId('session');
+  await expect(session).toHaveAttribute('data-mode', 'manual', { timeout: 40_000 });
+  expect(attempts).toBe(2); // first attempt + exactly one retry
+  const panel = page.getByTestId('manual-panel');
+  await expect(panel).toContainText(/on screen/);
+  await expect(panel).toContainText("I'm an AI moderator");
+  await shot(page, 'rt-down-intro');
+  await page.getByTestId('manual-continue').click();
+  // Task: the instruction is on screen in the dock, the app is usable.
+  await expect(session).toHaveAttribute('data-step', 'task_lamp');
+  await expect(page.getByTestId('task-text')).toContainText('Aurora desk lamp');
+  await expect(page.getByTestId('dock-notice')).toContainText(/on screen/);
+  const app = page.frameLocator('[data-testid=app-frame]');
+  await app.getByRole('link', { name: 'Lighting' }).click();
+  await app.getByRole('link', { name: /Aurora desk lamp/ }).click();
+  await app.getByRole('button', { name: 'Add to cart' }).click();
+  await expect(session).toHaveAttribute('data-task-phase', 'post', { timeout: 10_000 });
+  await page.getByTestId('manual-continue').first().click();
+  // Task without startPath: the app stays on the cart page.
+  await expect(session).toHaveAttribute('data-step', 'task_continue');
+  const entered = (await log(page)).filter((e) => e.kind === 'step.enter' && e.stepId === 'task_continue').pop()!;
+  await page.waitForTimeout(2500);
+  await expect(app.getByRole('heading', { name: 'Your cart' })).toBeVisible();
+  expect((await log(page)).filter((e) => e.kind === 'app.navigate' && e.t >= entered.t), 'no navigation on entering a task without startPath').toEqual([]);
+  await page.getByTestId('skip-task').click();
+  await expect(session).toHaveAttribute('data-task-phase', 'post', { timeout: 10_000 });
+  await page.getByTestId('manual-continue').first().click();
+  // Interview question on screen, answered by typing.
+  await expect(session).toHaveAttribute('data-step', 'wrapup');
+  await expect(page.getByTestId('question-card')).toContainText('describe the website to a friend');
+  await page.getByTestId('question-card').locator('textarea').fill('A calm little shop with clear categories.');
+  await page.getByRole('button', { name: 'Save answer' }).click();
+  await page.getByTestId('manual-continue').click();
+  await page.getByTestId('manual-continue').click(); // Finish
+  await waitDone(page);
+  const d = await lastSession(studyId);
+  save('realtime-down', d.events);
+  expect(d.session.status).toBe('completed');
+  expect(d.events.some((e) => e.kind === 'session.error' && e.data.fallback === 'manual')).toBe(true);
+  expect(d.taskResults.find((r) => r.stepId === 'task_lamp')).toMatchObject({ outcome: 'success', source: 'rule' });
+  expect(d.taskResults.find((r) => r.stepId === 'task_continue')).toMatchObject({ outcome: 'abandoned' });
+  expect(d.answers.find((a) => a.questionId === 'wrapup_q1')?.text).toContain('calm little shop');
+  await context.close();
+});
+
+test('5b · data channel drops mid-session: reconnects once and continues; a second drop → on-screen mode', async () => {
+  test.setTimeout(5 * 60_000);
+  const { token, studyId } = await createStudy('Realtime drop', protocol({ steps: [lampTask, wrapup] }));
+  const { context, page } = await newSessionPage(browser);
+  let attempts = 0;
+  let block = false;
+  await context.route(CALLS, (r) => {
+    attempts++;
+    return block ? r.abort('connectionfailed') : r.continue();
+  });
+  await enterSession(page, token);
+  await passIntro(page);
+  const session = page.getByTestId('session');
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 40_000 });
+  await waitModeratorIdle(page);
+  expect(attempts).toBe(1);
+  void rtTrace;
+
+  // Drop 1: the data channel closes → one reconnect → the moderator resumes the same task.
+  await page.evaluate(() => (window as unknown as { __taRunner: { rt: { dc: RTCDataChannel } } }).__taRunner.rt.dc.close());
+  const rec = await waitEvent(page, (e) => e.kind === 'observation' && e.data.kind === 'realtime_reconnected', 30_000, 'reconnected');
+  expect(attempts).toBe(2);
+  const line = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > rec.t, 30_000, 'moderator after reconnect');
+  console.log('after reconnect:', line.data.text);
+  expect(await session.getAttribute('data-mode')).toBe('voice');
+  await expect(session).toHaveAttribute('data-step', 'task_lamp');
+  expect(String(line.data.text)).not.toMatch(/Hi, and thanks for joining/); // does not restart
+  await waitModeratorIdle(page);
+  await expect(session).toHaveAttribute('data-task-phase', 'active');
+
+  // Drop 2 (network gone): → on-screen mode with the task still visible.
+  block = true;
+  await page.evaluate(() => (window as unknown as { __taRunner: { rt: { dc: RTCDataChannel } } }).__taRunner.rt.dc.close());
+  await expect(session).toHaveAttribute('data-mode', 'manual', { timeout: 30_000 });
+  await expect(page.getByTestId('dock-notice')).toContainText(/on screen/);
+  await expect(page.getByTestId('task-text')).toContainText('Aurora desk lamp');
+  await shot(page, 'rt-drop-manual');
+  const app = page.frameLocator('[data-testid=app-frame]');
+  await app.getByRole('link', { name: 'Lighting' }).click();
+  await app.getByRole('link', { name: /Aurora desk lamp/ }).click();
+  await app.getByRole('button', { name: 'Add to cart' }).click();
+  await expect(session).toHaveAttribute('data-task-phase', 'post', { timeout: 10_000 });
+  await page.getByTestId('manual-continue').first().click();
+  await expect(session).toHaveAttribute('data-step', 'wrapup');
+  await page.getByTestId('question-card').locator('textarea').fill('Simple and clear.');
+  await page.getByRole('button', { name: 'Save answer' }).click();
+  await page.getByTestId('manual-continue').click();
+  await page.getByTestId('manual-continue').click();
+  await waitDone(page);
+  const d = await lastSession(studyId);
+  save('realtime-drop', d.events);
+  expect(d.session.status).toBe('completed');
+  expect(d.events.filter((e) => e.kind === 'observation' && e.data.kind === 'realtime_dropped').length).toBeGreaterThanOrEqual(1);
+  expect(d.events.some((e) => e.kind === 'session.error' && e.data.fallback === 'manual')).toBe(true);
+  expect(d.taskResults[0]).toMatchObject({ outcome: 'success', source: 'rule' });
+  await context.close();
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+type EyeDbg = { frames: number; isSuspended: boolean; frameMs: number; latest: { x: number; y: number } | null };
+const eyeState = (page: Page) =>
+  page.evaluate(() => {
+    const e = (window as unknown as { __taRunner: { opts: { eye: EyeDbg | null } } }).__taRunner.opts.eye;
+    return e ? { frames: e.frames, isSuspended: e.isSuspended, frameMs: e.frameMs, latest: e.latest } : null;
+  });
+
+test('6 · eye tracking: 9-point calibration + validation on a fake face, gaze streamed in iframe coordinates, preview hidden, throttled', async () => {
+  test.setTimeout(8 * 60_000);
+  const face = await ensureFaceVideo();
+  const eyeBrowser = await launch([`--use-file-for-fake-video-capture=${face}`]);
+  try {
+    const { token, studyId } = await createStudy('Eye tracking', protocol({ steps: [lampTask, wrapup] }));
+    const { context, page } = await newSessionPage(eyeBrowser);
+    await enterSession(page, token, { eye: true });
+    await expect(page.getByTestId('calibration')).toBeVisible();
+    await expect(page.getByText(/Center your face|isn’t available/)).toBeVisible({ timeout: 120_000 });
+    await expect(page.getByText('Eye tracking isn’t available')).toHaveCount(0);
+    await shot(page, 'eye-position');
+    await page.getByRole('button', { name: 'Start calibration' }).click();
+    const dot = page.getByRole('button', { name: 'Calibration point' });
+    for (let p = 0; p < 9; p++) {
+      await expect(page.getByTestId('calibration-stage')).toContainText(`${p + 1} of 9`);
+      await page.waitForTimeout(450); // dot transition + look at it
+      for (let c = 0; c < 3; c++) {
+        await dot.click({ timeout: 10_000 });
+        await page.waitForTimeout(120);
+      }
+    }
+    await expect(page.getByTestId('calibration-stage')).toContainText('just look at each dot');
+    await expect(page.getByText(/Accuracy:/)).toBeVisible({ timeout: 40_000 });
+    const acc = await page.getByText(/Accuracy:/).innerText();
+    console.log('calibration result:', acc);
+    await shot(page, 'eye-result');
+    await page.getByTestId('calibration-continue').click();
+
+    const session = page.getByTestId('session');
+    await expect(session).toBeVisible();
+    const cal = await waitEvent(page, (e) => e.kind === 'eyetracking.calibrated', 10_000, 'eyetracking.calibrated');
+    expect(typeof cal.data.errorPx).toBe('number');
+    expect(Number(cal.data.errorPx)).toBeGreaterThan(0);
+    expect(Number(cal.data.errorPx)).toBeLessThan(9999); // validation produced real predictions
+    expect(cal.data.points).toBe(9);
+    // The webcam preview and overlays are hidden and never block clicks.
+    const preview = await page.evaluate(() => {
+      const c = document.getElementById('webgazerVideoContainer');
+      const st = c ? getComputedStyle(c) : null;
+      const overlay = document.getElementById('webgazerFaceOverlay');
+      const box = document.getElementById('webgazerFaceFeedbackBox');
+      return { exists: Boolean(c), opacity: st?.opacity, pointer: st?.pointerEvents, overlay: overlay ? getComputedStyle(overlay).display : 'none', box: box ? getComputedStyle(box).display : 'none' };
+    });
+    console.log('preview:', preview);
+    expect(preview.opacity).toBe('0');
+    expect(preview.pointer).toBe('none');
+    expect(preview.overlay).toBe('none');
+    expect(preview.box).toBe('none');
+
+    // Intro: the app is hidden → face tracking is suspended (no CPU spent).
+    await waitEvent(page, (e) => e.kind === 'transcript.moderator', 60_000, 'intro');
+    await page.waitForTimeout(1500);
+    const s1 = (await eyeState(page))!;
+    await page.waitForTimeout(2000);
+    const s2 = (await eyeState(page))!;
+    expect(s1.isSuspended).toBe(true);
+    expect(s2.frames - s1.frames).toBeLessThanOrEqual(1);
+    await waitModeratorIdle(page);
+    await speak(page, 'ready');
+    await expect(session).toHaveAttribute('data-app-visible', '1', { timeout: 45_000 });
+    await page.waitForTimeout(2500);
+    // Task: tracking runs, throttled to ~10 fps (WebGazer alone would run at the display rate).
+    const a = (await eyeState(page))!;
+    const t0 = Date.now();
+    await page.waitForTimeout(4000);
+    const b = (await eyeState(page))!;
+    const fps = ((b.frames - a.frames) * 1000) / (Date.now() - t0);
+    console.log('gaze fps during task:', fps.toFixed(1));
+    expect(b.isSuspended).toBe(false);
+    expect(fps).toBeGreaterThan(3);
+    expect(fps).toBeLessThan(13);
+
+    // Gaze points arrive as `gaze` events in iframe coordinates (viewport of the tested app).
+    const mapped = await page.evaluate(async () => {
+      const r = (window as unknown as { __taRunner: { queue: { subscribe: (fn: (e: { kind: string; data: unknown }) => void) => () => void }; onGaze: (x: number, y: number) => void; flushGaze: () => void } }).__taRunner;
+      const got: { points: [number, number, number][]; vw: number; vh: number; path: string }[] = [];
+      const off = r.queue.subscribe((e) => {
+        if (e.kind === 'gaze') got.push(e.data as (typeof got)[number]);
+      });
+      await new Promise((res) => setTimeout(res, 3500));
+      // Deterministic mapping check: a screen point 100/50 px inside the iframe → (100, 50).
+      const rect = document.querySelector('[data-testid=app-frame]')!.getBoundingClientRect();
+      r.flushGaze();
+      got.length = 0;
+      r.onGaze(rect.left + 100, rect.top + 50);
+      r.onGaze(rect.left - 5, rect.top + 10); // outside the app → dropped
+      r.flushGaze();
+      const probe = got.slice();
+      off();
+      return { rect: { w: Math.round(rect.width), h: Math.round(rect.height), top: Math.round(rect.top) }, probe };
+    });
+    console.log('iframe rect:', mapped.rect, 'probe batch:', JSON.stringify(mapped.probe));
+    expect(mapped.probe).toHaveLength(1);
+    expect(mapped.probe[0].points.map((p) => [p[1], p[2]])).toEqual([[100, 50]]);
+    expect(mapped.probe[0]).toMatchObject({ vw: mapped.rect.w, vh: mapped.rect.h, path: '/' });
+
+    // Real gaze points reached the server, inside the iframe viewport.
+    await page.waitForTimeout(3000);
+    const { sessions } = await call<{ sessions: { id: string }[] }>('GET', `/api/studies/${studyId}/sessions`);
+    const pts = await call<unknown>('GET', `/api/sessions/${sessions[0].id}/points?kind=gaze`);
+    const flat = JSON.stringify(pts);
+    const real = (Array.isArray(pts) ? pts : ((pts as { points?: unknown[] }).points ?? [])) as unknown[];
+    console.log('server gaze payload sample:', flat.slice(0, 300));
+    expect(real.length).toBeGreaterThan(5);
+    const detail = await call<{ session: { gazeErrorPx?: number | null } }>('GET', `/api/sessions/${sessions[0].id}`);
+    expect(detail.session.gazeErrorPx).toBe(Number(cal.data.errorPx));
+    await page.getByTestId('withdraw').click();
+    await page.getByTestId('confirm-withdraw').click();
+    await expect(page.getByTestId('withdrawn')).toBeVisible();
+    // Camera released, preview removed.
+    await expect(page.locator('#webgazerVideoContainer')).toHaveCount(0);
+    await context.close();
+  } finally {
+    await eyeBrowser.close();
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+test('7a · moderator flow after a rule ends the task: no filler / narration, no redundant outcome', async () => {
+  test.setTimeout(5 * 60_000);
+  const task = { ...lampTask, askSEQ: true, probes: [] };
+  const { token, studyId } = await createStudy('Moderator quality', protocol({ steps: [task, wrapup], moderation: { probingLevel: 'light', maxProbesPerStep: 1 } }));
+  const { context, page } = await newSessionPage(browser);
+  await enterSession(page, token);
+  await passIntro(page);
+  const session = page.getByTestId('session');
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 40_000 });
+  await waitModeratorIdle(page);
+  const app = page.frameLocator('[data-testid=app-frame]');
+  await app.getByRole('link', { name: 'Lighting' }).click();
+  await app.getByRole('link', { name: /Aurora desk lamp/ }).click();
+  await app.getByRole('button', { name: 'Add to cart' }).click();
+  const end = await waitEvent(page, (e) => e.kind === 'task.end', 20_000, 'task.end by rule');
+  expect(end.data).toMatchObject({ outcome: 'success', source: 'rule' });
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > end.t, 30_000, 'SEQ asked');
+  await waitModeratorIdle(page);
+  await speak(page, 'seq');
+  const ans = await waitEvent(page, (e) => e.kind === 'answer' && e.data.questionId === 'seq', 45_000, 'SEQ by voice');
+  expect(ans.data.value).toBe(6);
+  await page.waitForTimeout(2000);
+  await waitModeratorIdle(page, 1500);
+  if ((await session.getAttribute('data-step')) === 'task_lamp') await speak(page, 'probe_short'); // optional single follow-up
+  await waitEvent(page, (e) => e.kind === 'step.enter' && e.stepId === 'wrapup', 60_000, 'next step');
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && /describe the website/i.test(String(e.data.text)), 30_000, 'interview question');
+  const evs = await log(page);
+  save('quality-en', evs);
+  const lines = modLines(evs, end.t);
+  console.log('moderator after task end:', lines);
+  for (const l of lines) {
+    expect(l).not.toMatch(FILLER);
+    expect(l).not.toMatch(JUDGEMENT);
+  }
+  // Spoken preambles ("commentary") must not narrate anything.
+  for (const e of evs.filter((x) => x.kind === 'transcript.moderator' && x.data.phase === 'commentary')) expect(String(e.data.text).split(/\s+/).length).toBeLessThanOrEqual(3);
+  // A redundant set_task_outcome (if any) is ignored: the rule's outcome stands.
+  for (const c of evs.filter((e) => e.kind === 'moderator.tool' && e.data.name === 'set_task_outcome')) expect(c.data.ok).toBe(true);
+  const d = await lastSession(studyId);
+  expect(d.taskResults.find((r) => r.stepId === 'task_lamp')).toMatchObject({ outcome: 'success', source: 'rule' });
+  expect(d.events.filter((e) => e.kind === 'task.end').length).toBe(1);
+  await context.close();
+});
+
+const DE_TASK = 'Stellen Sie sich vor, Sie möchten eine neue Lampe für Ihren Schreibtisch. Finden Sie die Aurora-Schreibtischlampe.';
+test('7b · German session: intro in German, think-aloud is not answered, "Ich bin fertig" (no question mark) is', async () => {
+  test.setTimeout(6 * 60_000);
+  const proto = protocol({
+    title: 'Lumen Home Studie',
+    intro: 'Hallo und danke, dass Sie mitmachen. Ich bin ein KI-Moderator. Wir testen die Website, nicht Sie, es gibt also keine falschen Antworten. Bitte denken Sie laut, während Sie sich umsehen. Sind Sie bereit?',
+    closing: 'Das war alles. Vielen Dank für Ihre Zeit und Ihr ehrliches Feedback.',
+    moderation: { language: 'de', probingLevel: 'none' },
+    steps: [
+      shopTask({ id: 'task_lamp_de', title: 'Lampe finden', instruction: DE_TASK, startPath: '/', successCriteria: 'Die Aurora-Schreibtischlampe wird gefunden.', successRules: [], askSEQ: false }),
+      { id: 'wrapup_de', type: 'interview', title: 'Abschluss', goal: 'Unklarheiten', questions: ['Was war auf der Website für Sie unklar, wenn überhaupt?'], maxFollowUps: 0 },
+    ],
+  });
+  const { token, studyId } = await createStudy('German', proto);
+  const { context, page } = await newSessionPage(browser);
+  await enterSession(page, token);
+  const intro = await waitEvent(page, (e) => e.kind === 'transcript.moderator', 60_000, 'German intro');
+  console.log('intro:', intro.data.text);
+  expect(String(intro.data.text)).toMatch(/KI-Moderator|Sind Sie bereit/);
+  await waitModeratorIdle(page);
+  await speak(page, 'ready_de');
+  await waitEvent(page, (e) => e.kind === 'moderator.tool' && e.data.name === 'complete_step' && e.data.ok === true, 45_000, 'complete_step');
+  const session = page.getByTestId('session');
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && /Schreibtisch/i.test(String(e.data.text)), 45_000, 'task read in German');
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 40_000 });
+  await waitModeratorIdle(page);
+  const runnerChecks = () => page.evaluate(() => (window as unknown as { __taRunner: { turnChecks: { text: string; addressed: boolean; via: string }[] } }).__taRunner.turnChecks);
+
+  // Thinking aloud in German → the moderator stays quiet.
+  const before = (await log(page)).length;
+  await speak(page, 'think_de');
+  const app = page.frameLocator('[data-testid=app-frame]');
+  await app.getByRole('link', { name: 'Lighting' }).click();
+  await page.waitForTimeout(7000);
+  const thinkCheck = (await runnerChecks()).find((c) => /Lampe|Beleuchtung/i.test(c.text));
+  console.log('think check:', thinkCheck);
+  expect(thinkCheck).toMatchObject({ addressed: false, via: 'model' });
+  expect(modLines((await log(page)).slice(before))).toEqual([]);
+
+  // "Ich bin jetzt fertig mit der Aufgabe." — no question mark, not English → still recognised.
+  const doneFrom = (await log(page)).at(-1)!.t;
+  await speak(page, 'done_de');
+  const ask = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > doneFrom && /\?/.test(String(e.data.text)), 30_000, 'how did it go (German)');
+  console.log('after done:', ask.data.text);
+  expect(String(ask.data.text)).toMatch(/\b(wie|Wie)\b/);
+  const doneCheck = (await runnerChecks()).find((c) => /fertig/i.test(c.text));
+  expect(doneCheck).toMatchObject({ addressed: true, via: 'model' });
+  await waitModeratorIdle(page);
+  await speak(page, 'went_de');
+  const end = await waitEvent(page, (e) => e.kind === 'task.end', 45_000, 'task.end via set_task_outcome');
+  expect(end.data.source).toBe('ai');
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && /unklar/i.test(String(e.data.text)), 60_000, 'German interview question');
+  const evs = await log(page);
+  save('quality-de', evs);
+  for (const l of modLines(evs)) expect(l).not.toMatch(/\b(the|and|you|let's|thanks)\b/i); // never switches to English
+  void studyId;
+  await context.close();
 });

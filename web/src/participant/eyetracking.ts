@@ -15,10 +15,11 @@ export class EyeTracker {
   latest: { x: number; y: number; at: number } | null = null;
   running = false;
   /**
-   * CPU throttle: WebGazer runs face-mesh inference on every animation frame (~60/s). We run one
-   * inference, pause, and resume after `frameMs` — ~12 fps while calibrating, ~10 fps in session.
+   * CPU throttle: WebGazer runs face-mesh inference on every animation frame (~60/s). With
+   * `frameMs` > 0 we run one inference, pause, and resume after `frameMs` (the session uses ~10 fps).
+   * 0 during calibration: WebGazer ignores calibration clicks while paused.
    */
-  frameMs = 80;
+  frameMs = 0;
   /** Frames actually processed (tests / diagnostics). */
   frames = 0;
   private suspended = false;
@@ -26,14 +27,9 @@ export class EyeTracker {
   private frameStart = 0;
 
   async start(): Promise<void> {
-    const mod: any = await import('webgazer');
-    const wg = mod.default ?? mod;
+    const wg = await startWebgazer();
     this.wg = wg;
-    wg.params.faceMeshSolutionPath = FACE_MESH_CDN;
-    wg.params.camConstraints = { video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' } };
-    wg.saveDataAcrossSessions(false);
-    wg.applyKalmanFilter(true);
-    wg.setRegression('ridge');
+    // WebGazer is a singleton with one gaze listener: the tracker that started last owns it.
     wg.setGazeListener((data: { x: number; y: number } | null) => {
       this.frames++;
       this.throttle();
@@ -44,16 +40,6 @@ export class EyeTracker {
       this.lastEmit = now;
       this.listener?.(data.x, data.y);
     });
-    const ready = wg.begin();
-    await withTimeout(Promise.resolve(ready), 45000, 'Eye tracker did not start');
-    wg.showPredictionPoints(false);
-    wg.showVideoPreview(true);
-    wg.showFaceOverlay(true);
-    wg.showFaceFeedbackBox(true);
-    // Wait until face mesh produces predictions.
-    const t0 = Date.now();
-    while (!wg.isReady() && Date.now() - t0 < 30000) await sleep(200);
-    if (!wg.isReady()) throw new Error('Camera not ready');
     this.running = true;
   }
 
@@ -90,36 +76,46 @@ export class EyeTracker {
     return this.suspended;
   }
 
-  /** Center the camera preview so the participant can position their face. */
-  positionPreview(mode: 'center' | 'corner' | 'hidden') {
+  /**
+   * Camera preview placement. 'center' fills `anchor` (a placeholder in the page layout); 'corner'
+   * is a small preview between the calibration dot rows (never on top of a dot); 'hidden' keeps the
+   * video running for the tracker but shows and draws nothing. It never intercepts clicks.
+   */
+  positionPreview(mode: 'center' | 'corner' | 'hidden', anchor?: DOMRect) {
     const el = document.getElementById('webgazerVideoContainer');
     if (!el) return;
     el.style.transition = 'opacity .3s ease';
     el.style.borderRadius = '16px';
     el.style.overflow = 'hidden';
     el.style.zIndex = '60';
-    el.style.boxShadow = '0 10px 30px rgba(15,23,42,.25)';
+    el.style.pointerEvents = 'none';
+    el.style.boxShadow = '0 1px 2px rgba(0,0,0,.04), 0 8px 28px rgba(0,0,0,.08)';
     if (mode === 'hidden') {
       this.wg?.showVideoPreview(false);
       // No overlay drawing while nobody sees it (saves CPU); the video keeps feeding the tracker.
       this.wg?.showFaceOverlay(false);
       this.wg?.showFaceFeedbackBox(false);
       el.style.opacity = '0';
-      el.style.pointerEvents = 'none';
       return;
     }
     this.wg?.showVideoPreview(true);
     el.style.opacity = '1';
     el.style.position = 'fixed';
+    el.style.transformOrigin = 'center center';
+    const w = el.offsetWidth || 320;
+    const h = el.offsetHeight || 240;
     if (mode === 'center') {
-      el.style.top = '50%';
-      el.style.left = '50%';
-      el.style.transform = 'translate(-50%, -50%) scale(.8)';
+      const r = anchor ?? new DOMRect(0, 0, window.innerWidth, window.innerHeight);
+      const scale = Math.min(1, r.width / w, r.height / h);
+      el.style.top = `${r.top + r.height / 2}px`;
+      el.style.left = `${r.left + r.width / 2}px`;
+      el.style.transform = `translate(-50%, -50%) scale(${scale.toFixed(3)})`;
     } else {
-      el.style.top = '16px';
-      el.style.left = '16px';
-      el.style.transform = 'scale(.55)';
-      el.style.transformOrigin = 'top left';
+      // Calibration dots sit at 10 % / 50 % / 90 % of the height: 30 % is free.
+      const scale = Math.min(0.55, (window.innerHeight * 0.3) / h);
+      el.style.top = '30%';
+      el.style.left = '50%';
+      el.style.transform = `translate(-50%, -50%) scale(${scale.toFixed(3)})`;
     }
   }
 
@@ -161,6 +157,7 @@ export class EyeTracker {
   }
 
   stop() {
+    shared = null;
     this.running = false;
     this.listener = null;
     if (this.resumeTimer) clearTimeout(this.resumeTimer);
@@ -176,6 +173,58 @@ export class EyeTracker {
     (v?.srcObject as MediaStream | null)?.getTracks().forEach((t) => t.stop());
     document.getElementById('webgazerVideoContainer')?.remove();
   }
+}
+
+/**
+ * WebGazer (and the face mesh WASM inside it) is a page-wide singleton: starting it twice — e.g. a
+ * remount, or React StrictMode running effects twice in development — corrupts its init
+ * ("Module.arguments has been replaced…"). All trackers share one start.
+ */
+let shared: Promise<any> | null = null;
+function startWebgazer(): Promise<any> {
+  if (!shared) {
+    shared = (async () => {
+      // WebGazer's face mesh dependency is a classic script (see faceMeshShim.ts): load it first.
+      await loadScript(`${FACE_MESH_CDN}/face_mesh.js`, () => Boolean((window as any).FaceMesh));
+      const mod: any = await import('webgazer');
+      const wg = mod.default ?? mod;
+      wg.params.faceMeshSolutionPath = FACE_MESH_CDN;
+      wg.params.camConstraints = { video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' } };
+      wg.saveDataAcrossSessions(false);
+      wg.applyKalmanFilter(true);
+      wg.setRegression('ridge');
+      await withTimeout(Promise.resolve(wg.begin()), 45000, 'Eye tracker did not start');
+      wg.showPredictionPoints(false);
+      wg.showVideoPreview(true);
+      wg.showFaceOverlay(true);
+      wg.showFaceFeedbackBox(true);
+      // Wait until face mesh produces predictions.
+      const t0 = Date.now();
+      while (!wg.isReady() && Date.now() - t0 < 30000) await sleep(200);
+      if (!wg.isReady()) throw new Error('Camera not ready');
+      return wg;
+    })();
+    shared.catch(() => {
+      shared = null;
+    });
+  }
+  return shared;
+}
+
+function loadScript(src: string, ready: () => boolean): Promise<void> {
+  if (ready()) return Promise.resolve();
+  return withTimeout(
+    new Promise<void>((resolve, reject) => {
+      const el = document.createElement('script');
+      el.src = src;
+      el.crossOrigin = 'anonymous';
+      el.onload = () => (ready() ? resolve() : reject(new Error('Face mesh script loaded without FaceMesh')));
+      el.onerror = () => reject(new Error('Could not load the face mesh script'));
+      document.head.appendChild(el);
+    }),
+    30000,
+    'Face mesh script timeout',
+  );
 }
 
 function sleep(ms: number) {

@@ -248,14 +248,19 @@ function TaskDock({ runner, task, instruction, caption, allowText, typingDefault
   const elapsed = useElapsed(s.taskStartedAt);
   const left = s.taskDeadline ? Math.max(0, Math.round((s.taskDeadline - Date.now()) / 1000)) : null;
 
+  // Voice lost mid-task: show the task text again (it is now the only guidance).
+  useEffect(() => {
+    if (s.mode === 'manual') setOpen(true);
+  }, [s.mode]);
+
   // Collapse the task text automatically once the participant starts working.
   useEffect(() => {
-    if (s.taskPhase === 'active') {
+    if (s.taskPhase === 'active' && s.mode !== 'manual') {
       const t = setTimeout(() => setOpen(false), 9000);
       return () => clearTimeout(t);
     }
     setOpen(true);
-  }, [s.taskPhase, s.step?.id]);
+  }, [s.taskPhase, s.step?.id, s.mode]);
 
   // Show the moderator's line briefly above the dock.
   useEffect(() => {
@@ -278,6 +283,11 @@ function TaskDock({ runner, task, instruction, caption, allowText, typingDefault
         </div>
       )}
       <div className="material pointer-events-auto w-full max-w-[720px] rounded-[22px] border shadow-[0_8px_32px_rgba(0,0,0,.12)]">
+        {s.notice && !voice && (
+          <p className="border-b border-separator px-5 py-2.5 text-[13px] text-secondary" data-testid="dock-notice">
+            {s.notice}
+          </p>
+        )}
         {open && instruction && (
           <div className="border-b border-separator px-5 pb-3 pt-4 [animation:ta-fade_.25s_ease]" data-testid="task-text">
             <div className="mb-1 flex items-center justify-between text-[12px] text-tertiary">
