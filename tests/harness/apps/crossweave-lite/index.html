@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CrossWeave</title>
+  <!-- Small stand-in for the CrossWeave (Stacky Social) client used by the harness replay scenario.
+       Two-pane discussion reader: focus post on the left, "connected" posts on the right; one right-pane
+       card is a compact AI-modified copy with green inserted words (deliberately subtle). -->
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; color: #1d1d1f; }
+    body { margin: 0; background: #f5f5f7; }
+    header { display: flex; align-items: center; gap: 18px; padding: 12px 24px; background: #fff; border-bottom: 1px solid #e5e5ea; }
+    header .logo { font-weight: 700; font-size: 18px; text-decoration: none; color: #1d1d1f; }
+    header nav a { margin-right: 12px; color: #555; text-decoration: none; font-size: 14px; }
+    main { display: grid; grid-template-columns: 1fr 340px; gap: 18px; max-width: 1100px; margin: 0 auto; padding: 18px; }
+    .post { background: #fff; border: 1px solid #e5e5ea; border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; cursor: pointer; }
+    .post.focus { border: 2px solid #3478f6; }
+    .meta { font-size: 12px; color: #6e6e73; margin-bottom: 6px; }
+    .tags span { display: inline-block; font-size: 11px; background: #eef; color: #334; border-radius: 999px; padding: 2px 8px; margin-right: 4px; }
+    .hl { background: #fff4c2; }
+    ins { background: #d9f7d9; color: #135c13; text-decoration: none; }
+    .badge { font-size: 10px; color: #8a8a8e; border: 1px solid #d1d1d6; border-radius: 6px; padding: 0 5px; margin-left: 6px; }
+    aside h2 { font-size: 13px; text-transform: uppercase; color: #6e6e73; letter-spacing: .04em; margin: 4px 0 10px; }
+    input[type=search] { width: 100%; font-size: 16px; padding: 10px 12px; border-radius: 10px; border: 1px solid #d1d1d6; box-sizing: border-box; }
+    .btnrow button { margin-right: 6px; border: 1px solid #d1d1d6; background: #fff; border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+    a.res { display: block; padding: 10px 0; color: #3478f6; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="logo" href="/home" data-link>CrossWeave</a>
+    <nav>
+      <a href="/home" data-link>Home</a>
+      <a href="/search" data-link>Search</a>
+      <a href="/bookmarks" data-link>Bookmarks</a>
+    </nav>
+  </header>
+  <main id="app"></main>
+  <script>
+    const FEED = [
+      { id: 'p1', who: 'Fox News', when: 'Jul 21', text: 'Trump just expanded his tariff plan to more imported goods.', tags: ['Tariffs'] },
+      { id: 'p2', who: 'Erik Frederiksen', when: 'Jun 23', text: 'Grid batteries are getting cheaper every quarter.', tags: ['EnergyTech'] },
+      { id: 'p3', who: 'Mia Chen', when: 'Jul 2', text: 'Tariffs might actually be good for the US in the long run.', tags: ['Tariffs'] },
+    ];
+    const EV = {
+      focus: { id: '149289030', who: 'S James', when: 'Jun 30, 2025', text: 'China is pulling ahead on electric vehicles while the US is still arguing about <span class="hl">tariffs</span>. We are behind on <span class="hl">manufacturing</span> and batteries.' },
+      right: [
+        { id: '143200921', who: 'David Gelles', when: 'Jun 30', tags: ['Framing', 'Agree'], text: 'Letting cheap Chinese EVs in would put US automakers even further behind.' },
+        { id: '149290191', who: 'procrustes', when: 'Jul 1', tags: ['Evidence'], ai: true, text: 'The Big 3 are not punting on EVs, <ins>according to recent sales data,</ins> they are just pacing investment.' },
+        { id: '149290555', who: 'TruthStorming', when: 'Jul 1', tags: ['Disagree'], text: 'Subsidies, not tariffs, are what decide this race.' },
+      ],
+    };
+    const $ = (s) => document.querySelector(s);
+    const postHtml = (p, cls = '') => `<div class="post ${cls}" data-id="${p.id}" role="article" aria-label="Post by ${p.who}">
+        <div class="meta">${p.who} · ${p.when}${p.ai ? '<span class="badge">Modified by AI</span>' : ''}</div>
+        <div>${p.text}</div>
+        ${p.tags ? `<div class="tags" style="margin-top:6px">${p.tags.map((t) => `<span>${t}</span>`).join('')}</div>` : ''}
+        <div class="btnrow" style="margin-top:8px"><button data-act="like">Like</button><button data-act="bookmark">Bookmark</button><button data-act="reply">Reply</button></div>
+      </div>`;
+    function render() {
+      const path = location.pathname;
+      const app = $('#app');
+      let m;
+      if (path === '/' || path === '/home' || path === '/index.html') {
+        document.title = 'Home – CrossWeave';
+        app.innerHTML = `<section><h1 style="font-size:22px">Home</h1>${FEED.map((p) => postHtml(p)).join('')}</section>
+          <aside><h2>Trending</h2>${FEED.slice(0, 2).map((p) => `<div class="post"><div class="meta">#${p.tags[0]}</div>${p.text}</div>`).join('')}</aside>`;
+      } else if (path === '/search') {
+        document.title = 'Search – CrossWeave';
+        const q = new URLSearchParams(location.search).get('q') || '';
+        const hit = /chin|ev|electric/i.test(q);
+        app.innerHTML = `<section><h1 style="font-size:22px">Search</h1>
+          <input type="search" id="q" aria-label="Search hashtags, people, and posts" placeholder="Search hashtags, people, and posts" value="${q.replace(/"/g, '&quot;')}" />
+          <div id="results" style="margin-top:12px">${q ? (hit ? '<a class="res" href="/ChineseEVs" data-link>#ChineseEVs · 214 posts</a>' : '<p>No results.</p>') : ''}</div></section><aside></aside>`;
+        const input = $('#q');
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { history.replaceState({}, '', `/search?q=${encodeURIComponent(input.value)}`); render(); }
+        });
+      } else if ((m = path.match(/^\/ChineseEVs\/posts\/(\w+)/))) {
+        document.title = 'Post – CrossWeave';
+        const p = [EV.focus, ...EV.right].find((x) => x.id === m[1]) || EV.focus;
+        app.innerHTML = `<section><a href="/ChineseEVs" data-link>Back</a>${postHtml(p, 'focus')}<h2 style="font-size:14px">Replies</h2>${postHtml(EV.right[2])}</section><aside><h2>Connected posts</h2>${EV.right.filter((x) => x.id !== p.id).map((x) => postHtml(x)).join('')}</aside>`;
+      } else if (path === '/ChineseEVs') {
+        document.title = '#ChineseEVs – CrossWeave';
+        app.innerHTML = `<section><h1 style="font-size:22px">#ChineseEVs</h1>${postHtml(EV.focus, 'focus')}<button id="more">Read more</button></section>
+          <aside><h2>Connected posts</h2>${EV.right.map((x) => postHtml(x)).join('')}</aside>`;
+      } else if (path === '/bookmarks') {
+        document.title = 'Bookmarks – CrossWeave';
+        app.innerHTML = '<section><h1 style="font-size:22px">Bookmarks</h1><p>No bookmarks yet.</p></section><aside></aside>';
+      } else {
+        app.innerHTML = '<section><h1>Page not found</h1></section>';
+      }
+    }
+    function go(href) { history.pushState({}, '', href); render(); }
+    document.addEventListener('click', (e) => {
+      const a = e.target.closest('a[data-link]');
+      if (a) { e.preventDefault(); go(a.getAttribute('href')); return; }
+      const act = e.target.closest('button[data-act]');
+      if (act) { act.textContent = act.textContent.endsWith('d') ? act.textContent : act.textContent + 'd'; return; }
+      const post = e.target.closest('.post[data-id]');
+      if (post && location.pathname.startsWith('/ChineseEVs')) go(`/ChineseEVs/posts/${post.dataset.id}`);
+    });
+    window.addEventListener('popstate', render);
+    render();
+  </script>
+</body>
+</html>
