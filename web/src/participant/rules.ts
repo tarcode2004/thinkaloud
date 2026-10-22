@@ -67,15 +67,15 @@ export function addressedToModerator(text: string): boolean {
   );
 }
 
-/** Rough similarity: is `said` (moderator transcript) a reading of `prompt`? */
-export function isReadingOf(said: string, prompt: string): boolean {
+/** Rough similarity: is `said` (moderator transcript) a reading of `prompt`? (`threshold`: share of the prompt's words heard) */
+export function isReadingOf(said: string, prompt: string, threshold = 0.6): boolean {
   const a = norm(said).replace(/[^\p{L}\p{N} ]/gu, '');
   const b = norm(prompt).replace(/[^\p{L}\p{N} ]/gu, '');
   if (!b) return false;
   const words = b.split(' ').filter((w) => w.length > 3);
   if (!words.length) return a.includes(b);
   const hit = words.filter((w) => a.includes(w)).length;
-  return hit / words.length >= 0.6;
+  return hit / words.length >= threshold;
 }
 
 export function describeElement(el: ElementDescriptor | undefined): string {

@@ -169,6 +169,14 @@ export function stackyProtocol(): Json {
   return JSON.parse(fs.readFileSync(path.join(ROOT, 'examples/stacky/protocol.json'), 'utf8')) as Json;
 }
 
+/** SEQ wording per session language (English original; German as the product must present it). */
+export const SEQ_PROMPTS: Record<string, string> = {
+  en: 'Overall, how difficult or easy was the task to complete?',
+  de: 'Wie schwierig oder einfach war es insgesamt, die Aufgabe zu erledigen?',
+};
+export const langOf = (p: Json) => String(((p.moderation ?? {}) as Json).language ?? 'en').toLowerCase().split(/[-_]/)[0];
+export const seqPrompt = (p: Json) => SEQ_PROMPTS[langOf(p)] ?? SEQ_PROMPTS.en;
+
 /** Participant-facing texts the moderator must read verbatim (for the judge). */
 export function verbatimTexts(p: Json): { kind: string; stepId: string; id?: string; text: string }[] {
   const out: { kind: string; stepId: string; id?: string; text: string }[] = [];
@@ -177,7 +185,7 @@ export function verbatimTexts(p: Json): { kind: string; stepId: string; id?: str
     const id = String(s.id);
     if (s.type === 'task') {
       out.push({ kind: 'task', stepId: id, text: String(s.instruction) });
-      if (s.askSEQ) out.push({ kind: 'question', stepId: id, id: 'seq', text: 'Overall, how difficult or easy was the task to complete?' });
+      if (s.askSEQ) out.push({ kind: 'question', stepId: id, id: 'seq', text: seqPrompt(p) });
       for (const q of (s.postTaskQuestions as Json[]) ?? []) out.push({ kind: 'question', stepId: id, id: String(q.id), text: String(q.prompt) });
     } else if (s.type === 'question') out.push({ kind: 'question', stepId: id, id: String((s.question as Json).id), text: String((s.question as Json).prompt) });
     else if (s.type === 'interview') (s.questions as string[]).forEach((q, i) => out.push({ kind: 'interview', stepId: id, id: `${id}_q${i + 1}`, text: q }));

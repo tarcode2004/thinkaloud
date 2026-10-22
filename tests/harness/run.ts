@@ -29,7 +29,7 @@ import { E2eMockAdapter } from './lib/e2eMockAdapter.ts';
 import { ensureStack, exportRef } from './lib/server.ts';
 import { judge } from './judge.ts';
 import { PERSONAS } from './personas.ts';
-import { verbatimTexts } from './protocols.ts';
+import { SEQ_PROMPTS, seqPrompt, verbatimTexts } from './protocols.ts';
 import { writeComparison, writeRunReport, writeSummary, type RunResult } from './report.ts';
 import { pickScenarios, SCENARIOS, type Scenario } from './scenarios.ts';
 import { writeWav } from '../e2e/participant.fixtures.ts';
@@ -68,14 +68,18 @@ async function launchBrowser(): Promise<Browser> {
   });
 }
 
-function questionsOf(steps: Record<string, unknown>[]): { qs: QInfo[]; tasks: Record<string, string> } {
+function questionsOf(steps: Record<string, unknown>[], seq = SEQ_PROMPTS.en): { qs: QInfo[]; tasks: Record<string, string> } {
   const qs: QInfo[] = [];
   const tasks: Record<string, string> = {};
   for (const st of steps) {
     const id = String(st.id);
     if (st.type === 'task') {
       tasks[id] = String(st.instruction);
-      if (st.askSEQ) qs.push({ stepId: id, id: 'seq', prompt: 'Overall, how difficult or easy was the task to complete?', kind: 'rating' });
+      if (st.askSEQ) {
+        // The SEQ in the session language — and the English original, recognised too (as a person would).
+        qs.push({ stepId: id, id: 'seq', prompt: SEQ_PROMPTS.en, kind: 'rating' });
+        if (seq !== SEQ_PROMPTS.en) qs.push({ stepId: id, id: 'seq', prompt: seq, kind: 'rating' });
+      }
       for (const q of (st.postTaskQuestions as Record<string, unknown>[]) ?? []) qs.push({ stepId: id, id: String(q.id), prompt: String(q.prompt), kind: String(q.kind) });
     } else if (st.type === 'question') {
       const q = st.question as Record<string, unknown>;
@@ -120,7 +124,7 @@ async function runScenario(sc: Scenario, stack: { base: string; api: string }, o
     const { context, page } = await SyntheticParticipant.open(browser);
     await mock.attach(context, page);
     page.on('pageerror', (e) => log(`pageerror: ${e.message}`));
-    const { qs, tasks } = questionsOf(steps);
+    const { qs, tasks } = questionsOf(steps, seqPrompt(protocol));
     const agent = new SyntheticParticipant(page, {
       persona,
       mock,

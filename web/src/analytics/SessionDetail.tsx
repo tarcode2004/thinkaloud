@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router';
 import { ChevronLeft, ChevronRight, Trash2, X } from 'lucide-react';
 import type { SessionEvent, Step, TaskOutcome, TaskStep } from '@thinkaloud/shared';
-import { stepQuestions } from '@thinkaloud/shared';
+import { seqQuestion, stepQuestions } from '@thinkaloud/shared';
 import { api } from '../lib/api.ts';
 import { useAsync } from '../lib/hooks.ts';
 import { Button, FullPageSpinner, Modal, cn } from '../ui/index.tsx';
@@ -591,12 +591,14 @@ function AnswersPanel({ d }: { d: Detail }) {
   const prompts = useMemo(() => {
     const m = new Map<string, { prompt: string; max?: number }>();
     // stepQuestions covers every kind, incl. interview questions (ids like "<step>_q1").
+    // Standard instruments in the session language (as the participant saw them).
+    const lang = d.protocol?.moderation.language;
     for (const st of d.steps) {
-      if (st.type === 'task') m.set(`${st.id}:seq`, { prompt: 'Overall, how difficult or easy was the task to complete?', max: 7 });
-      for (const q of stepQuestions(st)) m.set(`${st.id}:${q.id}`, { prompt: q.prompt, max: q.scale?.max });
+      if (st.type === 'task') m.set(`${st.id}:seq`, { prompt: seqQuestion(lang).prompt, max: 7 });
+      for (const q of stepQuestions(st, lang)) m.set(`${st.id}:${q.id}`, { prompt: q.prompt, max: q.scale?.max });
     }
     return m;
-  }, [d.steps]);
+  }, [d.steps, d.protocol]);
   const titles = new Map(d.steps.map((s) => [s.id, s.title]));
   const groups = useMemo(() => {
     const g = new Map<string, typeof d.answers>();
@@ -656,6 +658,7 @@ function AnswersPanel({ d }: { d: Detail }) {
                           {a.declined && <span className="mr-2 text-secondary">Declined</span>}
                           {a.text && <span className="leading-relaxed">“{a.text}”</span>}
                         </div>
+                        {a.wording && <div className="mt-0.5 text-[12px] text-tertiary">Wording: {a.wording}</div>}
                       </div>
                     );
                   })}

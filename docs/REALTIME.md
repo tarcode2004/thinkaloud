@@ -3,7 +3,7 @@
 Verified working pattern (from a production project on this machine using `gpt-realtime-2`):
 
 1. Server mints an ephemeral key: `POST https://api.openai.com/v1/realtime/client_secrets` with
-   `Authorization: Bearer $OPENAI_API_KEY`, body `{ session: { type: 'realtime', model, reasoning?: {effort:'low'}, audio: { input: { noise_reduction:{type:'near_field'}, transcription:{model:'gpt-4o-transcribe', language:'en'}, turn_detection:{ type:'semantic_vad', eagerness:'low', create_response:true, interrupt_response:true } }, output: { voice: 'marin' } }, instructions, tools, tool_choice:'auto' } }`.
+   `Authorization: Bearer $OPENAI_API_KEY`, body `{ session: { type: 'realtime', model, reasoning?: {effort:'low'}, audio: { input: { noise_reduction:{type:'near_field'}, transcription:{model:'gpt-4o-transcribe', language:'en'}, turn_detection:{ type:'semantic_vad', eagerness:'low', create_response:false, interrupt_response:true } }, output: { voice: 'marin' } }, instructions, tools, tool_choice:'auto' } }`.
    Response JSON: `{ value: 'ek_...', expires_at, session }` (older shape: `client_secret.value`). Accept both.
 2. Browser: `RTCPeerConnection`, add mic track, `pc.createDataChannel('oai-events')`, play remote audio track via an `<audio autoplay>` element, create offer,
    `POST https://api.openai.com/v1/realtime/calls` body = offer SDP, headers `Authorization: Bearer ek_...`, `Content-Type: application/sdp`; response text = answer SDP → `setRemoteDescription({type:'answer', sdp})`.

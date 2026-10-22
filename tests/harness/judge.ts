@@ -17,6 +17,7 @@ export type CheckId =
   | 'talk_over'
   | 'deflection'
   | 'answer_fidelity'
+  | 'answer_after_question'
   | 'language'
   | 'neutral_wording';
 
@@ -26,11 +27,12 @@ export const CHECK_TITLES: Record<CheckId, string> = {
   question_repeats: 'No question asked more than twice',
   card_visible: 'Every question step has a visible card',
   premature_advance: 'No premature task end / step advance',
-  done_latency: 'Done → moderator question latency < 4s',
+  done_latency: 'Done → moderator question latency < 2s (fail > 4s)',
   nudge_cap: 'Silence nudges capped',
   talk_over: 'Moderator never talks over the participant',
   deflection: 'Clarifying questions are answered, not deflected',
   answer_fidelity: 'Recorded answers match what was said',
+  answer_after_question: 'Answers only from speech after the question was read out',
   language: 'Moderator speaks only the session language',
   neutral_wording: 'No praise, outcome disclosure or self-narration',
 };
@@ -76,11 +78,17 @@ interface QInfo {
   stepId: string;
   id: string;
   prompt: string;
+  /** Other accepted wordings (the SEQ in English and in the session language). */
+  alts?: string[];
   kind: string;
   where: 'question' | 'post' | 'interview' | 'questionnaire';
 }
 
-function questionsOf(steps: Json[]): QInfo[] {
+const SEQ_EN = 'Overall, how difficult or easy was the task to complete?';
+const SEQ_BY_LANG: Record<string, string> = { de: 'Wie schwierig oder einfach war es insgesamt, die Aufgabe zu erledigen?' };
+const reads = (said: string, q: QInfo, th = 0.7) => isReadingOf(said, q.prompt, th) || Boolean(q.alts?.some((a) => isReadingOf(said, a, th)));
+
+function questionsOf(steps: Json[], language = 'en'): QInfo[] {
   const out: QInfo[] = [];
   for (const st of steps) {
     const id = String(st.id);
@@ -88,7 +96,7 @@ function questionsOf(steps: Json[]): QInfo[] {
       const q = st.question as Json;
       out.push({ stepId: id, id: String(q.id), prompt: String(q.prompt), kind: String(q.kind), where: 'question' });
     } else if (st.type === 'task') {
-      if (st.askSEQ) out.push({ stepId: id, id: 'seq', prompt: 'Overall, how difficult or easy was the task to complete?', kind: 'rating', where: 'post' });
+      if (st.askSEQ) out.push({ stepId: id, id: 'seq', prompt: SEQ_BY_LANG[language] ?? SEQ_EN, alts: SEQ_BY_LANG[language] ? [SEQ_EN] : [], kind: 'rating', where: 'post' });
       for (const q of (st.postTaskQuestions as Json[]) ?? []) out.push({ stepId: id, id: String(q.id), prompt: String(q.prompt), kind: String(q.kind), where: 'post' });
     } else if (st.type === 'interview') {
       (st.questions as string[]).forEach((p, i) => out.push({ stepId: id, id: `${id}_q${i + 1}`, prompt: p, kind: 'open', where: 'interview' }));
@@ -131,7 +139,7 @@ function unfinishedWindows(tl: Timeline | null): { from: number; to: number; u: 
 export function runChecks(o: { events: LogEvent[]; steps: Json[]; timeline: Timeline | null; expect?: Partial<Record<CheckId, 'fail' | 'warn' | 'off'>>; completed: boolean; language?: string; verbatim?: string[] }): CheckResult[] {
   const ev = [...o.events].sort((a, b) => a.t - b.t);
   const tl = o.timeline;
-  const qs = questionsOf(o.steps);
+  const qs = questionsOf(o.steps, o.language);
   const frags = participantFragments(ev, tl);
   const unfinished = unfinishedWindows(tl);
   const modTurns = ev.filter((e) => e.kind === 'transcript.moderator');
@@ -192,14 +200,14 @@ export function runChecks(o: { events: LogEvent[]; steps: Json[]; timeline: Time
     const f: Finding[] = [];
     for (const q of qs) {
       const inStep = modTurns.filter((e) => e.stepId === q.stepId);
-      const first = inStep.find((e) => isReadingOf(txt(e), q.prompt, 0.7));
+      const first = inStep.find((e) => reads(txt(e), q));
       if (!first) continue;
       const answered = ev.find((e) => e.kind === 'answer' && e.data.questionId === q.id && e.stepId === q.stepId && e.t >= first.t);
       const skipped = ev.find((e) => e.kind === 'observation' && e.data.kind === 'question_skipped' && e.data.questionId === q.id && e.t >= first.t);
       const others = qs.filter((x) => x.stepId === q.stepId && x.id !== q.id);
-      const nextOther = inStep.find((e) => e.t > first.t && others.some((x) => isReadingOf(txt(e), x.prompt, 0.7)));
+      const nextOther = inStep.find((e) => e.t > first.t && others.some((x) => reads(txt(e), x)));
       const until = Math.min(answered?.t ?? Infinity, skipped?.t ?? Infinity, nextOther?.t ?? Infinity, ev.find((e) => e.kind === 'step.exit' && e.stepId === q.stepId && e.t > first.t)?.t ?? Infinity);
-      const asks = inStep.filter((e) => e.t >= first.t && e.t <= until && (isReadingOf(txt(e), q.prompt, 0.7) || (e.t > first.t && (/[?？]/.test(txt(e)) || /\byes or no\b|\bja oder nein\b|pick (a|the|one)|closest to you/i.test(txt(e))))));
+      const asks = inStep.filter((e) => e.t >= first.t && e.t <= until && (reads(txt(e), q) || (e.t > first.t && (/[?？]/.test(txt(e)) || /\byes or no\b|\bja oder nein\b|pick (a|the|one)|closest to you|wählen sie eine zahl/i.test(txt(e))))));
       if (asks.length > 2)
         f.push({ t: asks[2].t, stepId: q.stepId, severity: 'fail', message: `"${q.prompt}" (${q.id}) asked ${asks.length}× before it was resolved: ${asks.map((a) => `[${s(a.t)}] "${txt(a).slice(0, 80)}"`).join(' · ')}` });
     }
@@ -213,14 +221,14 @@ export function runChecks(o: { events: LogEvent[]; steps: Json[]; timeline: Time
     if (!tl || !tl.ui.length) na = true;
     else
       for (const q of qs) {
-        const readings = modTurns.filter((e) => e.stepId === q.stepId && isReadingOf(txt(e), q.prompt, 0.7));
+        const readings = modTurns.filter((e) => e.stepId === q.stepId && reads(txt(e), q));
         const seen = new Set<string>();
         for (const r of readings) {
           const key = `${q.stepId}::${q.id}`;
           if (seen.has(key)) continue;
           seen.add(key);
           const win = tl.ui.filter((u) => u.t >= r.t - 1500 && u.t <= r.t + 4000);
-          const ok = win.some((u) => u.card?.visible && (u.card.activeQuestionId === q.id || (u.card.prompt && isReadingOf(u.card.prompt, q.prompt, 0.8))));
+          const ok = win.some((u) => u.card?.visible && (u.card.activeQuestionId === q.id || (u.card.prompt && reads(u.card.prompt, q, 0.8))));
           if (!ok) {
             const skipped = ev.some((e) => e.kind === 'task.end' && e.stepId === q.stepId && e.data.source === 'participant' && e.t < r.t);
             f.push({
@@ -285,6 +293,7 @@ export function runChecks(o: { events: LogEvent[]; steps: Json[]; timeline: Time
       const next = modStarts.find((t) => t > p.t);
       const lat = next != null ? next - p.t : Infinity;
       if (lat > 4000) f.push({ t: p.t, stepId: p.stepId, severity: 'fail', message: `"I'm done" pressed → moderator spoke ${isFinite(lat) ? `${(lat / 1000).toFixed(1)} s` : 'never'} later (limit 4 s).` });
+      else if (lat > 2000) f.push({ t: p.t, stepId: p.stepId, severity: 'warn', message: `"I'm done" pressed → moderator spoke ${(lat / 1000).toFixed(1)} s later (target < 2 s).` });
     }
     if (tl) {
       let since: number | null = null;
@@ -348,6 +357,14 @@ export function runChecks(o: { events: LogEvent[]; steps: Json[]; timeline: Time
       const reply = modTurns.find((m) => m.t > a.t && m.t < a.t + 20_000);
       if (reply && DEFLECT.test(txt(reply)))
         f.push({ t: reply.t, stepId: reply.stepId, severity: a.intent === 'observation' ? 'warn' : 'fail', message: `Participant (${a.intent}): "${a.text.slice(0, 80)}" → moderator deflected: "${txt(reply).slice(0, 100)}"` });
+      // A question during a task ("Do I click done?") that the system answered by ending the task instead.
+      if (tl && (a.intent === 'meta_question' || a.intent === 'clarify') && /\?\s*$/.test(a.text.trim())) {
+        const stepId = stepAt(a.t);
+        const end = ev.find((e) => e.kind === 'task.end' && e.stepId === stepId && e.t > a.t && e.data.source === 'ai');
+        const answered = modTurns.some((m) => m.t > a.t && (!end || m.t < end.t) && !/how do you feel|wie ist es/i.test(txt(m)));
+        const pressed = tl.actions.some((x) => x.stepId === stepId && x.t > a.t && (!end || x.t < end.t) && (x.kind === 'press_done' || x.kind === 'press_skip'));
+        if (end && !answered && !pressed) f.push({ t: end.t, stepId, severity: 'fail', message: `Participant asked "${a.text.slice(0, 80)}" during the task and got no answer: the task was ended instead.` });
+      }
     }
     add('deflection', f);
   }
@@ -372,6 +389,40 @@ export function runChecks(o: { events: LogEvent[]; steps: Json[]; timeline: Time
     add('answer_fidelity', f);
   }
 
+  // 10b — a recorded answer only uses speech that started after the question was read out (never
+  // thinking aloud from the task, never what was said while the question was still to come).
+  {
+    const f: Finding[] = [];
+    const norm = (x: string) => x.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, ' ').replace(/\s+/g, ' ').trim();
+    for (const e of ev) {
+      if (e.kind !== 'moderator.tool' || e.data.name !== 'record_answer' || e.data.ok === false) continue;
+      const args = (e.data.args ?? {}) as Json;
+      const q = qs.find((x) => x.id === String(args.question_id ?? '') && x.stepId === e.stepId);
+      if (!q) continue;
+      const reading = [...modTurns].reverse().find((m) => m.t <= e.t && m.stepId === e.stepId && reads(txt(m), q));
+      if (!reading) {
+        f.push({ t: e.t, stepId: e.stepId, severity: 'fail', message: `record_answer(${q.id}) by voice although "${q.prompt}" was never read out.` });
+        continue;
+      }
+      // The reading's audio started at the last moderator speech start before its transcript.
+      const prevTurn = [...modTurns].reverse().find((m) => m.t < reading.t);
+      const qStart = [...modStarts].reverse().find((t) => t <= reading.t && t > (prevTurn?.t ?? -Infinity)) ?? reading.t - 2500;
+      const text = norm(String(args.text ?? ''));
+      if (!text || !tl) continue;
+      const after = tl.utterances.flatMap((u) => u.chunks).filter((c) => c.start >= qStart - 300 && c.start <= e.t).map((c) => norm(c.text));
+      for (const u of tl.utterances) {
+        for (const c of u.chunks) {
+          if (c.end > qStart) continue;
+          const head = norm(c.text).split(' ').slice(0, 5).join(' ');
+          // (The same words said again after the question are fine.)
+          if (head.split(' ').length >= 3 && text.includes(head) && !after.some((x) => x.includes(head)))
+            f.push({ t: e.t, stepId: e.stepId, severity: 'fail', message: `record_answer(${q.id}) used words said before the question was read out ("${c.text.slice(0, 70)}" at ${s(c.start)}; question started ${s(qStart)}).` });
+        }
+      }
+    }
+    add('answer_after_question', f, tl ? undefined : 'no harness timeline: only "never read out" is checked');
+  }
+
   // 11 — language consistency: in a non-English session, no moderator line may be mostly English.
   {
     const f: Finding[] = [];
@@ -387,6 +438,14 @@ export function runChecks(o: { events: LogEvent[]; steps: Json[]; timeline: Time
           if (lead && lang !== 'en') f.push({ t: m.t, stepId: m.stepId, severity: 'fail', message: `English acknowledgement "${lead[1]}" in a "${lang}" session: "${txt(m).slice(0, 80)}"` });
         }
       }
+      // Standard instruments (the SEQ) must be presented — and recorded — in the session language.
+      for (const e of ev.filter((x) => x.kind === 'answer' && x.data.questionId === 'seq')) {
+        const w = String(e.data.wording ?? '');
+        if (!w) f.push({ t: e.t, stepId: e.stepId, severity: 'warn', message: 'SEQ answer recorded without the wording that was presented.' });
+        else if (!new RegExp(`/${lang}\\b`).test(w) && !/translated/i.test(w)) f.push({ t: e.t, stepId: e.stepId, severity: 'fail', message: `SEQ answer recorded with wording "${w}" in a "${lang}" session.` });
+      }
+      const enCard = tl?.ui.find((u) => u.card?.visible && u.card.activeQuestionId === 'seq' && u.card.prompt && isReadingOf(u.card.prompt, SEQ_EN, 0.8));
+      if (enCard) f.push({ t: enCard.t, stepId: enCard.stepId, severity: 'fail', message: `SEQ card shown in English in a "${lang}" session: "${enCard.card!.prompt}"` });
     }
     add('language', f, lang === 'en' ? 'English session' : undefined, lang === 'en');
   }

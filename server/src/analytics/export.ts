@@ -119,6 +119,8 @@ export function exportRows(studyId: string, table: ExportTable, opts: { includeP
           value: a.value ?? null,
           text: a.text ?? null,
           choices: a.choices?.join('; ') ?? null,
+          declined: a.declined ? 1 : 0,
+          wording: a.wording ?? null,
           source: a.source,
           at: iso(a.at),
         });

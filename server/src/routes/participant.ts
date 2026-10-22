@@ -287,6 +287,8 @@ const AnswerData = z.object({
   value: z.number().optional(),
   choices: z.array(z.string().max(1000)).max(100).optional(),
   declined: z.boolean().optional(),
+  /** Standard instruments: which wording (language + source) was presented. */
+  wording: z.string().max(300).optional(),
   source: z.enum(['voice', 'screen', 'text']).default('screen'),
   at: z.number().optional(),
 });
@@ -306,9 +308,9 @@ export function ingestEvents(sessionId: string, rawEvents: unknown[]): { accepte
        WHERE task_results.source != 'researcher'`,
     );
     const upsertAnswer = db.prepare(
-      `INSERT INTO answers (session_id, step_id, question_id, text, value, choices, source, at, declined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO answers (session_id, step_id, question_id, text, value, choices, source, at, declined, wording) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (session_id, step_id, question_id) DO UPDATE SET text = excluded.text, value = excluded.value,
-         choices = excluded.choices, source = excluded.source, at = excluded.at, declined = excluded.declined`,
+         choices = excluded.choices, source = excluded.source, at = excluded.at, declined = excluded.declined, wording = excluded.wording`,
     );
     for (const raw of rawEvents) {
       const p = EventSchema.safeParse(raw);
@@ -347,7 +349,7 @@ export function ingestEvents(sessionId: string, rawEvents: unknown[]): { accepte
         const sid = stepId ?? (d.success ? d.data.stepId : undefined);
         if (d.success && sid) {
           const x = d.data;
-          upsertAnswer.run(sessionId, sid, x.questionId, x.text ?? null, x.value ?? null, x.choices ? json.str(x.choices) : null, x.source, Math.round(x.at ?? e.at), x.declined ? 1 : 0);
+          upsertAnswer.run(sessionId, sid, x.questionId, x.text ?? null, x.value ?? null, x.choices ? json.str(x.choices) : null, x.source, Math.round(x.at ?? e.at), x.declined ? 1 : 0, x.wording ?? null);
         }
       } else if (e.kind === 'eyetracking.calibrated') {
         const err = Number(e.data.errorPx);
@@ -450,7 +452,7 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
       input: {
         transcription,
         noise_reduction: { type: 'near_field' },
-        turn_detection: { type: 'semantic_vad', eagerness: 'low', create_response: true, interrupt_response: true },
+        turn_detection: { type: 'semantic_vad', eagerness: 'low', create_response: false, interrupt_response: true },
       },
       output: { voice },
     },

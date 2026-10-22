@@ -85,6 +85,16 @@ export interface Question {
   allowFollowUp?: boolean;
   /** Hidden note for the AI on what the researcher wants to learn from this question. */
   intent?: string;
+  /**
+   * Standard instruments only (runtime, never stored in protocols): which wording this text is,
+   * e.g. "SUS/de: Rummel (2016) German SUS". Recorded with every answer.
+   */
+  wording?: string;
+  /**
+   * Standard instruments in a session language without a stored translation: the moderator
+   * translates `prompt` into this language when reading it (ids and scale stay the same).
+   */
+  translateTo?: string;
 }
 
 /** Automatic, deterministic success detection for a task (evaluated in the participant client). */
@@ -356,6 +366,8 @@ export interface Answer {
   declined?: boolean;
   source: 'voice' | 'screen' | 'text';
   at: Millis;
+  /** Standard instruments: the wording that was presented (language + source), see Question.wording. */
+  wording?: string;
 }
 
 // ── Events ───────────────────────────────────────────────────────────────────

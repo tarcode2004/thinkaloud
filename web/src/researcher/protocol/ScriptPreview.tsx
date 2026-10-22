@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { AudioLines, Clock, Eye, Flag, Hand, MonitorSmartphone, ShieldCheck } from 'lucide-react';
-import { INSTRUMENTS, SEQ_QUESTION, questionnaireItems, type Protocol, type Step, type SuccessRule } from '@thinkaloud/shared';
+import { instrumentIntro, questionnaireItems, seqQuestion, type Protocol, type Step, type SuccessRule } from '@thinkaloud/shared';
 import { cn } from '../../ui/index.tsx';
 import { STEP_META } from './stepMeta.tsx';
 
@@ -80,9 +80,9 @@ export function ScriptPreview({ p, onJump, activeId }: { p: Protocol; onJump: (i
               Listens while they work.{moderated && m.silencePromptSeconds ? ` After ${m.silencePromptSeconds}s of silence it nudges: “What are you thinking right now?”` : ''} It gives no hints and never confirms correctness.
             </Act>
             <Act icon={<Flag className="size-3.5" />}>
-              Task ends when {s.successRules?.length ? s.successRules.map(ruleText).join(' or ') : 'the AI judges the success criteria are met'}, the participant gives up{s.timeLimitSec ? `, or after ${Math.round(s.timeLimitSec / 60 * 10) / 10} min` : ''}.
+              Task ends when {s.successRules?.length ? `${s.successRules.map(ruleText).join(' or ')}, ` : ''}the participant says they are done or presses “I’m done” (the AI then judges the success criteria), gives up{s.timeLimitSec ? `, or after ${Math.round(s.timeLimitSec / 60 * 10) / 10} min` : ''}.
             </Act>
-            {s.askSEQ && <Say>{SEQ_QUESTION.prompt}</Say>}
+            {s.askSEQ && <Say>{seqQuestion(m.language).prompt}</Say>}
             {s.postTaskQuestions?.map((q) => <Say key={q.id}>{q.prompt || '…'}</Say>)}
             {probes && (
               <Act>
@@ -94,8 +94,8 @@ export function ScriptPreview({ p, onJump, activeId }: { p: Protocol; onJump: (i
           </>
         );
       case 'questionnaire': {
-        const items = questionnaireItems(s);
-        const intro = s.instrument !== 'custom' ? INSTRUMENTS[s.instrument].intro : '';
+        const items = questionnaireItems(s, m.language);
+        const intro = s.instrument !== 'custom' ? instrumentIntro(s.instrument, m.language) : '';
         return (
           <>
             {intro && <Say>{intro}</Say>}

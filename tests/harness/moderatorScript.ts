@@ -48,6 +48,9 @@ const DE: Record<string, string> = {
   "Let's stop this one here.": 'Wir hören bei dieser hier auf.',
   "If you'd like, you can skip this one — just say so or press Skip.": 'Wenn Sie möchten, können Sie diese Aufgabe überspringen – sagen Sie es einfach oder drücken Sie „Überspringen“.',
   'Sorry, we had a short connection problem.': 'Entschuldigung, wir hatten ein kurzes Verbindungsproblem.',
+  "Okay, let's continue.": 'Okay, machen wir weiter.',
+  'Take your time.': 'Lassen Sie sich Zeit.',
+  "If you're finished, just say 'done' or press 'I'm done'.": 'Wenn Sie fertig sind, sagen Sie einfach „fertig“ oder drücken Sie „Ich bin fertig“.',
 };
 
 export class ScriptedModerator {
@@ -244,6 +247,10 @@ export class ScriptedModerator {
 
   /** Directed "# NOW" turn: say the dictated text (ack + quote), or the canned equivalent. */
   private fromNow(now: string): ModeratorOutput | null {
+    // The runner hands over the participant's complete answer turn: react to exactly those words.
+    const turn = /Their complete answer turn[^:]*: "([^"]*)"/.exec(now)?.[1];
+    if (turn != null) return this.onUser(turn);
+    if (/when they are finished they can just say so/i.test(now)) return this.say(this.L("If you're finished, just say 'done' or press 'I'm done'."), 'directed: how to finish');
     const quotes = Q(now);
     const verbatim = /verbatim|exactly (this|the following)|ask exactly this|say once|say:/i.test(now);
     if (quotes.length && verbatim) {
@@ -271,7 +278,7 @@ export class ScriptedModerator {
     if (name === 'set_task_outcome') return this.tool('set_task_outcome', { outcome: P.done.test(said) || /delivered|told you/i.test(now) ? 'success' : 'partial', evidence: `no matching app activity observed; participant said: "${said.slice(0, 160)}"` }, 'forced set_task_outcome');
     if (name === 'record_answer') {
       const qid = /question_id "([^"]+)"/.exec(now)?.[1] ?? this.brief?.question?.question_id ?? '';
-      const text = this.lastUserText(2) || 'No answer given.';
+      const text = /Their complete answer turn[^:]*: "([^"]*)"/.exec(now)?.[1] || this.lastUserText(2) || 'No answer given.';
       return this.tool('record_answer', { question_id: qid, text, ...(this.hasDeclinedParam() && (P.dontKnow.test(text) || !text) ? { declined: true } : {}) }, 'forced record_answer');
     }
     if (name === 'complete_step') return this.tool('complete_step', { summary: this.summary() }, 'forced complete_step');

@@ -173,6 +173,8 @@ export function answerFromRow(r: Row): Answer {
   if (value !== undefined) a.value = value;
   if (choices !== undefined) a.choices = choices;
   if (Number(r.declined ?? 0) === 1) a.declined = true;
+  const wording = optStr(r.wording);
+  if (wording !== undefined) a.wording = wording;
   return a;
 }
 

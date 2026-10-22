@@ -90,16 +90,89 @@ export function meanLogprob(logprobs: unknown): number | null {
   return vals.reduce((a, b) => a + b, 0) / vals.length;
 }
 
-// ── "I'm done" answer window ─────────────────────────────────────────────────
+// ── Answer windows ───────────────────────────────────────────────────────────
+//
+// The runner (not the realtime VAD) decides when the participant has finished a turn. The same
+// rules protect the "How do you feel that went?" wrap-up, interview questions, open questions,
+// post-task questions and replies to the moderator: a thinking pause in the middle of an answer
+// is never the end of it.
 
 /** After their last words, the participant must have been quiet this long before a task is wrapped up. */
 export const WRAP_QUIET_MS = 2000;
 /** …or this long when their last words were a fragment (they are probably still talking). */
 export const WRAP_FRAGMENT_QUIET_MS = 6000;
+/** …or this long when the transcript has no closing punctuation (often a sentence cut by a pause). */
+export const OPEN_ENDED_QUIET_MS = 3500;
+/** Short, complete answers to closed questions (a rating, yes/no) and typed answers. */
+export const CLOSED_QUIET_MS = 1200;
 /** No answer at all to "How do you feel that went?" → move on after this much silence. */
 export const WRAP_SILENCE_MS = 10_000;
+/** No answer at all to a question → one gentle re-prompt after this much silence… */
+export const ANSWER_SILENCE_MS = 12_000;
+/** …and after the re-prompt, this much more silence before moving on without an answer. */
+export const ANSWER_SILENCE_AFTER_REPROMPT_MS = 20_000;
 /** Hard cap on an answer window. */
 export const WRAP_MAX_MS = 75_000;
+
+/** Has `text` closing punctuation (. ! ? and the CJK/Arabic equivalents)? */
+export function hasTerminalPunctuation(text: string): boolean {
+  return /[.!?。！？؟]["'”’)\]]*\s*$/.test(text.trim());
+}
+
+/**
+ * How long the participant must have been quiet after `last` before their turn counts as finished:
+ * ~6 s after a fragment ("The interfaces", "cod", "But--"), ~3.5 s when the transcript has no closing
+ * punctuation (a sentence cut by a pause), ~2 s after a complete sentence (~1.2 s for a short closed
+ * answer, or a typed one).
+ */
+export function quietNeededMs(last: string, o: { typed?: boolean; closed?: boolean } = {}): number {
+  if (o.typed) return CLOSED_QUIET_MS;
+  if (isUnfinishedUtterance(last)) return WRAP_FRAGMENT_QUIET_MS;
+  if (!hasTerminalPunctuation(last)) return OPEN_ENDED_QUIET_MS;
+  return o.closed ? CLOSED_QUIET_MS : WRAP_QUIET_MS;
+}
+
+export interface TurnInput {
+  /** Meaningful (non-noise) participant utterances in the window (only speech that started after the window opened). */
+  heard: string[];
+  /** The last utterance was typed (deliberate, complete). */
+  typed: boolean;
+  /** Times (ms, same clock as `now`). */
+  now: number;
+  /** When the window opened (the moderator's question / turn became fully audible). */
+  listenFrom: number;
+  lastHeardAt: number;
+  /** Last participant speech start/stop. */
+  lastUserSpeech: number;
+  userSpeaking: boolean;
+  /** A speech segment ended but its transcript has not arrived yet. */
+  transcriptPending: boolean;
+  /** A closed question (rating, yes/no, choice, number): short complete answers need less quiet. */
+  closed?: boolean;
+}
+
+export type TurnDecision =
+  /** Still talking, in a thinking pause, or the transcript is on its way. */
+  | { state: 'wait' }
+  /** They finished a turn: respond now. */
+  | { state: 'finished'; quietMs: number }
+  /** Nothing said for `quietMs` since the window opened. Silence is never an answer. */
+  | { state: 'silent'; quietMs: number };
+
+/** Turn-taking for every spoken answer: has the participant finished? */
+export function turnDecision(i: TurnInput): TurnDecision {
+  if (i.userSpeaking) return { state: 'wait' };
+  if (i.transcriptPending && i.now - i.lastUserSpeech < 4000) return { state: 'wait' }; // their words are still being transcribed
+  const lastVoice = Math.max(i.lastUserSpeech, i.lastHeardAt, i.listenFrom);
+  const quiet = i.now - lastVoice;
+  if (!i.heard.length) {
+    // Speech that has not produced a (meaningful) transcript yet still holds the window open.
+    if (i.lastUserSpeech > i.listenFrom && quiet < WRAP_QUIET_MS) return { state: 'wait' };
+    return { state: 'silent', quietMs: i.now - Math.max(i.listenFrom, i.lastUserSpeech) };
+  }
+  const need = quietNeededMs(i.heard[i.heard.length - 1], { typed: i.typed, closed: i.closed });
+  return quiet >= need ? { state: 'finished', quietMs: quiet } : { state: 'wait' };
+}
 
 export interface WrapUpInput {
   /** Why the window is open: the Done button, a spoken "I'm done", a delivered tell/explain answer, or the model's own set_task_outcome. */
@@ -117,14 +190,17 @@ export interface WrapUpInput {
   userSpeaking: boolean;
   /** A speech segment ended but its transcript has not arrived yet. */
   transcriptPending: boolean;
+  /** Silence (ms) after which the window gives up without an answer (default WRAP_SILENCE_MS). */
+  silenceMs?: number;
 }
 
 export type WrapUpDecision = { ready: false } | { ready: true; answered: boolean; ack: string };
 
 /**
  * Has the participant finished answering? Ready when they have been quiet ~2 s after a complete
- * answer, ~6 s after a fragment ("The interfaces", "cod", "But--"), or ~10 s when they said nothing
- * at all (then the moderator moves on with "Okay, let's continue." instead of "Thanks.").
+ * answer, ~3.5 s after an unpunctuated one, ~6 s after a fragment ("The interfaces", "cod", "But--"),
+ * or ~10 s when they said nothing at all (the runner then re-asks once before moving on with
+ * "Okay, let's continue." instead of "Thanks.").
  */
 export function wrapUpDecision(i: WrapUpInput): WrapUpDecision {
   if (i.userSpeaking) return { ready: false };
@@ -132,12 +208,8 @@ export function wrapUpDecision(i: WrapUpInput): WrapUpDecision {
   const lastVoice = Math.max(i.lastUserSpeech, i.lastHeardAt, i.listenFrom);
   const capped = i.now - i.listenFrom > WRAP_MAX_MS;
   let ready: boolean;
-  if (!i.heard.length) ready = i.now - lastVoice >= WRAP_SILENCE_MS;
-  else {
-    const last = i.heard[i.heard.length - 1];
-    const need = i.typed ? 1200 : isUnfinishedUtterance(last) ? WRAP_FRAGMENT_QUIET_MS : WRAP_QUIET_MS;
-    ready = i.now - lastVoice >= need;
-  }
+  if (!i.heard.length) ready = i.now - lastVoice >= (i.silenceMs ?? WRAP_SILENCE_MS);
+  else ready = i.now - lastVoice >= quietNeededMs(i.heard[i.heard.length - 1], { typed: i.typed });
   if (!ready && !capped) return { ready: false };
   const all = i.heard.join(' ').trim();
   const answered = Boolean(all) && (i.source === 'delivered' || i.source === 'model' || i.heard.some((h) => !isUnfinishedUtterance(h)) || all.split(/\s+/).length >= 4);

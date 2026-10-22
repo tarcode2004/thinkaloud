@@ -133,6 +133,13 @@ export const MOCK_REALTIME = () => {
       }
       const now = r.instructions?.split('# NOW').pop();
       if (r.instructions && now !== undefined && r.instructions.includes('# NOW')) {
+        // The runner hands over the participant's complete answer turn: the model reacts to exactly those words.
+        const turn = /Their complete answer turn[^:]*: "([^"]*)"/.exec(now)?.[1];
+        if (turn != null) {
+          st.lastUser = turn;
+          st.lastUserAt = Date.now();
+          return policy(rid);
+        }
         const quoted = [...now.matchAll(/"([^"]{2,})"/g)].map((m) => m[1]);
         if (/set_task_outcome now/.test(now)) return call(rid, 'set_task_outcome', { outcome: 'success', evidence: 'mock judgement' });
         return speak(rid, quoted.at(-1) ?? 'Okay.');

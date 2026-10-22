@@ -19,7 +19,8 @@ export interface RealtimeHandlers {
   /** Any server event (for debugging / fine-grained UI). */
   onServerEvent?: (ev: ServerEvent) => void;
   onFunctionCall?: (call: FunctionCall) => Promise<{ output: unknown; respond: boolean }> | { output: unknown; respond: boolean };
-  onUserSpeechStart?: () => void;
+  /** `itemId`: the input item this speech segment becomes (its transcript arrives later with the same id). */
+  onUserSpeechStart?: (itemId?: string) => void;
   onUserSpeechStop?: () => void;
   onUserTranscriptDelta?: (itemId: string, delta: string) => void;
   /** `logprobs`: transcription token log-probabilities when the session includes them. */
@@ -31,7 +32,7 @@ export interface RealtimeHandlers {
   /** `cleared`: playback was cut (interruption); `byClient`: we asked for the clear (not the server's VAD). */
   onAssistantAudioStop?: (responseId: string | undefined, cleared: boolean, byClient: boolean) => void;
   onResponseStart?: () => void;
-  onResponseDone?: (status: string) => void;
+  onResponseDone?: (status: string, responseId?: string) => void;
   /** Called after a (re)connect once the data channel is open — send session.update + context here. */
   onReady?: (reconnected: boolean) => void;
   onRemoteStream?: (stream: MediaStream) => void;
@@ -50,6 +51,12 @@ export interface RealtimeOptions {
   mic: MediaStream | null;
   handlers: RealtimeHandlers;
   audioEl: HTMLAudioElement;
+  /**
+   * Turn-taking gate: may a spoken response start right now? While it returns false (the participant
+   * is talking), response.create for spoken responses is held and re-tried — the moderator never
+   * starts talking over the participant. Text-only responses are never held.
+   */
+  canSpeak?: () => boolean;
 }
 
 export class RealtimeClient {
@@ -71,6 +78,13 @@ export class RealtimeClient {
   /** Out-of-band (classification) responses still running on the server. */
   private liveOob = new Set<string>();
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private gateTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The request behind the response that is live now (re-sent once if the server cancels it before it was audible). */
+  private liveCreate: CreateReq | null = null;
+  private audibleResponses = new Set<string>();
+  /** Responses we cancelled ourselves (never re-queued); `cancelNextCreated`: a cancel sent before its response.created. */
+  private cancelledByUs = new Set<string>();
+  private cancelNextCreated = false;
   private pendingCallOutputs = 0;
   private respondAfterCalls = false;
   private reconnects = 0;
@@ -226,8 +240,11 @@ export class RealtimeClient {
     this.liveResponses.clear();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
+    if (this.gateTimer) clearTimeout(this.gateTimer);
+    this.gateTimer = null;
     this.activeResponse = false;
     this.assistantAudioPlaying = false;
+    this.userSpeaking = false;
     try {
       pc?.getSenders().forEach((s) => {
         // do not stop the shared mic track – it belongs to the session
@@ -341,16 +358,37 @@ export class RealtimeClient {
     this.send({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } });
   }
 
-  /** Ask the model to respond. Queued until the active response (and pending tool calls) finish. */
-  requestResponse(instructions?: string, toolChoice?: ToolChoice, textOnly?: boolean) {
-    if (this.activeResponse || this.pendingCallOutputs > 0) {
+  /**
+   * Ask the model to respond. Queued until the active response (and pending tool calls) finish, and — for spoken responses — until the participant is not talking.
+   * `noRetry`: if the participant cuts in before it is audible, drop it (e.g. a silence nudge) instead of sending it again.
+   */
+  requestResponse(instructions?: string, toolChoice?: ToolChoice, textOnly?: boolean, noRetry?: boolean) {
+    if (this.activeResponse || this.pendingCallOutputs > 0 || (!textOnly && this.gated())) {
       this.wantResponse = instructions
-        ? { instructions, toolChoice, textOnly }
-        : { instructions: this.wantResponse?.instructions, toolChoice: toolChoice ?? this.wantResponse?.toolChoice, textOnly: textOnly ?? this.wantResponse?.textOnly };
+        ? { instructions, toolChoice, textOnly, retried: noRetry }
+        : { instructions: this.wantResponse?.instructions, toolChoice: toolChoice ?? this.wantResponse?.toolChoice, textOnly: textOnly ?? this.wantResponse?.textOnly, retried: noRetry ?? this.wantResponse?.retried };
+      if (!this.activeResponse && this.pendingCallOutputs === 0) this.pollGate();
       return;
     }
     this.activeResponse = true; // optimistic, avoids double-create races
-    this.sendCreate({ instructions, toolChoice, textOnly });
+    this.sendCreate({ instructions, toolChoice, textOnly, retried: noRetry });
+  }
+
+  /** A spoken response is waiting for the participant to stop talking (or for the active response). */
+  get pendingRequest() {
+    return Boolean(this.wantResponse);
+  }
+
+  private gated() {
+    return Boolean(this.opts.canSpeak && !this.opts.canSpeak());
+  }
+
+  private pollGate() {
+    if (this.gateTimer) return;
+    this.gateTimer = setTimeout(() => {
+      this.gateTimer = null;
+      this.maybeContinue();
+    }, 150);
   }
 
   private sendCreate(w: CreateReq) {
@@ -362,14 +400,20 @@ export class RealtimeClient {
     this.send({ type: 'response.create', ...(Object.keys(response).length ? { response } : {}) });
   }
 
+  /** A response is being generated / played, or one is queued. */
   get responding() {
-    return this.activeResponse;
+    return this.activeResponse || Boolean(this.wantResponse);
   }
 
   private clearRequestedAt = 0;
   private truncSeq = 0;
 
   cancelResponse() {
+    // A queued (not yet sent) request is dropped too: the caller decided it is no longer wanted.
+    this.wantResponse = null;
+    this.respondAfterCalls = false;
+    for (const rid of this.liveResponses) this.cancelledByUs.add(rid);
+    if (this.activeResponse && !this.liveResponses.size) this.cancelNextCreated = true;
     if (this.activeResponse || this.liveResponses.size) this.send({ type: 'response.cancel' });
     if (this.assistantAudioPlaying) {
       this.clearRequestedAt = performance.now();
@@ -409,6 +453,8 @@ export class RealtimeClient {
 
   private maybeContinue() {
     if (this.activeResponse || this.pendingCallOutputs > 0) return;
+    const next = this.wantResponse ?? (this.respondAfterCalls ? ({} as CreateReq) : null);
+    if (next && !next.textOnly && this.gated()) return this.pollGate();
     if (this.wantResponse) {
       // An explicit request (possibly with instructions) wins over a plain continuation.
       const w = this.wantResponse;
@@ -456,6 +502,9 @@ export class RealtimeClient {
         this.createdSeen++;
         const rid = (ev.response as { id?: string } | undefined)?.id;
         if (rid) this.liveResponses.add(rid);
+        if (rid && this.cancelNextCreated) this.cancelledByUs.add(rid);
+        this.cancelNextCreated = false;
+        this.liveCreate = this.lastCreate;
         this.activeResponse = true;
         h.onResponseStart?.();
         break;
@@ -469,7 +518,16 @@ export class RealtimeClient {
         for (const item of resp?.output ?? []) {
           if (item.type === 'function_call' && item.call_id) this.onCall(item.call_id, item.name ?? '', item.arguments ?? '{}');
         }
-        h.onResponseDone?.(resp?.status ?? 'completed');
+        // A spoken response the server cancelled before a word was audible (the participant started
+        // talking — VAD interruption): send it once more when they have finished, instead of losing it.
+        const lc = this.liveCreate;
+        const byUs = rid ? this.cancelledByUs.delete(rid) : false;
+        if (resp?.status === 'cancelled' && rid && !byUs && !this.audibleResponses.has(rid) && lc && !lc.textOnly && !lc.retried && !this.wantResponse) {
+          this.tr('! response cancelled before it was audible; re-queued');
+          this.wantResponse = { ...lc, retried: true };
+        }
+        if (this.cancelledByUs.size > 100) this.cancelledByUs.clear();
+        h.onResponseDone?.(resp?.status ?? 'completed', rid);
         this.maybeContinue();
         break;
       }
@@ -489,7 +547,7 @@ export class RealtimeClient {
       }
       case 'input_audio_buffer.speech_started':
         this.userSpeaking = true;
-        h.onUserSpeechStart?.();
+        h.onUserSpeechStart?.(ev.item_id as string | undefined);
         break;
       case 'input_audio_buffer.speech_stopped':
         this.userSpeaking = false;
@@ -513,6 +571,10 @@ export class RealtimeClient {
         break;
       case 'output_audio_buffer.started':
         this.assistantAudioPlaying = true;
+        if (ev.response_id) {
+          this.audibleResponses.add(ev.response_id as string);
+          if (this.audibleResponses.size > 200) this.audibleResponses.delete(this.audibleResponses.values().next().value!);
+        }
         h.onAssistantAudioStart?.(ev.response_id as string | undefined);
         break;
       case 'output_audio_buffer.stopped':

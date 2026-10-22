@@ -43,12 +43,14 @@ test('"I don\'t know" is recognised in several languages', () => {
   for (const t of ['Yes', 'No', 'The AI wrote it', 'I know where it is']) assert.equal(isDontKnow(t), false, t);
 });
 
-test('record_answer accepts declined answers; set_task_outcome allows verbal completion of tell/explain tasks', () => {
+test('record_answer accepts declined answers; set_task_outcome only when the system says so (never on a tell/explain answer alone)', () => {
   const rec = MODERATOR_TOOLS.find((t) => t.name === 'record_answer')!;
   assert.ok((rec.parameters as { properties: Record<string, unknown> }).properties.declined);
   assert.match(rec.description, /I don't know/);
   const out = MODERATOR_TOOLS.find((t) => t.name === 'set_task_outcome')!;
-  assert.match(out.description, /TELL or EXPLAIN/);
+  assert.match(out.description, /ONLY when the system tells you to/);
+  assert.match(out.description, /Never call it on your own/);
+  assert.doesNotMatch(out.description, /do not need to press a button/);
   assert.match(out.description, /Never call it while the participant is still talking/);
 });
 

@@ -152,11 +152,150 @@ function cap(s: string) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-/** Questions for a questionnaire step (standard instrument or custom). */
-export function questionnaireItems(step: { instrument: InstrumentId | 'custom'; questions?: Question[]; productName?: string }): Question[] {
+// ── Session-language wording ─────────────────────────────────────────────────
+//
+// Standard instruments are presented in the session language. Where a published / widely used
+// translation exists it is stored here verbatim; otherwise the English original is used and the
+// moderator translates it while reading (Question.translateTo). Question ids, scales and scoring
+// never change, and every answer records which wording was presented (Question.wording).
+
+interface Wording {
+  /** Recorded with each answer, e.g. "SUS/de: Rummel (2016) German SUS". */
+  label: string;
+  intro?: string;
+  /** Item texts in order (`{p}` = product, `{pd}` = product in the dative where the grammar needs it). */
+  items: string[];
+  /** Scale end labels per item (falls back to `labels`). */
+  itemLabels?: [string, string][];
+  labels?: [string, string];
+}
+
+const EN_WORDING: Record<InstrumentId, string> = {
+  SUS: 'SUS/en: Brooke (1996)',
+  SEQ: 'SEQ/en: Sauro & Dumas (2009)',
+  UMUX_LITE: 'UMUX-Lite/en: Lewis, Utesch & Maher (2013)',
+  NASA_TLX: 'NASA-TLX/en: Hart & Staveland (1988), raw',
+  NPS: 'NPS/en: Reichheld (2003)',
+};
+
+/** German: SUS after the widely used German translation by Rummel (SAP, 2016); the others are ThinkAloud translations. */
+const DE_WORDING: Record<InstrumentId, Wording> = {
+  SUS: {
+    label: 'SUS/de: Rummel (2016) German SUS',
+    intro: 'Ich lese Ihnen jetzt zehn kurze Aussagen vor. Sagen Sie mir bitte jeweils, wie sehr Sie zustimmen, von 1, stimme überhaupt nicht zu, bis 5, stimme voll und ganz zu.',
+    items: [
+      'Ich denke, dass ich {p} gerne häufig benutzen würde.',
+      'Ich fand {p} unnötig komplex.',
+      'Ich fand {p} einfach zu benutzen.',
+      'Ich glaube, ich würde die Hilfe einer technisch versierten Person benötigen, um {p} benutzen zu können.',
+      'Ich fand, die verschiedenen Funktionen in {pd} waren gut integriert.',
+      'Ich denke, {p} enthielt zu viele Inkonsistenzen.',
+      'Ich kann mir vorstellen, dass die meisten Menschen den Umgang mit {pd} sehr schnell lernen.',
+      'Ich fand {p} sehr umständlich zu nutzen.',
+      'Ich fühlte mich bei der Benutzung von {pd} sehr sicher.',
+      'Ich musste eine Menge lernen, bevor ich anfangen konnte, {p} zu verwenden.',
+    ],
+    labels: ['Stimme überhaupt nicht zu', 'Stimme voll und ganz zu'],
+  },
+  SEQ: {
+    label: 'SEQ/de: ThinkAloud German translation (not separately validated)',
+    items: ['Wie schwierig oder einfach war es insgesamt, die Aufgabe zu erledigen?'],
+    labels: ['Sehr schwierig', 'Sehr einfach'],
+  },
+  UMUX_LITE: {
+    label: 'UMUX-Lite/de: ThinkAloud German translation (not separately validated)',
+    intro: 'Zwei kurze Aussagen. Sagen Sie mir bitte, wie sehr Sie zustimmen, von 1, stimme überhaupt nicht zu, bis 7, stimme voll und ganz zu.',
+    items: ['Die Funktionen von {pd} erfüllen meine Anforderungen.', '{P} ist einfach zu benutzen.'],
+    labels: ['Stimme überhaupt nicht zu', 'Stimme voll und ganz zu'],
+  },
+  NASA_TLX: {
+    label: 'NASA-TLX/de: ThinkAloud German translation (not separately validated), raw',
+    intro: 'Jetzt sechs Fragen zur Beanspruchung. Bewerten Sie jede von 0 bis 100.',
+    items: [
+      'Geistige Anforderung: Wie geistig anspruchsvoll war die Aufgabe?',
+      'Körperliche Anforderung: Wie körperlich anspruchsvoll war die Aufgabe?',
+      'Zeitliche Anforderung: Wie gehetzt oder unter Zeitdruck fühlten Sie sich?',
+      'Leistung: Wie erfolgreich haben Sie das erreicht, worum Sie gebeten wurden?',
+      'Anstrengung: Wie sehr mussten Sie sich anstrengen, um Ihre Leistung zu erreichen?',
+      'Frustration: Wie unsicher, entmutigt, gereizt, gestresst und verärgert waren Sie?',
+    ],
+    itemLabels: [
+      ['Sehr gering', 'Sehr hoch'],
+      ['Sehr gering', 'Sehr hoch'],
+      ['Sehr gering', 'Sehr hoch'],
+      ['Perfekt', 'Misserfolg'],
+      ['Sehr gering', 'Sehr hoch'],
+      ['Sehr gering', 'Sehr hoch'],
+    ],
+  },
+  NPS: {
+    label: 'NPS/de: ThinkAloud German translation',
+    items: ['Wie wahrscheinlich ist es, dass Sie {p} einem Freund oder Kollegen weiterempfehlen?'],
+    labels: ['Überhaupt nicht wahrscheinlich', 'Äußerst wahrscheinlich'],
+  },
+};
+
+const STORED: Record<string, Record<InstrumentId, Wording>> = { de: DE_WORDING };
+
+const baseLang = (lang?: string) => (lang || 'en').toLowerCase().split(/[-_]/)[0];
+
+/** Display name of a language code (for "translate into …"). */
+const LANG_NAMES: Record<string, string> = {
+  fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese', nl: 'Dutch', tr: 'Turkish', pl: 'Polish', sv: 'Swedish', da: 'Danish',
+  no: 'Norwegian', fi: 'Finnish', cs: 'Czech', ru: 'Russian', uk: 'Ukrainian', ja: 'Japanese', ko: 'Korean', zh: 'Chinese', ar: 'Arabic',
+  hi: 'Hindi', he: 'Hebrew', el: 'Greek', ro: 'Romanian', hu: 'Hungarian',
+};
+
+/** Whether this instrument has a stored wording in the language (English always). */
+export function hasInstrumentWording(id: InstrumentId, lang?: string): boolean {
+  const l = baseLang(lang);
+  return l === 'en' || Boolean(STORED[l]?.[id]);
+}
+
+/** The instrument's spoken lead-in in the session language ('' if none; English when no stored translation). */
+export function instrumentIntro(id: InstrumentId, lang?: string): string {
+  const l = baseLang(lang);
+  if (l === 'en') return INSTRUMENTS[id].intro;
+  const w = STORED[l]?.[id];
+  return w ? (w.intro ?? '') : INSTRUMENTS[id].intro;
+}
+
+/** The instrument's items in the session language (ids, kinds and scales unchanged). */
+export function instrumentItems(id: InstrumentId, productName: string | undefined, lang?: string): Question[] {
+  const l = baseLang(lang);
+  const name = productName?.trim();
+  const en = INSTRUMENTS[id].items(name || 'this system');
+  if (l === 'en') return en.map((q) => ({ ...q, wording: EN_WORDING[id] }));
+  const w = STORED[l]?.[id];
+  if (!w) {
+    // No stored translation: the moderator translates the English original while reading it.
+    const langName = LANG_NAMES[l] ?? lang ?? l;
+    return en.map((q) => ({ ...q, wording: `${EN_WORDING[id]} (no stored ${langName} version: translated live by the AI moderator)`, translateTo: langName }));
+  }
+  const p = name || 'das System';
+  const pd = name || 'diesem System';
+  return en.map((q, i) => {
+    const text = (w.items[i] ?? q.prompt).replaceAll('{P}', cap(p)).replaceAll('{pd}', pd).replaceAll('{p}', p);
+    const lab = w.itemLabels?.[i] ?? w.labels;
+    return {
+      ...q,
+      prompt: text,
+      ...(q.scale && lab ? { scale: { ...q.scale, minLabel: lab[0], maxLabel: lab[1] } } : {}),
+      wording: w.label,
+    };
+  });
+}
+
+/** Questions for a questionnaire step (standard instrument or custom), in the session language. */
+export function questionnaireItems(step: { instrument: InstrumentId | 'custom'; questions?: Question[]; productName?: string }, lang?: string): Question[] {
   if (step.instrument === 'custom') return step.questions ?? [];
-  return INSTRUMENTS[step.instrument].items(step.productName?.trim() || 'this system');
+  return instrumentItems(step.instrument, step.productName, lang);
 }
 
 /** SEQ question used when TaskStep.askSEQ is true. Id is `seq`, step scoped by stepId in Answer. */
 export const SEQ_QUESTION: Question = INSTRUMENTS.SEQ.items('')[0];
+
+/** The SEQ in the session language. */
+export function seqQuestion(lang?: string): Question {
+  return instrumentItems('SEQ', '', lang)[0];
+}

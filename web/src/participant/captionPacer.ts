@@ -176,6 +176,16 @@ export class CaptionPacer {
     return cut;
   }
 
+  /**
+   * response.done with status "cancelled": if none of it was ever audible, nothing of it was said —
+   * its transcript is committed empty (never logged as a moderator line, never counts as a reading).
+   */
+  cancelled(responseId: string) {
+    if (this.heard.has(responseId) || this.playing === responseId) return;
+    this.ended.set(responseId, 'cleared');
+    for (const s of this.segs.filter((x) => x.responseId === responseId && !x.committed && x.done)) this.commit(s, '', true, true);
+  }
+
   private commit(s: PacedSegment, text: string, truncated: boolean, late: boolean) {
     if (s.committed) return;
     s.committed = true;

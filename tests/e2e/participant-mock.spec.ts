@@ -256,7 +256,7 @@ async function start(page: Page, token: string) {
 const task = (over: Json) => ({ type: 'task', successCriteria: 'Done.', successRules: [], timeLimitSec: 600, probes: [], askSEQ: false, startPath: '/', ...over });
 
 // ─────────────────────────────────────────────────────────────────────────────
-test('M1 · captions follow the voice; "I\'m done" asks at once even while a classification blocks responses; a paused answer is not cut off; silence → "Okay, let\'s continue."', async () => {
+test('M1 · captions follow the voice; "I\'m done" asks at once even while a classification blocks responses; a paused answer is not cut off; silence → asked once more, then "Okay, let\'s continue."', async () => {
   const steps = [
     task({ id: 'task_find', title: 'Find', instruction: 'Imagine you want a new lamp for your desk. Find the Aurora desk lamp.', askSEQ: true }),
     task({ id: 'task_decor', title: 'Decor', instruction: 'Have a look at the decor section.' }),
@@ -322,14 +322,17 @@ test('M1 · captions follow the voice; "I\'m done" asks at once even while a cla
   await expect(page.getByTestId('question-card')).toBeVisible();
   await page.locator('[data-testid=question-card] [data-value="6"]').click();
 
-  // (d) Done, then silence → ~10 s, then "Okay, let's continue." (never "Thanks").
+  // (d) Done, then silence → ~10 s → asked once more ("Take your time."), never "Thanks" for silence;
+  // still silent → ~20 s, then "Okay, let's continue." (silence is never taken as the answer).
   await expect(session).toHaveAttribute('data-step', 'task_decor', { timeout: 15_000 });
   await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 20_000 });
   await waitIdle(page);
   await page.getByTestId('im-done').click();
   const ask2 = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_decor' && /how do you feel/i.test(String(e.data.text)), 10_000, 'ask 2');
-  const end2 = await waitEvent(page, (e) => e.kind === 'task.end' && e.stepId === 'task_decor', 20_000, 'task.end 2');
-  expect(end2.t - ask2.t).toBeGreaterThan(9500);
+  const reask = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_decor' && /take your time/i.test(String(e.data.text)), 20_000, 're-ask');
+  expect(reask.t - ask2.t).toBeGreaterThan(9500);
+  const end2 = await waitEvent(page, (e) => e.kind === 'task.end' && e.stepId === 'task_decor', 35_000, 'task.end 2');
+  expect(end2.t - reask.t).toBeGreaterThan(19_000);
   const after2 = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > end2.t, 15_000, 'after silence');
   expect(String(after2.data.text)).toBe("Okay, let's continue. How would you describe the website to a friend?");
   evs = await log(page);
@@ -338,7 +341,7 @@ test('M1 · captions follow the voice; "I\'m done" asks at once even while a cla
   await context.close();
 });
 
-test('M2 · a tell-me task completes by voice; stuck twice → one skip reminder; after a skip every question has a card and "I don\'t know" / "I\'m not sure" are accepted; noise is ignored', async () => {
+test('M2 · a tell-me answer never ends the task by itself (reminder, then "done"); stuck twice → one skip reminder; after a skip every question has a card and "I don\'t know" / "I\'m not sure" are accepted; noise is ignored', async () => {
   const steps = [
     task({ id: 'task_price', title: 'Price', instruction: 'Open the Aurora desk lamp and tell me what it costs.' }),
     task({
@@ -363,16 +366,25 @@ test('M2 · a tell-me task completes by voice; stuck twice → one skip reminder
   await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 20_000 });
   await waitIdle(page);
 
-  // (a) Verbal delivery ends the task — no button, no "How do you feel that went?".
-  await setRules(page, [['costs', 'DELIVERED'], ["don't see|can't find", 'STUCK']]);
+  // (a) What sounds like the requested answer never ends the task by itself (it may be ongoing
+  // narration): after a quiet moment they are reminded once how to finish; their "done" ends it.
+  await setRules(page, [['costs', 'DELIVERED'], ['^done', 'DONE'], ["don't see|can't find", 'STUCK']]);
+  const said = (await log(page)).at(-1)!.t;
   await says(page, 'Okay, here it is. The Aurora desk lamp costs eighty-nine dollars.');
-  const end1 = await waitEvent(page, (e) => e.kind === 'task.end' && e.stepId === 'task_price', 15_000, 'task.end by delivery');
-  expect(end1.data.source).toBe('ai');
+  const remind = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > said && /if you're finished/i.test(String(e.data.text)), 20_000, 'finish reminder');
   let evs = await log(page);
-  expect(evs.some((e) => e.kind === 'observation' && e.data.kind === 'participant_done_button')).toBe(false);
-  expect(modLines(evs).some((l) => /how do you feel/i.test(l))).toBe(false);
+  expect(evs.some((e) => e.kind === 'task.end' && e.stepId === 'task_price')).toBe(false);
+  expect(remind.t - said).toBeGreaterThan(6000);
   const checks = await page.evaluate(() => (window as unknown as { __taRunner: { turnChecks: { label: string }[] } }).__taRunner.turnChecks);
   expect(checks.map((c) => c.label)).toContain('DELIVERED');
+  await waitIdle(page);
+  await says(page, 'Done.');
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_price' && /how do you feel/i.test(String(e.data.text)), 15_000, 'how did it go');
+  await waitIdle(page);
+  await says(page, 'It was easy, the price was right on the page.');
+  const end1 = await waitEvent(page, (e) => e.kind === 'task.end' && e.stepId === 'task_price', 15_000, 'task.end after done');
+  expect(end1.data.source).toBe('ai');
+  evs = await log(page);
 
   // (b) Stuck: first time quiet, second time one reminder that skipping is fine.
   await expect(session).toHaveAttribute('data-step', 'task_poster', { timeout: 15_000 });
