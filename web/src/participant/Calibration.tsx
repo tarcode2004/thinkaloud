@@ -117,19 +117,28 @@ export function Calibration({ onDone, onSkip }: { onDone: (eye: EyeTracker, r: C
     const [fx, fy] = phase === 'calibrate' ? CAL_POINTS[pt] : VAL_POINTS[Math.max(0, vpt)];
     return (
       <div className="fixed inset-0 z-50 cursor-crosshair bg-canvas" data-testid="calibration-stage">
-        <p className="absolute inset-x-0 top-8 text-center text-[15px] text-secondary">
-          {phase === 'calibrate' ? `Look at the dot and click it ${CLICKS_PER_POINT} times · ${pt + 1} of ${CAL_POINTS.length}` : 'Now just look at each dot — no clicking.'}
-        </p>
+        <div className="pointer-events-none absolute inset-x-0 top-6 flex justify-center px-4" aria-live="polite">
+          <div className="max-w-[640px] rounded-[18px] bg-surface/95 px-6 py-3 text-center shadow-[0_1px_2px_rgba(0,0,0,.04),0_4px_16px_rgba(0,0,0,.06)]">
+            <p className="text-[24px] font-semibold leading-snug tracking-[-0.015em] text-label">
+              {phase === 'calibrate' ? `Look at the dot and click it ${CLICKS_PER_POINT} times` : 'Now just look at each dot. No clicking.'}
+            </p>
+            <p className="mt-1 text-[17px] tabular-nums text-secondary">
+              {phase === 'calibrate'
+                ? `Dot ${pt + 1} of ${CAL_POINTS.length} · ${clicks} of ${CLICKS_PER_POINT} clicks`
+                : `Dot ${Math.max(0, vpt) + 1} of ${VAL_POINTS.length}`}
+            </p>
+          </div>
+        </div>
         <button
           aria-label="Calibration point"
           disabled={phase === 'validate'}
           onClick={(e) => clickPoint(e.clientX, e.clientY)}
-          className="absolute size-7 -translate-x-1/2 -translate-y-1/2 rounded-full bg-brand-500 transition-[left,top,transform] duration-300 ease-apple active:scale-90"
+          className="absolute size-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-brand-500 transition-[left,top,transform] duration-300 ease-apple active:scale-90"
           style={{ left: `${fx * 100}%`, top: `${fy * 100}%`, opacity: phase === 'calibrate' ? 0.35 + (clicks / CLICKS_PER_POINT) * 0.65 : 1 }}
         >
-          <span className="absolute inset-[10px] rounded-full bg-white" />
+          <span className="absolute inset-[14px] rounded-full bg-white" />
         </button>
-        <button onClick={skip} className="absolute bottom-6 right-6 rounded-full px-4 py-2 text-[13px] text-secondary hover:bg-black/5">
+        <button onClick={skip} className="absolute bottom-6 right-6 rounded-full bg-fill px-5 py-2.5 text-[15px] font-medium text-label hover:bg-black/10">
           Skip eye tracking
         </button>
       </div>

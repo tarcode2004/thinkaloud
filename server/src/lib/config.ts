@@ -20,10 +20,16 @@ export const config = {
   /** Realtime API base. Point at a self-hosted OpenRealtime server (openrealtime/) to moderate without OpenAI. */
   realtimeBaseUrl: (env.REALTIME_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
   /** Base the participant's browser uses for the SDP exchange (defaults to realtimeBaseUrl). */
-  realtimePublicUrl: (env.REALTIME_PUBLIC_URL || env.REALTIME_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
+  realtimePublicUrl: (env.REALTIME_BASE_URL ? env.REALTIME_PUBLIC_URL || env.REALTIME_BASE_URL : 'https://api.openai.com/v1').replace(/\/$/, ''),
   realtimeKey: env.REALTIME_API_KEY || env.OPENAI_API_KEY || '',
   /** ICE servers for the participant's WebRTC connection to a self-hosted realtime server (comma list of stun:/turn: URLs). */
   realtimeIceServers: (env.REALTIME_ICE_SERVERS || '').split(',').map((s) => s.trim()).filter(Boolean),
+  /**
+   * Participant transport to a self-hosted realtime server (ignored for OpenAI, always WebRTC):
+   * 'websocket' (default: works through HTTP tunnels and any NAT), 'auto' (WebRTC first, WebSocket
+   * when ICE hasn't connected after ~4.5 s) or 'webrtc' (never fall back).
+   */
+  realtimeTransport: (['webrtc', 'websocket', 'auto'].includes(env.REALTIME_TRANSPORT || '') ? env.REALTIME_TRANSPORT : 'websocket') as 'webrtc' | 'websocket' | 'auto',
   realtimeVoice: env.OPENAI_REALTIME_VOICE || 'marin',
   realtimeEffort: env.OPENAI_REALTIME_REASONING_EFFORT || 'low',
   transcribeModel: env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',
