@@ -1,6 +1,7 @@
 // Security regression tests: researcher endpoints check ownership, participant endpoints need the
 // session secret, and the app host never serves files outside an app's dist/.
-import { test, before, after } from 'node:test';
+import { test, before, after, mock } from 'node:test';
+import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -373,4 +374,176 @@ test('billing off (self-hosted): publishing and sessions are unlimited', async (
   const { entitlement } = await import('./billing/account.ts');
   assert.deepEqual(entitlement('anyone'), { canRunSessions: true, blockReason: null });
   assert.equal((await client()('GET', `/api/p/links/${detail.links[0].token}`)).json.unavailableReason, undefined);
+});
+
+// ── Sign in with Google ──────────────────────────────────────────────────────
+// ID tokens are real RS256 JWTs signed by a local test key. google-auth-library's verifyIdToken runs for
+// real (signature, audience, issuer, expiry); only the fetch of Google's signing certs is mocked, so
+// nothing here talks to Google.
+
+const GOOGLE_CLIENT = 'test-client.apps.googleusercontent.com';
+const googleKey = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+const otherKey = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+const KID = 'test-kid';
+
+function googleToken(claims: Record<string, unknown> = {}, key = googleKey.privateKey) {
+  const now = Math.floor(Date.now() / 1000);
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const head = b64({ alg: 'RS256', kid: KID, typ: 'JWT' });
+  const body = b64({ iss: 'https://accounts.google.com', aud: GOOGLE_CLIENT, sub: '1000001', email: 'g-new@example.com', email_verified: true, name: 'Grace Hopper', picture: 'https://lh3.googleusercontent.com/a/x', iat: now, exp: now + 3600, ...claims });
+  const sig = crypto.sign('RSA-SHA256', Buffer.from(`${head}.${body}`), key).toString('base64url');
+  return `${head}.${body}.${sig}`;
+}
+
+async function withGoogle(fn: () => Promise<void>) {
+  const { OAuth2Client } = await import('google-auth-library');
+  const certs = mock.method(OAuth2Client.prototype, 'getFederatedSignonCertsAsync', async () => ({
+    certs: { [KID]: googleKey.publicKey.export({ type: 'spki', format: 'pem' }).toString() },
+    format: 'PEM',
+  }));
+  process.env.GOOGLE_CLIENT_ID = GOOGLE_CLIENT;
+  try {
+    await fn();
+  } finally {
+    delete process.env.GOOGLE_CLIENT_ID;
+    certs.mock.restore();
+  }
+}
+
+const userRow = (email: string) => db.prepare('SELECT * FROM users WHERE email = ?').get(email) as Record<string, any> | undefined;
+
+test('Google sign-in is off and invisible without GOOGLE_CLIENT_ID', async () => {
+  const c = client();
+  assert.deepEqual((await c('GET', '/api/auth/providers')).json, { google: null });
+  assert.equal((await c('POST', '/api/auth/google', { credential: googleToken() })).status, 404);
+  assert.equal(userRow('g-new@example.com'), undefined);
+});
+
+test('Google sign-in rejects bad tokens, the wrong audience, issuer or key, and expired tokens', async () => {
+  await withGoogle(async () => {
+    const c = client();
+    assert.deepEqual((await c('GET', '/api/auth/providers')).json, { google: { clientId: GOOGLE_CLIENT, oneTap: false } });
+    const now = Math.floor(Date.now() / 1000);
+    const cases: [string, string][] = [
+      ['garbage', 'not-a-jwt-but-long-enough-to-parse'],
+      ['wrong audience', googleToken({ aud: 'someone-else.apps.googleusercontent.com' })],
+      ['wrong issuer', googleToken({ iss: 'https://evil.example' })],
+      ['wrong signing key', googleToken({}, otherKey.privateKey)],
+      ['expired', googleToken({ iat: now - 7200, exp: now - 3600 })],
+      ['tampered payload', (() => { const [h, , s] = googleToken().split('.'); return `${h}.${Buffer.from(JSON.stringify({ iss: 'https://accounts.google.com', aud: GOOGLE_CLIENT, sub: '9', email: 'x@example.com', email_verified: true, iat: now, exp: now + 60 })).toString('base64url')}.${s}`; })()],
+    ];
+    for (const [label, credential] of cases) {
+      const r = await c('POST', '/api/auth/google', { credential });
+      assert.equal(r.status, 401, label);
+      assert.equal(r.json.token, undefined, label);
+    }
+    assert.equal((await c('POST', '/api/auth/google', {})).status, 400);
+    assert.equal(userRow('g-new@example.com'), undefined);
+  });
+});
+
+test('Google sign-in double-checks the audience even if the library returned a ticket', async () => {
+  const { OAuth2Client } = await import('google-auth-library');
+  const verify = mock.method(OAuth2Client.prototype, 'verifyIdToken', async () => ({
+    getPayload: () => ({ iss: 'https://accounts.google.com', aud: 'other.apps.googleusercontent.com', sub: '42', email: 'g-aud@example.com', email_verified: true }),
+  }));
+  process.env.GOOGLE_CLIENT_ID = GOOGLE_CLIENT;
+  try {
+    const r = await client()('POST', '/api/auth/google', { credential: 'x'.repeat(40) });
+    assert.equal(r.status, 401);
+    assert.equal(verify.mock.callCount(), 1);
+    assert.equal((verify.mock.calls[0].arguments as unknown as [{ audience: string }])[0].audience, GOOGLE_CLIENT, 'verifyIdToken is called with our client id as audience');
+    assert.equal(userRow('g-aud@example.com'), undefined);
+  } finally {
+    delete process.env.GOOGLE_CLIENT_ID;
+    verify.mock.restore();
+  }
+});
+
+test('an unverified Google email never signs in, creates or takes over an account', async () => {
+  const victim = client();
+  assert.equal((await victim('POST', '/api/auth/signup', { name: 'Victim', email: 'victim@example.com', password: 'victim-password' })).status, 201);
+  await withGoogle(async () => {
+    for (const email_verified of [false, 'true', undefined]) {
+      for (const email of ['victim@example.com', 'VICTIM@example.com', 'unverified-new@example.com']) {
+        const r = await client()('POST', '/api/auth/google', { credential: googleToken({ sub: '2000002', email, email_verified }) });
+        assert.equal(r.status, 403, `${email} email_verified=${String(email_verified)}`);
+        assert.equal(r.json.token, undefined);
+      }
+    }
+  });
+  assert.equal(userRow('victim@example.com')!.google_sub, null);
+  assert.equal(userRow('unverified-new@example.com'), undefined);
+  assert.equal((await victim('GET', '/api/auth/me')).status, 200, 'the victim is still signed in');
+});
+
+test('Google sign-in links an existing account by verified email, then signs in by Google id', async () => {
+  const existing = client();
+  const signup = await existing('POST', '/api/auth/signup', { name: 'Linda Link', email: 'link@example.com', password: 'link-password' });
+  assert.equal(signup.status, 201);
+  const oldToken = signup.json.token;
+  await withGoogle(async () => {
+    // Existing account: linked, same user, no new account.
+    const g = client();
+    const r = await g('POST', '/api/auth/google', { credential: googleToken({ sub: '3000003', email: 'Link@Example.com' }) });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.created, false);
+    assert.equal(r.json.user.id, signup.json.user.id);
+    assert.equal(r.json.user.name, 'Linda Link', 'the existing name is kept');
+    assert.equal(r.json.user.avatarUrl, 'https://lh3.googleusercontent.com/a/x');
+    assert.equal(typeof r.json.token, 'string');
+    assert.doesNotMatch(JSON.stringify(r.json), /google_sub|password|3000003/);
+    assert.equal(userRow('link@example.com')!.google_sub, '3000003');
+    assert.equal((await g('GET', '/api/auth/me')).json.user.email, 'link@example.com');
+    // Sessions opened before the link are ended (pre-registered accounts); the password still works.
+    assert.equal((await client()('GET', '/api/auth/me', undefined, { Authorization: `Bearer ${oldToken}` })).status, 401);
+    assert.equal((await client()('POST', '/api/auth/login', { email: 'link@example.com', password: 'link-password' })).status, 200);
+    // Bearer token from the Google sign-in works cross-origin.
+    assert.equal((await client()('GET', '/api/auth/me', undefined, { Authorization: `Bearer ${r.json.token}` })).status, 200);
+
+    // Later sign-ins match on the Google id, even if the Google account's email changed.
+    const again = await client()('POST', '/api/auth/google', { credential: googleToken({ sub: '3000003', email: 'renamed@example.com' }) });
+    assert.equal(again.status, 200);
+    assert.equal(again.json.user.id, signup.json.user.id);
+
+    // A different Google account with the same email can't re-link it.
+    const other = await client()('POST', '/api/auth/google', { credential: googleToken({ sub: '3999999', email: 'link@example.com' }) });
+    assert.equal(other.status, 409);
+    assert.equal(other.json.token, undefined);
+    assert.equal(userRow('link@example.com')!.google_sub, '3000003');
+
+    // New email: a Google-only account with no usable password.
+    const fresh = await client()('POST', '/api/auth/google', { credential: googleToken({ sub: '4000004', email: 'g-new@example.com' }) });
+    assert.equal(fresh.status, 201);
+    assert.equal(fresh.json.created, true);
+    assert.equal(fresh.json.user.name, 'Grace Hopper');
+    assert.equal(userRow('g-new@example.com')!.password_hash, '');
+    for (const password of ['', ' ', 'x', 'scrypt$$']) {
+      const l = await client()('POST', '/api/auth/login', { email: 'g-new@example.com', password });
+      assert.ok(l.status === 400 || l.status === 401, `password ${JSON.stringify(password)} → ${l.status}`);
+    }
+    // Password sign-up can't claim the Google account's email either.
+    assert.equal((await client()('POST', '/api/auth/signup', { name: 'X', email: 'g-new@example.com', password: 'attacker-password' })).status, 409);
+  });
+});
+
+test('Google sign-in is behind the CSRF origin guard and the auth rate limit', async () => {
+  await withGoogle(async () => {
+    const r = await client()('POST', '/api/auth/google', { credential: googleToken({ sub: '5000005', email: 'csrf@example.com' }) }, { Origin: 'http://app-x.localhost:4001' });
+    assert.equal(r.status, 403);
+    assert.equal(userRow('csrf@example.com'), undefined);
+  });
+  // Same limiter as login/signup (AUTH_RATE_LIMIT is read when the app is created).
+  process.env.AUTH_RATE_LIMIT = '2';
+  const { createApp } = await import('./app.ts');
+  const limited = await listen(createApp());
+  delete process.env.AUTH_RATE_LIMIT;
+  try {
+    const url = `http://127.0.0.1:${(limited.address() as AddressInfo).port}/api/auth/google`;
+    const statuses: number[] = [];
+    for (let i = 0; i < 3; i++) statuses.push((await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"credential":"x"}' })).status);
+    assert.deepEqual(statuses, [400, 400, 429]);
+  } finally {
+    limited.close();
+  }
 });

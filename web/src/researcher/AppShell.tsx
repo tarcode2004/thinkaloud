@@ -108,7 +108,11 @@ function Sidebar({ billing }: { billing: BillingOverview | null }) {
           className="bottom-full mb-1.5 w-56"
           trigger={({ toggle }) => (
             <button onClick={toggle} className="mt-1 flex w-full items-center gap-2.5 rounded-[9px] px-2 py-1.5 text-left hover:bg-black/[0.03]" data-testid="user-menu">
-              <span className="grid size-7 shrink-0 place-items-center rounded-full bg-[#8e8e93] text-[11px] font-semibold text-white">{initials}</span>
+              {user?.avatarUrl ? (
+                <img src={user.avatarUrl} alt="" referrerPolicy="no-referrer" className="size-7 shrink-0 rounded-full bg-fill object-cover" />
+              ) : (
+                <span className="grid size-7 shrink-0 place-items-center rounded-full bg-[#8e8e93] text-[11px] font-semibold text-white">{initials}</span>
+              )}
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-[13px] font-medium text-label">{user?.name}</span>
                 <span className="block truncate text-[11px] text-secondary">{user?.email}</span>

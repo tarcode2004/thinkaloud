@@ -139,6 +139,7 @@ export function loadAnswers(studyId: string): Map<string, Answer[]> {
 export const METRIC_EVENT_KINDS = [
   'task.start',
   'task.end',
+  'task.resume',
   'step.enter',
   'app.navigate',
   'app.click',

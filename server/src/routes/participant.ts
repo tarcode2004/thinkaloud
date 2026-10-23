@@ -369,6 +369,9 @@ export function ingestEvents(sessionId: string, rawEvents: unknown[]): { accepte
           const x = d.data;
           upsertTask.run(sessionId, sid, x.outcome, x.source, Math.round(x.startedAt), Math.round(x.endedAt), Math.round(x.durationMs), x.evidence ?? null);
         }
+      } else if (e.kind === 'task.resume') {
+        // "Back to task" after an accidental "I'm done": the outcome is recorded again when the task ends.
+        if (stepId) db.prepare('DELETE FROM task_results WHERE session_id = ? AND step_id = ?').run(sessionId, stepId);
       } else if (e.kind === 'answer') {
         const d = AnswerData.safeParse(e.data);
         const sid = stepId ?? (d.success ? d.data.stepId : undefined);
@@ -528,6 +531,14 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
     transcription,
     callsUrl: `${config.realtimePublicUrl}/realtime/calls`,
     ...(config.realtimeIceServers.length ? { iceServers: config.realtimeIceServers.map((urls) => ({ urls })) } : {}),
+    // Self-hosted servers (OpenRealtime) also speak the Realtime WebSocket protocol, which passes
+    // through HTTP tunnels where WebRTC's UDP media can't (symmetric NAT, mobile carriers).
+    ...(selfHosted
+      ? {
+          transport: config.realtimeTransport,
+          ...(config.realtimeTransport !== 'webrtc' ? { wsUrl: `${config.realtimePublicUrl.replace(/^http/, 'ws')}/realtime` } : {}),
+        }
+      : {}),
   };
   markVoiceStarted(sessionId);
   res.json(out);

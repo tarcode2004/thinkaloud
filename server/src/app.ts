@@ -35,7 +35,7 @@ export function createApp() {
 
   app.get('/api/health', (_req, res) => res.json({ ok: true, appHostUrl: config.appHostUrl, realtimeUrl: config.realtimePublicUrl, ai: Boolean(config.openaiKey) }));
   app.use('/api', sameOriginGuard);
-  app.use(['/api/auth/login', '/api/auth/signup'], rateLimit({ windowMs: 10 * 60_000, max: Number(process.env.AUTH_RATE_LIMIT || (config.isProd ? 30 : 1000)) }));
+  app.use(['/api/auth/login', '/api/auth/signup', '/api/auth/google'], rateLimit({ windowMs: 10 * 60_000, max: Number(process.env.AUTH_RATE_LIMIT || (config.isProd ? 30 : 1000)) }));
   app.use('/api/auth', authRouter);
   app.use('/api/p', participantRouter); // public participant API (session-secret auth)
   app.use('/api/ai', aiRouter);

@@ -204,6 +204,11 @@ const MIGRATIONS: string[] = [
   ALTER TABLE sessions ADD COLUMN voice_started_at INTEGER; -- first realtime-token mint (start of metered voice time)
   ALTER TABLE sessions ADD COLUMN voice_last_seen_at INTEGER; -- server time of the last participant activity after voice started
   `,
+  /* 7 Sign in with Google */ `
+  ALTER TABLE users ADD COLUMN google_sub TEXT;            -- Google account id (ID token "sub"); NULL until linked
+  ALTER TABLE users ADD COLUMN avatar_url TEXT;            -- Google profile picture (https URL)
+  CREATE UNIQUE INDEX users_google_sub ON users(google_sub); -- SQLite can't ADD COLUMN ... UNIQUE; NULLs don't collide
+  `,
 ];
 
 db.exec('CREATE TABLE IF NOT EXISTS _migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)');

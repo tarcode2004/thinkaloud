@@ -13,6 +13,8 @@ export interface User {
   email: string;
   name: string;
   createdAt: Millis;
+  /** Profile picture from Google sign-in (https), when the account is linked to Google. */
+  avatarUrl?: string | null;
 }
 
 // ── Protocol ─────────────────────────────────────────────────────────────────
@@ -389,7 +391,7 @@ export type EventKind =
   // media: data { t } = session-clock time the recording started (audio files are aligned to this)
   | 'media.audio_start' | 'eyetracking.calibrated'
   // protocol
-  | 'step.enter' | 'step.exit' | 'task.start' | 'task.end' | 'answer'
+  | 'step.enter' | 'step.exit' | 'task.start' | 'task.end' | 'task.resume' | 'answer'
   // conversation
   | 'transcript.participant' | 'transcript.moderator' | 'moderator.tool' | 'moderator.probe' | 'moderator.nudge'
   | 'speech.start' | 'speech.stop'
@@ -634,6 +636,10 @@ export interface RealtimeTokenResponse {
   callsUrl?: string;
   /** ICE servers for the RTCPeerConnection (self-hosted realtime servers behind NAT). */
   iceServers?: { urls: string | string[]; username?: string; credential?: string }[];
+  /** WebSocket endpoint of a self-hosted realtime server (fallback when WebRTC media can't connect). */
+  wsUrl?: string;
+  /** Self-hosted only: 'websocket' = skip WebRTC; 'webrtc' = never fall back; 'auto' = WebRTC, WS fallback. */
+  transport?: 'webrtc' | 'websocket' | 'auto';
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

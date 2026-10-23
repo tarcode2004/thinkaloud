@@ -17,6 +17,19 @@ declare global {
   }
 }
 
+export interface UserRow {
+  id: string;
+  email: string;
+  name: string;
+  created_at: number;
+  avatar_url?: string | null;
+}
+
+/** API shape of a users row (never includes password_hash or google_sub). */
+export function userJson(row: UserRow): User {
+  return { id: row.id, email: row.email, name: row.name, createdAt: row.created_at, avatarUrl: row.avatar_url ?? null };
+}
+
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16);
   const hash = crypto.scryptSync(password, salt, 64);
@@ -53,11 +66,11 @@ export function loadUser(req: Request, _res: Response, next: NextFunction) {
   if (token) {
     const row = db
       .prepare(
-        `SELECT u.id, u.email, u.name, u.created_at FROM auth_sessions s JOIN users u ON u.id = s.user_id
+        `SELECT u.id, u.email, u.name, u.created_at, u.avatar_url FROM auth_sessions s JOIN users u ON u.id = s.user_id
          WHERE s.token = ? AND s.expires_at > ?`,
       )
-      .get(token, Date.now()) as { id: string; email: string; name: string; created_at: number } | undefined;
-    if (row) req.user = { id: row.id, email: row.email, name: row.name, createdAt: row.created_at };
+      .get(token, Date.now()) as UserRow | undefined;
+    if (row) req.user = userJson(row);
   }
   next();
 }

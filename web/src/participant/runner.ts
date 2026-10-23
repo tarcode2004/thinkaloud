@@ -98,6 +98,8 @@ export interface RunnerState {
   captions: Caption[];
   /** Waiting for the moderator to react to a button press. */
   pendingAction: string | null;
+  /** "I'm done" may have been pressed by accident: the participant can still go back to the task. */
+  canResume: boolean;
   /** Text shown in manual (no-AI) mode. */
   manualPrompt: string | null;
   manualError: string | null;
@@ -328,6 +330,7 @@ export class SessionRunner {
       appStatus: opts.start.appUrl ? (opts.start.appInstrumented ? 'loading' : 'limited') : 'none',
       card: null,
       answers: {},
+      canResume: false,
       captions: [],
       pendingAction: null,
       manualPrompt: null,
@@ -948,6 +951,7 @@ Reply with exactly one word: YES or NO.`;
       appVisible: showApp,
       card: null,
       pendingAction: null,
+      canResume: false,
       exploreEndsAt: null,
       manualError: null,
     });
@@ -1121,7 +1125,8 @@ Reply with exactly one word: YES or NO.`;
       ...(evidence ? { evidence } : {}),
     });
     this.followUpsUsed = 0;
-    this.set({ taskPhase: 'post', appVisible: false, taskDeadline: null, pendingAction: null });
+    const viaDone = Boolean(this.wrap && this.wrap.source !== 'delivered' && this.wrap.source !== 'model') && this.state.canResume;
+    this.set({ taskPhase: 'post', appVisible: false, taskDeadline: null, pendingAction: null, canResume: viaDone });
     this.doneRequested = false;
     this.endWrap();
     this.replyDue = null;
@@ -1470,6 +1475,9 @@ Reply with exactly one word: YES or NO.`;
           if (w.phase !== 'judging') await new Promise<void>((r) => w.waiters.push(r));
           if (this.step !== s || this.snapshot.taskPhase === 'post' || this.state.ended)
             return { output: { ...this.brief(), ignored: true, note: 'The task already ended meanwhile. Continue with this brief.' }, respond: false };
+          // "Back to task" cancelled this wrap-up while the call was held: the task continues.
+          if (this.wrap !== w)
+            return { output: { ok: false, ignored: true, note: 'The participant went back to the task. Do not set an outcome; stay quiet and let them continue.' }, respond: false };
         }
         const w = this.wrap;
         const said = w?.heard.join(' ').trim();
@@ -1620,7 +1628,7 @@ Reply with exactly one word: YES or NO.`;
 
   private storeAnswer(stepId: string, q: Question, a: AnswerValue) {
     const answers = { ...this.state.answers, [akey(stepId, q.id)]: a };
-    this.set({ answers });
+    this.set({ answers, ...(this.state.canResume ? { canResume: false } : {}) });
     this.queue.push('answer', {
       stepId,
       questionId: q.id,
@@ -1692,6 +1700,44 @@ Reply with exactly one word: YES or NO.`;
     this.startWrapUp('button');
   }
 
+  /**
+   * "Back to task": the participant pressed (or said) "I'm done" by accident. Before the outcome is
+   * recorded the wrap-up is simply dropped; after it (but before any post-task answer) the recorded
+   * outcome is withdrawn (`task.resume`) and the task continues with its original start time.
+   */
+  resumeTask() {
+    const s = this.step;
+    if (s?.type !== 'task' || !this.state.canResume || this.state.ended || this.finishing) return;
+    const rt = this.rt;
+    const recorded = this.state.taskPhase === 'post';
+    rt?.cancelResponse();
+    this.endWrap();
+    this.doneRequested = false;
+    this.replyDue = null;
+    if (recorded) {
+      this.queue.push('task.resume', { startedAt: this.taskWallStart, resumedAt: Date.now(), previousOutcome: this.taskOutcome?.outcome ?? null });
+      this.taskOutcome = null;
+      this.taskEndedAt = 0;
+      this.followUpsUsed = 0;
+      const deadline = s.timeLimitSec ? this.taskWallStart + s.timeLimitSec * 1000 : null;
+      this.set({ taskPhase: 'active', appVisible: Boolean(this.opts.start.appUrl), taskDeadline: deadline });
+    } else {
+      this.queue.push('observation', { kind: 'wrap_up_cancelled' });
+    }
+    this.set({ canResume: false, pendingAction: null });
+    this.lastUserSpeech = Math.max(this.lastUserSpeech, performance.now());
+    this.resetTurn();
+    this.applyTurnDetection();
+    this.updateCard();
+    this.refreshManualPrompt();
+    if (rt) {
+      rt.addSystemItem(
+        `[EVENT] The participant pressed "Back to task": they said they were done by accident and are continuing the same task now.${recorded ? ' The earlier outcome was withdrawn.' : ''} Do NOT ask how it went and do NOT call set_task_outcome; let them work and think aloud as before.`,
+      );
+      this.directed(this.isEnglish() ? 'Say exactly this, kindly: "No problem. Take your time, and press I\'m done when you\'re finished." Nothing else.' : `Say briefly and kindly in ${languageName(this.mod.language)} that it is no problem, they can take their time and press "I'm done" when finished. Nothing else.`);
+    }
+  }
+
   // ── "I'm done" wrap-up window ─────────────────────────────────────────────
   /**
    * Open the wrap-up: ask how it went (unless they just delivered what a tell/explain task asked
@@ -1723,6 +1769,7 @@ Reply with exactly one word: YES or NO.`;
       reasked: false,
       askAudibleAt: Infinity,
     };
+    if (source !== 'delivered') this.set({ canResume: true });
     // The button shows "One moment…" until the moderator reacts (only for the button).
     if (source === 'button') {
       this.set({ pendingAction: 'done' });

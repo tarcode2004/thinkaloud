@@ -170,6 +170,14 @@ export function SessionView({ runner, title, preview, onWithdraw }: { runner: Se
               </div>
             )}
 
+            {s.canResume && !app && (
+              <div className="mt-1 flex justify-center pb-6">
+                <Button variant="secondary" onClick={() => runner.resumeTask()} data-testid="back-to-task">
+                  Back to task
+                </Button>
+              </div>
+            )}
+
             {!voice && !(task && s.taskPhase !== 'post') && (
               <div className="mt-8 flex w-full max-w-[640px] items-center justify-between gap-3 pb-12">
                 <span className="text-[13px] text-sys-red">{s.manualError}</span>
@@ -335,11 +343,18 @@ function TaskDock({ runner, task, instruction, caption, allowText, typingDefault
               <Button variant="secondary" onClick={() => runner.skipTask()} data-testid="skip-task">
                 Skip
               </Button>
-              <Button onClick={() => runner.imDone()} disabled={s.pendingAction === 'done'} data-testid="im-done">
-                {s.pendingAction === 'done' ? 'One moment…' : 'I’m done'}
-              </Button>
+              {s.canResume ? (
+                <Button variant="secondary" onClick={() => runner.resumeTask()} data-testid="back-to-task">
+                  Back to task
+                </Button>
+              ) : (
+                <Button onClick={() => runner.imDone()} disabled={s.pendingAction === 'done'} data-testid="im-done">
+                  {s.pendingAction === 'done' ? 'One moment…' : 'I’m done'}
+                </Button>
+              )}
             </>
           )}
+
           {!inTask && !voice && (
             <Button onClick={() => runner.manualContinue()} data-testid="manual-continue">
               Continue

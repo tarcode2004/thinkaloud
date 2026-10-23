@@ -75,7 +75,7 @@ Linger is on for `tarmus`, so the units start at boot without a login.
 
 ## Cross-origin details
 
-- **Auth.** `POST /api/auth/login` and `/signup` return `{ token, user }`. The web client stores the token
+- **Auth.** `POST /api/auth/login`, `/signup` and `/google` return `{ token, user }`. The web client stores the token
   (`localStorage.ta_auth_token`) and sends `Authorization: Bearer <token>` only when the API is
   cross-origin. The server accepts the bearer header or the `ta_auth` cookie (bearer wins), and logout
   revokes whichever was used. Cookies would be third-party here (web.app → trycloudflare.com), which
@@ -162,6 +162,73 @@ touching anything. Then `kill <pid from ss -ltnp | grep :4000>` and immediately
 tunnels keep pointing at :4000/:4001, so their links keep working until they die. Don't kill
 them.
 
+## Google sign-in
+
+"Sign in with Google" is optional. Without `GOOGLE_CLIENT_ID` the sign-in and sign-up pages show only
+the email form and `POST /api/auth/google` answers 404.
+
+**How it works.** The pages load Google Identity Services (`https://accounts.google.com/gsi/client`)
+only when `GET /api/auth/providers` returns a client ID. Google's own button is rendered above the email
+form (popup mode, no redirect URI). It gives the page an ID token (JWT), which is posted to
+`POST /api/auth/google`. The server verifies it with `google-auth-library` (`OAuth2Client.verifyIdToken`):
+signature, `aud` = `GOOGLE_CLIENT_ID`, `iss` = accounts.google.com, and expiry. It also requires
+`email_verified: true`. Then:
+
+- If an account is already linked to that Google ID (`users.google_sub`), that account signs in.
+- If an account has the same email, it is linked and signed in, and sessions opened before the link are
+  ended. An account already linked to a different Google ID is never re-linked (409).
+- Otherwise a new account is created from the Google profile, with no usable password.
+
+The `?plan=` sign-up flow continues to Stripe Checkout exactly as it does for email sign-up. The route
+shares the login/signup rate limit and sits behind the CSRF origin guard. There is no account settings page
+yet, so a Google-only account cannot set a password. One Tap is off by default; `GOOGLE_ONE_TAP=1`
+shows it on the sign-in page.
+
+**Creating the OAuth client.** This can't be done from the CLI. Google offers no public API or gcloud
+command for OAuth clients of type "Web application" or for their JavaScript origins. `gcloud iap
+oauth-brands` / `oauth-clients` only create *Internal* brands, which need a Google Workspace organization
+(`testrepoapp-d6122` has none), and IAP-only clients. `gcloud iam oauth-clients` is for Workforce Identity
+Federation. Firebase Auth is not initialized in this project (Identity Toolkit config returns
+`CONFIGURATION_NOT_FOUND`), so there is no auto-created web client to reuse either. Sign in to the Google Cloud console as the
+project owner (`tarmus1291@gmail.com`) and follow these steps:
+
+1. Open https://console.cloud.google.com/auth/overview?project=testrepoapp-d6122
+   (left menu: **APIs & Services → OAuth consent screen**, which now opens the *Google Auth Platform*).
+2. If it says *Google Auth Platform not configured yet*, click **Get started**:
+   - **App information.** App name `ThinkAloud`, user support email = your address → **Next**.
+   - **Audience.** **External** → **Next**.
+   - **Contact information.** Your email address → **Next**.
+   - **Finish.** Tick the user data policy box → **Continue** → **Create**.
+3. **Audience** (left menu). The app starts in **Testing**, where only listed test users can sign in. Under
+   **Test users**, click **+ Add users**, add each Google address that should be able to sign in → **Save**.
+   To open sign-in to everyone, click **Publish app** → **Confirm**. ThinkAloud asks only for `openid email profile`,
+   which are non-sensitive scopes, so there is no Google review.
+4. **Clients** (left menu) → **+ Create client** (older UI: **APIs & Services → Credentials → + Create
+   credentials → OAuth client ID**):
+   - **Application type.** **Web application**. Name `ThinkAloud web`.
+   - **Authorized JavaScript origins.** Click **+ Add URI** once for each:
+     `https://thinkaloud-app.web.app`, `https://thinkaloud-app.firebaseapp.com`, `http://localhost:5173`,
+     `http://localhost` (Google requires the port-less one too for local testing). Add any other origin the SPA is
+     served from: a custom domain, or for single-origin self-hosting the `PUBLIC_URL` origin, e.g.
+     `http://localhost:4000`.
+   - **Authorized redirect URIs.** Leave empty (popup mode).
+   - Click **Create**, then copy the **Client ID** (`…apps.googleusercontent.com`). The client secret is not used.
+     Don't store it anywhere.
+5. Origin changes can take a few minutes (up to hours) to take effect.
+
+**Turning it on.** Put the ID in `.env` (it is public, but `.env` is where the server reads config):
+
+```bash
+echo 'GOOGLE_CLIENT_ID=<client id>' >> .env
+systemctl --user restart thinkaloud       # server picks it up
+bash scripts/deploy-web.sh                # ship the front end with the button
+curl -s "$(curl -s https://thinkaloud-app.web.app/config.json | jq -r .apiBase)/api/auth/providers"
+```
+
+Nothing has to change in Firebase Hosting or `config.json`. The front end asks the API for the client ID at
+runtime. The page must not be served with `Referrer-Policy: no-referrer` (GIS needs the origin) or
+`Cross-Origin-Opener-Policy: same-origin` (it would break the popup). `firebase.json` sets neither.
+
 ## Project
 
 The Google account had reached its Cloud project quota (27 projects), so `gcloud projects create`
@@ -185,6 +252,10 @@ from the sandbox project first lets the new project reuse it.
 | Hosted app shows "Preparing…" or 404 in the iframe | The app URL is rewritten at server start. Make sure the server restarted after the last apps-tunnel change (`curl 127.0.0.1:4000/api/health` → `appHostUrl`) |
 | 403 "Cross-origin request refused" | The front-end origin is missing from `CORS_ORIGINS` (`data/deploy/runtime.env`). For a custom domain, add `EXTRA_CORS_ORIGINS` in `data/deploy/deploy.env` and restart the sync and server |
 | Upload of a large zip fails | Cloudflare's 100 MB body cap; see Limits |
+| Google button missing | `curl <apiBase>/api/auth/providers` must show a `clientId`. Set `GOOGLE_CLIENT_ID` in `.env` and restart `thinkaloud` |
+| Google popup says *Error 400: origin_mismatch* / "not a valid origin" | Add the exact page origin (scheme + host + port) to the client's Authorized JavaScript origins and wait a few minutes |
+| Google popup says *Access blocked: … has not completed the Google verification process* | The app is in Testing and that address isn't a test user. Add it under Audience → Test users, or publish the app |
+| "Google sign-in didn't work" after the popup | Server rejected the token: usually `GOOGLE_CLIENT_ID` on the server differs from the client the page used, or the server clock is off |
 | Old `*.web.app` assets 404 after a deploy | Expected for removed hashes. `index.html` is `no-cache`, so a reload picks up the new build |
 
 ## Upgrade: a named tunnel on your own domain (stable URLs)

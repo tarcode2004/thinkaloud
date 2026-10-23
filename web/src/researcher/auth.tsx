@@ -9,6 +9,7 @@ interface AuthCtx {
   loading: boolean;
   login: (email: string, password: string) => Promise<User>;
   signup: (name: string, email: string, password: string) => Promise<User>;
+  loginWithGoogle: (credential: string) => Promise<User>;
   logout: () => Promise<void>;
 }
 
@@ -40,12 +41,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(user);
     return user;
   }, []);
+  const loginWithGoogle = useCallback(async (credential: string) => {
+    const { user } = await rApi.google(credential);
+    setUser(user);
+    return user;
+  }, []);
   const logout = useCallback(async () => {
     await rApi.logout().catch(() => {});
     setUser(null);
   }, []);
 
-  return <Ctx.Provider value={{ user, loading, login, signup, logout }}>{children}</Ctx.Provider>;
+  return <Ctx.Provider value={{ user, loading, login, signup, loginWithGoogle, logout }}>{children}</Ctx.Provider>;
 }
 
 export function useAuth() {

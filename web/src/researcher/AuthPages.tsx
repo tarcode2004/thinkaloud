@@ -5,7 +5,9 @@ import { Button, Field, Input } from '../ui/index.tsx';
 import { Logo } from './components/index.tsx';
 import { useAuth } from './auth.tsx';
 import { errorMessage } from './lib.ts';
+import { ApiError } from '../lib/api.ts';
 import { trialSummary, usePlans } from './billing/api.ts';
+import { GoogleSignInButton, useAuthProviders } from './GoogleSignIn.tsx';
 
 export function LoginPage() {
   return <AuthPage mode="login" />;
@@ -15,7 +17,8 @@ export function SignupPage() {
 }
 
 function AuthPage({ mode }: { mode: 'login' | 'signup' }) {
-  const { user, login, signup } = useAuth();
+  const { user, login, signup, loginWithGoogle } = useAuth();
+  const providers = useAuthProviders();
   const [params] = useSearchParams();
   const nav = useNavigate();
   // ?plan=<id> (from the pricing section): after signing up, go straight on to Stripe Checkout.
@@ -28,12 +31,14 @@ function AuthPage({ mode }: { mode: 'login' | 'signup' }) {
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [googleErr, setGoogleErr] = useState('');
 
   if (user) return <Navigate to={next} replace />;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setErr('');
+    setGoogleErr('');
     if (mode === 'signup' && password.length < 8) return setErr('Password must be at least 8 characters.');
     setBusy(true);
     try {
@@ -43,6 +48,21 @@ function AuthPage({ mode }: { mode: 'login' | 'signup' }) {
     } catch (e) {
       const m = errorMessage(e);
       setErr(mode === 'login' && /401|invalid|credentials/i.test(m) ? 'That email and password do not match.' : m);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const google = async (credential: string) => {
+    setErr('');
+    setGoogleErr('');
+    setBusy(true);
+    try {
+      await loginWithGoogle(credential);
+      nav(next, { replace: true }); // same `next` as email sign-up, so ?plan= still continues to checkout
+    } catch (e) {
+      // The server's messages are written for this page; anything else gets one plain line.
+      setGoogleErr(e instanceof ApiError && e.status !== 404 && e.status < 500 && e.message ? e.message : 'Google sign-in didn’t work. Try again, or use your email.');
     } finally {
       setBusy(false);
     }
@@ -65,6 +85,15 @@ function AuthPage({ mode }: { mode: 'login' | 'signup' }) {
             </p>
           )}
           <form onSubmit={submit} className="mt-8 rounded-[22px] bg-surface p-6 shadow-[0_1px_2px_rgba(0,0,0,.04),0_8px_30px_rgba(0,0,0,.05)] ring-1 ring-black/[0.04]">
+            {providers?.google && (
+              <GoogleSignInButton clientId={providers.google.clientId} mode={mode} oneTap={providers.google.oneTap && mode === 'login'} disabled={busy} onCredential={google}>
+                {googleErr && (
+                  <p className="mt-3 flex items-start gap-2 text-[13px] text-[#d70015]" role="alert" data-testid="google-error">
+                    <AlertCircle className="mt-px size-4 shrink-0" /> {googleErr}
+                  </p>
+                )}
+              </GoogleSignInButton>
+            )}
             <div className="space-y-4">
               {mode === 'signup' && (
                 <Field label="Name">

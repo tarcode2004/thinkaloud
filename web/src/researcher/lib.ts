@@ -22,6 +22,8 @@ export const rApi = {
   // The token is kept for bearer auth when the API is cross-origin (see lib/api.ts).
   login: (email: string, password: string) => api.post<{ user: User; token?: string }>('/api/auth/login', { email, password }).then(keepToken),
   signup: (name: string, email: string, password: string) => api.post<{ user: User; token?: string }>('/api/auth/signup', { name, email, password }).then(keepToken),
+  /** Sign in with a Google ID token (GIS). Links or creates the account; `created` is true for a new one. */
+  google: (credential: string) => api.post<{ user: User; token?: string; created: boolean }>('/api/auth/google', { credential }).then(keepToken),
   logout: () => api.post<{ ok: boolean }>('/api/auth/logout').finally(() => setAuthToken(null)),
   studies: () => api.get<{ studies: StudySummary[] }>('/api/studies'),
   createStudy: (body: { name: string; description?: string; template?: 'starter' | 'blank' }) => api.post<{ study: Study }>('/api/studies', body),

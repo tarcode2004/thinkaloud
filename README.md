@@ -124,7 +124,7 @@ npm start              # http://localhost:4000 (app host on :4001)
 - **Share with anyone over HTTPS** (required for the microphone): `npm run share` opens Cloudflare quick tunnels and prints public URLs.
 - **Deploy:** [`docs/DEPLOY.md`](docs/DEPLOY.md) covers a static front end on Firebase Hosting with the API at home behind Cloudflare tunnels (systemd units, auto-synced tunnel URLs). Or `docker compose up -d`. Set `PUBLIC_URL`, and point `APP_HOST_URL` at a wildcard domain (`https://apps.example.com` → `https://app-<id>.apps.example.com`). See [`server/src/apphost/README.md`](server/src/apphost/README.md).
 
-**Configuration** (`.env`): `OPENAI_API_KEY`, `OPENAI_REALTIME_MODEL` (default `gpt-realtime-2`), `OPENAI_TEXT_MODEL`, `BUILD_MODE=docker|local`, `DATA_DIR`, and `GIT_ALLOW_SSH=1` to build private repos with the server's SSH key.
+**Configuration** (`.env`): `OPENAI_API_KEY`, `OPENAI_REALTIME_MODEL` (default `gpt-realtime-2`), `OPENAI_TEXT_MODEL`, `BUILD_MODE=docker|local`, `DATA_DIR`, `GIT_ALLOW_SSH=1` to build private repos with the server's SSH key, and `GOOGLE_CLIENT_ID` for "Sign in with Google" (optional, see [docs/DEPLOY.md](docs/DEPLOY.md#google-sign-in)).
 
 Supported project types and their status are listed in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 

@@ -445,3 +445,65 @@ test('M2 · a tell-me answer never ends the task by itself (reminder, then "done
   expect(d.taskResults.find((r) => r.stepId === 'task_poster')).toMatchObject({ outcome: 'abandoned' });
   await context.close();
 });
+
+test('M3 · "Back to task" after an accidental "I\'m done": during "How do you feel that went?" the wrap-up is dropped; after the outcome (before any post-task answer) it is withdrawn; finishing again records one result', async () => {
+  const steps = [
+    task({ id: 'task_find', title: 'Find', instruction: 'Imagine you want a new lamp for your desk. Find the Aurora desk lamp.', askSEQ: true }),
+    { id: 'wrapup', type: 'interview', title: 'Wrap-up', goal: 'Impression', questions: ['How would you describe the website to a friend?'], maxFollowUps: 0 },
+  ];
+  const { token, studyId } = await createStudy('Mock resume', protocol(steps));
+  const { context, page, openaiHits } = await newPage();
+  await start(page, token);
+  await waitIdle(page);
+  await says(page, "Yes, I'm ready. Let's start.");
+  const session = page.getByTestId('session');
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 20_000 });
+  await waitIdle(page);
+
+  // (a) Pressed by accident: the question is asked, the participant goes back before answering.
+  await page.getByTestId('im-done').click();
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && /how do you feel/i.test(String(e.data.text)), 15_000, 'ask');
+  await page.getByTestId('back-to-task').click();
+  await waitEvent(page, (e) => e.kind === 'observation' && e.data.kind === 'wrap_up_cancelled', 5000, 'cancelled');
+  const back1 = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && /take your time/i.test(String(e.data.text)), 15_000, 'no problem');
+  expect(String(back1.data.text)).toMatch(/^No problem\./);
+  await expect(session).toHaveAttribute('data-task-phase', 'active');
+  await expect(page.getByTestId('im-done')).toBeVisible();
+  let evs = await log(page);
+  expect(evs.filter((e) => e.kind === 'task.end')).toEqual([]);
+  await waitIdle(page);
+
+  // (b) Done again and answered, outcome recorded; the SEQ card shows — then "Back to task" before rating.
+  await page.getByTestId('im-done').click();
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > back1.t && /how do you feel/i.test(String(e.data.text)), 15_000, 'ask 2');
+  await waitIdle(page, 300);
+  await says(page, 'I think I found it with the search.');
+  await waitEvent(page, (e) => e.kind === 'task.end' && e.stepId === 'task_find', 20_000, 'task.end 1');
+  await expect(page.getByTestId('back-to-task')).toBeVisible();
+  await page.getByTestId('back-to-task').click();
+  await waitEvent(page, (e) => e.kind === 'task.resume' && e.stepId === 'task_find', 5000, 'task.resume');
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 5000 });
+  await waitIdle(page);
+
+  // (c) Finish for real: one task result, with the original start time.
+  await page.getByTestId('im-done').click();
+  const pressed = await waitEvent(page, (e) => e.kind === 'observation' && e.data.kind === 'participant_done_button' && e.t > back1.t + 1, 5000, 'done 3');
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > pressed.t && /how do you feel/i.test(String(e.data.text)), 15_000, 'ask 3');
+  await waitIdle(page, 300);
+  await says(page, 'Now I really found the Aurora lamp.');
+  await waitEvent(page, (e) => e.kind === 'task.end' && e.stepId === 'task_find' && e.t > pressed.t, 20_000, 'task.end 2');
+  await expect(page.getByTestId('question-card')).toBeVisible({ timeout: 15_000 });
+  await page.locator('[data-testid=question-card] [data-value="6"]').click();
+  await expect(page.getByTestId('back-to-task')).toHaveCount(0);
+  evs = await log(page);
+  save('resume', evs);
+  const ends = evs.filter((e) => e.kind === 'task.end');
+  expect(ends).toHaveLength(2);
+  expect(ends[1].data.startedAt).toBe(ends[0].data.startedAt);
+  await page.waitForTimeout(2500); // event upload
+  const d = await lastSession(studyId);
+  expect(d.taskResults.filter((r) => r.stepId === 'task_find')).toHaveLength(1);
+  expect(String((d.taskResults.find((r) => r.stepId === 'task_find') as { evidence?: string }).evidence ?? '')).toContain('really found');
+  expect(openaiHits.filter((u) => !u.endsWith('/v1/realtime/calls'))).toEqual([]);
+  await context.close();
+});

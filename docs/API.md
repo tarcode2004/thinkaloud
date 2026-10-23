@@ -24,6 +24,8 @@ Row → API object mapping: snake_case columns → camelCase fields; JSON TEXT c
 ## Auth (done) — `server/src/routes/auth.ts`
 - `POST /api/auth/signup {email,password(min 8),name}` → `{user}` (sets `ta_auth` httpOnly cookie)
 - `POST /api/auth/login {email,password}` → `{user}`
+- `GET /api/auth/providers` → `{google: {clientId, oneTap} | null}` (public; `null` when `GOOGLE_CLIENT_ID` is unset)
+- `POST /api/auth/google {credential}` (GIS ID token) → `{token, user, created}`; 201 when a new account was created. 401 bad/expired/wrong-audience token, 403 unverified Google email, 409 email already linked to another Google account, 404 not configured
 - `POST /api/auth/logout` → `{ok}`
 - `GET /api/auth/me` → `{user}` | 401
 
