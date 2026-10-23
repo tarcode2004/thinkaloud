@@ -141,13 +141,3 @@ export function VoiceOrb({ state, micLevel, outLevel, size = 200, className }: P
 function mix(a: number, b: number, t: number) {
   return Math.round(a + (b - a) * t);
 }
-
-export const ORB_LABEL: Record<OrbState, string> = {
-  connecting: 'Connecting…',
-  listening: 'Listening',
-  user: 'Listening',
-  assistant: 'Speaking',
-  thinking: 'Thinking',
-  muted: 'Microphone off',
-  offline: 'On-screen mode',
-};

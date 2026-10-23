@@ -7,6 +7,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import {
   buildBrief,
+  taskNumber,
   buildModeratorInstructions,
   describeScale,
   followUpBudget,
@@ -46,6 +47,16 @@ import type { EyeTracker } from './eyetracking.ts';
 
 export type RunnerMode = 'voice' | 'text' | 'manual';
 export type OrbState = 'connecting' | 'listening' | 'user' | 'assistant' | 'thinking' | 'muted' | 'offline';
+/**
+ * What the participant should know about the conversation right now (shown as text next to the orb).
+ * `heard`: they finished speaking and the moderator is preparing its reply; `slow`: that is taking
+ * unusually long (so they don't repeat themselves); `your_turn`: the moderator is waiting for them.
+ */
+export type VoiceStatus = 'connecting' | 'muted' | 'offline' | 'speaking' | 'listening' | 'heard' | 'thinking' | 'slow' | 'your_turn' | 'idle';
+/** They seem finished and have been quiet this long: the moderator asks "Is that all for this task?". */
+const FINISH_ASK_QUIET_MS = 3500;
+/** After this long without a reply, the status says so. */
+const SLOW_REPLY_MS = 6000;
 export type TaskPhase = 'briefing' | 'active' | 'post';
 export type AppStatus = 'none' | 'loading' | 'ready' | 'crashed' | 'limited';
 /** Quiet-phase classification of a participant utterance. */
@@ -83,11 +94,14 @@ export interface RunnerState {
   mode: RunnerMode;
   conn: RealtimeStatus | 'none';
   orb: OrbState;
+  status: VoiceStatus;
   muted: boolean;
   /** -1 intro, steps.length closing */
   index: number;
   total: number;
   step: Step | null;
+  /** The current step's position among the study's tasks ("Task 2 of 4"). */
+  taskNo: { n: number; total: number } | null;
   taskPhase: TaskPhase | null;
   taskStartedAt: number | null;
   taskDeadline: number | null;
@@ -289,6 +303,10 @@ export class SessionRunner {
   private lastDirectedAt = 0;
   private lastResponseStartAt = 0;
   private lastSpeechStopAt = 0;
+  /** End of the participant's last utterance or typed message (performance.now). */
+  private lastParticipantInput = 0;
+  /** Quiet-phase classifications in flight for an utterance that answers the moderator. */
+  private addressPending = 0;
   private lastAssistantAudioStart = 0;
   private nudgePending = false;
   /** When each realtime input item's speech started (performance.now). */
@@ -307,6 +325,8 @@ export class SessionRunner {
   /** A tell/explain task: the classifier thinks they gave the answer (never ends the task by itself). */
   private delivered: { text: string; at: number } | null = null;
   private finishReminded = false;
+  /** When the moderator asked "Is that all for this task?" (performance.now; 0 = not asked / answered). */
+  private finishAskedAt = 0;
   /** Instruction step without a question: complete_step requested after the script was read. */
   private instructionAdvanceAsked = false;
 
@@ -319,10 +339,12 @@ export class SessionRunner {
       mode,
       conn: mode === 'manual' ? 'none' : 'idle',
       orb: mode === 'manual' ? 'offline' : 'connecting',
+      status: mode === 'manual' ? 'offline' : 'connecting',
       muted: false,
       index: -1,
       total: this.steps.length,
       step: null,
+      taskNo: null,
       taskPhase: null,
       taskStartedAt: null,
       taskDeadline: null,
@@ -441,7 +463,7 @@ export class SessionRunner {
   private toManual(notice: string) {
     this.rt?.close();
     this.rt = null;
-    this.set({ mode: 'manual', conn: 'none', orb: 'offline', notice, pendingAction: null });
+    this.set({ mode: 'manual', conn: 'none', orb: 'offline', status: 'offline', notice, pendingAction: null });
     if (this.step || this.state.index >= 0) this.refreshManualPrompt();
   }
 
@@ -489,6 +511,7 @@ export class SessionRunner {
         onUserSpeechStop: () => {
           this.lastUserSpeech = performance.now();
           this.lastSpeechStopAt = this.lastUserSpeech;
+          this.lastParticipantInput = this.lastUserSpeech;
           this.queue.push('speech.stop', { who: 'participant' });
           this.updateOrb();
         },
@@ -622,7 +645,37 @@ export class SessionRunner {
     else if (rt.userSpeaking) orb = 'user';
     else if (rt.responding) orb = 'thinking';
     else orb = 'listening';
-    if (orb !== this.state.orb) this.set({ orb });
+    const status = this.voiceStatus(orb);
+    if (orb !== this.state.orb || status !== this.state.status) this.set({ orb, status });
+  }
+
+  /** When the current wait for the moderator's reply started (0 = not waiting). */
+  private replyWaitFrom = 0;
+
+  private voiceStatus(orb: OrbState): VoiceStatus {
+    if (orb === 'connecting' || orb === 'muted' || orb === 'offline') return orb;
+    if (orb === 'assistant') return (this.replyWaitFrom = 0), 'speaking';
+    if (orb === 'user') return (this.replyWaitFrom = 0), 'listening';
+    const rt = this.rt!;
+    const now = performance.now();
+    // The participant spoke (or typed) last and the moderator has not answered yet.
+    const spokeLast = this.lastParticipantInput > this.lastAssistantAudio;
+    const t = this.turn;
+    const w = this.wrap;
+    const pending = w
+      ? w.transcriptPending || w.phase === 'judging' || (w.phase === 'listening' && w.heard.length > 0)
+      : this.quiet
+        ? Boolean(this.replyDue) || this.addressPending > 0 || (now < this.awaitingReplyUntil && spokeLast && now - this.lastSpeechStopAt < 10_000)
+        : t.transcriptPending || (t.heard.length > 0 && !t.responded);
+    if ((rt.responding && spokeLast) || (pending && spokeLast)) {
+      if (!this.replyWaitFrom) this.replyWaitFrom = this.lastParticipantInput || now;
+      return now - this.replyWaitFrom >= SLOW_REPLY_MS ? 'slow' : 'heard';
+    }
+    this.replyWaitFrom = 0;
+    if (rt.responding) return 'thinking';
+    // Outside quiet phases the moderator is waiting for them (shown once its turn has settled).
+    if (!this.quiet && !this.state.ended && now - this.lastAssistantAudio > 700) return 'your_turn';
+    return 'idle';
   }
 
   // ── captions / transcripts ─────────────────────────────────────────────────
@@ -658,7 +711,16 @@ export class SessionRunner {
     this.noteUtterance(text, startP, false);
     if (this.wrap) return this.onWrapUtterance(text, false, startP);
     // In quiet phases the moderator responds only when addressed.
-    if (this.quiet && this.rt) return void this.respondIfAddressed(text);
+    if (this.quiet && this.rt) {
+      // Answering something the moderator asked: keep showing "Got it" while the classifier decides.
+      const awaiting = performance.now() < this.awaitingReplyUntil;
+      if (awaiting) this.addressPending++;
+      void this.respondIfAddressed(text).finally(() => {
+        if (awaiting) this.addressPending--;
+        this.updateOrb();
+      });
+      return;
+    }
     this.onTurnUtterance(text, startP, false);
   }
 
@@ -693,12 +755,29 @@ export class SessionRunner {
       this.replyWhenFinished(text, () => rt.requestResponse());
       return;
     }
+    // Reply to "Is that all for this task?": a yes ends the task, a no lets them carry on.
+    const finishReply = Boolean(task) && this.finishAskedAt > 0 && performance.now() - this.finishAskedAt < 60_000;
+    if (finishReply) {
+      this.finishAskedAt = 0;
+      const en = this.isEnglish();
+      const t = text.trim().toLowerCase();
+      const no = en && /^(no|nope|not yet|nah|wait|hold on|one (sec|second|moment)|i('| a)?m not|actually)\b|\b(keep going|not (done|finished)|still)\b/.test(t);
+      const yes = !no && en && /^(yes|yeah|yep|yup|sure|i think so|i guess|correct|right|ok(ay)?,? (that'?s|i'?m)|that'?s (all|it))\b|\b(i('| a)?m (done|finished)|that'?s (all|it))\b/.test(t);
+      if (yes || no) {
+        this.turnChecks.push({ text, addressed: true, label: yes ? 'DONE' : 'ADDRESSED', via: 'finish-check', verdict: null, at: this.queue.now() });
+        if (this.rt !== rt || this.step?.id !== stepId || !this.quiet || this.wrap || this.state.taskPhase === 'post') return;
+        if (yes) return this.startWrapUp('verbal');
+        this.delivered = null;
+        this.replyWhenFinished(text, () => this.directed(en ? `Say exactly this: "Okay, take your time." Nothing else.` : `In ${languageName(this.mod.language)}, say only a short "Okay, take your time." Nothing else.`));
+        return;
+      }
+    }
     const quoted = text.replace(/"/g, "'");
     const prompt = task
-      ? `You are a silent turn-taking classifier for a usability-test moderator — you are NOT talking to anyone. The participant is working on this task (they were told: "${task.instruction.replace(/"/g, "'")}") and thinking aloud. Their most recent utterance (it may be in any language) was transcribed as: "${quoted}".${awaiting ? ' The moderator had just asked them something.' : ''}
+      ? `You are a silent turn-taking classifier for a usability-test moderator — you are NOT talking to anyone. The participant is working on this task (they were told: "${task.instruction.replace(/"/g, "'")}") and thinking aloud. Their most recent utterance (it may be in any language) was transcribed as: "${quoted}".${finishReply ? ' The moderator had just asked whether that is all for this task: a yes in any form ("yes", "that\'s it", "ja") is DONE; a no or "not yet" is ADDRESSED.' : awaiting ? ' The moderator had just asked them something.' : ''}
 Classify it with exactly one label:
 DONE — they say they have finished the task or found what they were looking for ("I'm done", "I think that's it", "found it", "fertig"), in any language.
-DELIVERED — ONLY if the task asks them to tell, explain or describe something to the moderator AND in this utterance they state their final answer to it as an answer to the moderator (e.g. "The main claim is that…", "It costs 89 dollars."). Thinking aloud is NOT DELIVERED: describing what they see, reading text aloud, a plan, a guess about where to look, a half sentence, a question (e.g. "Do I click done?" is ADDRESSED) — when in doubt, answer NO.
+DELIVERED — ONLY if (a) the task asks them to tell, explain or describe something to the moderator AND in this utterance they state their final answer to it as an answer to the moderator (e.g. "The main claim is that…", "It costs 89 dollars."), or (b) they say they have just reached what the task asked for without saying they are finished (e.g. "Okay, it's in the cart now.", "And that's the booking confirmed."). Thinking aloud is NOT DELIVERED: describing what they see, reading text aloud, a plan, a guess about where to look, a half sentence, a question (e.g. "Do I click done?" is ADDRESSED) — when in doubt, answer NO.
 SKIP — they want to skip, stop or give up on the task.
 STUCK — they say they cannot find or do not see something, are lost, or sound frustrated or irritated.
 ADDRESSED — any other question or request to the moderator (including asking what the task was or what the moderator meant), or a reply to something the moderator just asked.
@@ -741,8 +820,8 @@ Reply with exactly one word: YES or NO.`;
       case 'DONE':
         return this.startWrapUp('verbal');
       case 'DELIVERED':
-        // Never ends the task by itself (it may be ongoing narration): the participant ends it with
-        // "done" or the button. If they go quiet after it, they are reminded once how to finish.
+        // Never ends the task by itself (it may be ongoing narration). If they go quiet after it, the
+        // moderator asks once whether that is all; a yes ends the task.
         this.delivered = { text, at: performance.now() };
         return;
       case 'STUCK':
@@ -937,6 +1016,7 @@ Reply with exactly one word: YES or NO.`;
     this.replyDue = null;
     this.delivered = null;
     this.finishReminded = false;
+    this.finishAskedAt = 0;
     this.instructionAdvanceAsked = false;
     // Anything said before this step's first moderator line is not a reply to it.
     this.resetTurn();
@@ -945,6 +1025,7 @@ Reply with exactly one word: YES or NO.`;
     this.set({
       index,
       step,
+      taskNo: step?.type === 'task' ? taskNumber(this.steps, step) : null,
       taskPhase: step?.type === 'task' ? 'briefing' : null,
       taskStartedAt: null,
       taskDeadline: null,
@@ -978,10 +1059,19 @@ Reply with exactly one word: YES or NO.`;
       this.briefDelivered = true;
       return brief;
     }
+    if (mode === 'announce' && this.rt && step?.type === 'task' && !this.isEnglish() && brief.task_number && (this.state.taskNo?.total ?? 0) > 1) {
+      // English briefs say "Task two of four." themselves; other languages get it as a translated transition.
+      ack = `${ack ? `${ack} ` : ''}Task ${brief.task_number}.`;
+    }
     if (mode === 'announce' && this.rt) {
       this.rt.addSystemItem(`${prefix ? `${prefix}\n` : ''}[STEP] ${JSON.stringify(this.withAck(brief, ack))}`);
       // Verbatim text known: dictate this turn (no improvisation, no tool calls, no double reading).
-      if (brief.say_verbatim) this.directed(this.sayWithAck(ack, brief.say_verbatim, 'Say the following text verbatim, completely and only once, and nothing else'));
+      // Other languages: the first task also says once how to finish (English has it in the text).
+      const finishHint =
+        step?.type === 'task' && !this.isEnglish() && this.state.taskNo?.n === 1
+          ? `\nThen add one short sentence in ${languageName(this.mod.language)}: when they are finished they can just say so or press the "I'm done" button.`
+          : '';
+      if (brief.say_verbatim) this.directed(this.sayWithAck(ack, brief.say_verbatim, 'Say the following text verbatim, completely and only once, and nothing else') + finishHint);
       else this.rt.requestResponse();
       this.briefDelivered = true;
     } else this.briefDelivered = true;
@@ -1283,6 +1373,8 @@ Reply with exactly one word: YES or NO.`;
 
   /** Runs every 200 ms: replies that are due, the finish reminder, and the answer window. */
   private checkTurn() {
+    // Time-based status changes ("Still thinking", "Your turn") need a re-check even without events.
+    if (!this.disposed) this.updateOrb();
     const rt = this.rt;
     if (!rt || this.state.mode !== 'voice' || this.disposed || this.finishing || this.state.ended) return;
     const now = performance.now();
@@ -1300,7 +1392,7 @@ Reply with exactly one word: YES or NO.`;
     // A tell/explain task: they seem to have given their answer and gone quiet → remind them once how to finish.
     if (this.quiet && this.delivered && !this.finishReminded && !this.wrap && s?.type === 'task' && this.state.taskPhase === 'active') {
       const lastActivity = Math.max(this.lastUserSpeech, this.lastInteraction, this.lastAssistantAudio, this.delivered.at);
-      if (!this.participantTalking() && !rt.assistantAudioPlaying && !rt.responding && now - lastActivity >= 6000) this.remindFinish();
+      if (!this.participantTalking() && !rt.assistantAudioPlaying && !rt.responding && now - lastActivity >= FINISH_ASK_QUIET_MS) this.askIfFinished();
       return;
     }
     if (this.quiet || this.wrap || this.state.index >= this.steps.length) return;
@@ -1395,15 +1487,20 @@ Reply with exactly one word: YES or NO.`;
     else rt.requestResponse();
   }
 
-  /** Tell/explain task: they seem to have given their answer and gone quiet. Remind them how to finish (once). */
-  private remindFinish() {
+  /**
+   * They seem to have finished (gave what a tell/explain task asked for, or said they reached the
+   * goal) and went quiet: ask once whether that is all. A yes ends the task (wrap-up, "Back to task"
+   * still works); anything else lets them carry on. Neutral wording: never implies success.
+   */
+  private askIfFinished() {
     this.finishReminded = true;
+    this.finishAskedAt = performance.now();
     this.lastTrigger = performance.now();
-    this.queue.push('observation', { kind: 'finish_reminder', note: this.delivered?.text.slice(0, 200) });
+    this.queue.push('observation', { kind: 'finish_check', note: this.delivered?.text.slice(0, 200) });
     this.directed(
       this.isEnglish()
-        ? `Say exactly this, kindly and neutrally: "If you're finished, just say 'done' or press 'I'm done'." Nothing else — never comment on what they said.`
-        : `In ${languageName(this.mod.language)}, say once, briefly and kindly, that when they are finished they can just say so or press the I'm-done button. Nothing else — never comment on what they said.`,
+        ? `Say exactly this, kindly and neutrally: "Is that all for this task, or would you like to keep going?" Nothing else — never comment on what they said.`
+        : `In ${languageName(this.mod.language)}, ask once, briefly and kindly, whether that is all for this task or whether they would like to keep going. Nothing else — never comment on what they said.`,
     );
   }
 
@@ -1968,6 +2065,7 @@ Reply with exactly one word: YES or NO.`;
     }
     if (!this.rt) return;
     this.rt.addUserText(t);
+    this.lastParticipantInput = performance.now();
     this.noteUtterance(t, performance.now(), true);
     // Typed answer to "How do you feel that went?": the wrap-up decides when to move on.
     if (this.wrap) return this.onWrapUtterance(t, true);

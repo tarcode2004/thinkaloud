@@ -341,7 +341,7 @@ test('M1 · captions follow the voice; "I\'m done" asks at once even while a cla
   await context.close();
 });
 
-test('M2 · a tell-me answer never ends the task by itself (reminder, then "done"); stuck twice → one skip reminder; after a skip every question has a card and "I don\'t know" / "I\'m not sure" are accepted; noise is ignored', async () => {
+test('M2 · a tell-me answer never ends the task by itself ("Is that all for this task?", then a yes ends it); stuck twice → one skip reminder; after a skip every question has a card and "I don\'t know" / "I\'m not sure" are accepted; noise is ignored', async () => {
   const steps = [
     task({ id: 'task_price', title: 'Price', instruction: 'Open the Aurora desk lamp and tell me what it costs.' }),
     task({
@@ -367,18 +367,19 @@ test('M2 · a tell-me answer never ends the task by itself (reminder, then "done
   await waitIdle(page);
 
   // (a) What sounds like the requested answer never ends the task by itself (it may be ongoing
-  // narration): after a quiet moment they are reminded once how to finish; their "done" ends it.
+  // narration): after a quiet moment the moderator asks once whether that is all; a "no" lets them
+  // carry on, and a later yes ends it.
   await setRules(page, [['costs', 'DELIVERED'], ['^done', 'DONE'], ["don't see|can't find", 'STUCK']]);
   const said = (await log(page)).at(-1)!.t;
   await says(page, 'Okay, here it is. The Aurora desk lamp costs eighty-nine dollars.');
-  const remind = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > said && /if you're finished/i.test(String(e.data.text)), 20_000, 'finish reminder');
+  const remind = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > said && /is that all for this task/i.test(String(e.data.text)), 20_000, 'is that all');
   let evs = await log(page);
   expect(evs.some((e) => e.kind === 'task.end' && e.stepId === 'task_price')).toBe(false);
-  expect(remind.t - said).toBeGreaterThan(6000);
+  expect(remind.t - said).toBeGreaterThan(3000);
   const checks = await page.evaluate(() => (window as unknown as { __taRunner: { turnChecks: { label: string }[] } }).__taRunner.turnChecks);
   expect(checks.map((c) => c.label)).toContain('DELIVERED');
   await waitIdle(page);
-  await says(page, 'Done.');
+  await says(page, 'Yes, that is all.');
   await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_price' && /how do you feel/i.test(String(e.data.text)), 15_000, 'how did it go');
   await waitIdle(page);
   await says(page, 'It was easy, the price was right on the page.');
@@ -504,6 +505,57 @@ test('M3 · "Back to task" after an accidental "I\'m done": during "How do you f
   const d = await lastSession(studyId);
   expect(d.taskResults.filter((r) => r.stepId === 'task_find')).toHaveLength(1);
   expect(String((d.taskResults.find((r) => r.stepId === 'task_find') as { evidence?: string }).evidence ?? '')).toContain('really found');
+  expect(openaiHits.filter((u) => !u.endsWith('/v1/realtime/calls'))).toEqual([]);
+  await context.close();
+});
+
+test('M4 · status: "Listening" while they talk, "Got it" right after they stop, "Still thinking" when the reply is slow, "Your turn" when the moderator waits; tasks are announced ("Task one of two." + how to finish, then "Task two of two.") with a banner', async () => {
+  const steps = [
+    task({ id: 'task_a', title: 'Lamp', instruction: 'Find the Aurora desk lamp.' }),
+    task({ id: 'task_b', title: 'Posters', instruction: 'Have a look at the poster section.' }),
+  ];
+  const { token } = await createStudy('Mock status', protocol(steps));
+  const { context, page, openaiHits } = await newPage();
+  await start(page, token);
+  const session = page.getByTestId('session');
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator', 30_000, 'intro');
+  await waitIdle(page);
+  await expect(session).toHaveAttribute('data-status', 'your_turn', { timeout: 5000 });
+  await expect(page.getByTestId('orb-label')).toContainText('Your turn');
+
+  // A slow reply: acknowledged at once, then "no need to repeat".
+  await setRules(page, [], { responseDelayMs: 7500 });
+  const talking = says(page, "Yes, I'm ready.", 1500);
+  await expect(session).toHaveAttribute('data-status', 'listening', { timeout: 1500 });
+  await talking;
+  const stoppedAt = Date.now();
+  await expect(session).toHaveAttribute('data-status', 'heard', { timeout: 500 });
+  await expect(page.getByTestId('orb-label')).toContainText('Got it');
+  await expect(session).toHaveAttribute('data-status', 'slow', { timeout: 9000 });
+  expect(Date.now() - stoppedAt).toBeGreaterThan(5000);
+  await expect(page.getByTestId('orb-label').first()).toContainText('no need to repeat');
+  await page.screenshot({ path: path.join(OUT, 'mock-status-slow.png') });
+  await setRules(page, [], { responseDelayMs: 250 });
+
+  // Task one of two: banner + spoken number + how to finish (first task only).
+  await expect(session).toHaveAttribute('data-step', 'task_a', { timeout: 20_000 });
+  await expect(page.getByTestId('task-banner')).toContainText('Task 1 of 2');
+  await page.screenshot({ path: path.join(OUT, 'mock-task-banner.png') });
+  const a = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_a' && /task one of two/i.test(String(e.data.text)), 15_000, 'task one of two');
+  expect(String(a.data.text)).toMatch(/just tell me, or press I'm done/);
+  await expect(page.getByTestId('step-label')).toContainText('Task 1 of 2');
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 20_000 });
+  await waitIdle(page);
+  // During the task the dock shows the status too (quiet phase: just "Listening").
+  await expect(page.getByTestId('dock-orb')).toContainText('Listening');
+  await page.screenshot({ path: path.join(OUT, 'mock-task-dock.png') });
+
+  await page.getByTestId('skip-task').click();
+  await expect(session).toHaveAttribute('data-step', 'task_b', { timeout: 20_000 });
+  await expect(page.getByTestId('task-banner')).toContainText('Task 2 of 2');
+  const b = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_b' && /task two of two/i.test(String(e.data.text)), 15_000, 'task two of two');
+  expect(String(b.data.text)).not.toMatch(/just tell me/);
+  save('status', await log(page));
   expect(openaiHits.filter((u) => !u.endsWith('/v1/realtime/calls'))).toEqual([]);
   await context.close();
 });

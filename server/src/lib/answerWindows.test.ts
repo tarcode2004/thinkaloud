@@ -143,7 +143,7 @@ test('a tell/explain task is only ended by an explicit "done"; "Do I click done?
   assert.match(text, /Silence is not an answer/);
   const b = buildBrief({ protocol: p, steps: [{ ...lampTask, instruction: 'Tell me when you have found something.' } as TaskStep], index: 0, taskPhase: 'active', remainingFollowUps: 1 });
   assert.match(b.your_job, /never call it yourself/);
-  assert.match(b.your_job, /do not end the task — wait for their "done"/);
+  assert.match(b.your_job, /do not end the task yourself — when they seem finished the system has you ask whether that is all/);
 });
 
 test('captions: a response cancelled before it was audible is never logged as said', () => {

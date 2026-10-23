@@ -290,7 +290,7 @@ Speak ${lang} only. Keep your turns short: one or two sentences besides the verb
 6. ${probingRules(mod)}
 7. ${styleRules(mod)}
 8. During an ACTIVE TASK: do not interrupt and do not talk while the participant is working or speaking. Speak only when (a) they address you directly, (b) a [TRIGGER] asks you to, or (c) they say they are done or want to give up. Then use ONE short sentence. Researcher probes are asked only AFTER the task, never during it.
-9. Ending a task: when the participant says or signals that they are done ("I'm done", "I found it", "I think that's it" — in any language), the system asks them how it went, waits until they have finished answering and then tells you to call set_task_outcome. Never call set_task_outcome on your own, while they are still talking or mid-sentence, and never say "Thanks" before they have actually answered. A task that asks them to TELL or EXPLAIN something to you ("tell me…", "explain…") is NOT over just because they said something that sounds like the answer: they may still be thinking aloud. Stay quiet; the task ends when they say they are done or press "I'm done" (the system may remind them how to finish). If they ask how to finish ("Do I click done?"), answer plainly: "Yes — when you're finished, press 'I'm done', or just tell me." Never tell them the outcome.
+9. Ending a task: when the participant says or signals that they are done ("I'm done", "I found it", "I think that's it" — in any language), the system asks them how it went, waits until they have finished answering and then tells you to call set_task_outcome. Never call set_task_outcome on your own, while they are still talking or mid-sentence, and never say "Thanks" before they have actually answered. A task that asks them to TELL or EXPLAIN something to you ("tell me…", "explain…") is NOT over just because they said something that sounds like the answer: they may still be thinking aloud. Stay quiet; the task ends when they say they are done or press "I'm done" (when they seem finished and go quiet, the system has you ask once whether that is all for this task; their yes ends it). If they ask how to finish ("Do I click done?"), answer plainly: "Yes — when you're finished, press 'I'm done', or just tell me." Never tell them the outcome.
 10. When the participant wants to skip or give up: say neutrally that this is completely fine, then call participant_requests_skip.
 11. Wait until the participant has completely finished answering (people pause mid-answer to think) — the system tells you when they have finished; never record an answer or move on while they are still talking or in a thinking pause, and never record anything they said BEFORE you asked the question (e.g. thinking aloud during the task). Silence is not an answer. Record every answer to a question that has a question_id with record_answer: ratings and numbers as value, choices as exact option labels, open answers as faithful concise text in the participant's own words. Never invent or embellish an answer. If a rating answer is vague ("somewhere in the middle"), ask them to pick a number from the scale. "I don't know", "not sure" or "I didn't see that" is a valid answer to ANY question (ratings and yes/no included): record it with declined: true and their words, and move on. Never ask the same question more than twice — after the second time, record whatever they said. If they answer on screen, the system tells you — do not ask again.
 12. Do not chit-chat or talk about unrelated topics. If they ask about the study's purpose, say you can share more at the end of the session. Never invent facts about the product.
@@ -478,27 +478,44 @@ export function buildBrief(ctx: BriefContext): ModeratorBrief {
   }
 }
 
+/** 1-based position of `step` among the study's tasks. */
+export function taskNumber(steps: Step[], step: Step): { n: number; total: number } | null {
+  const tasks = steps.filter((s) => s.type === 'task');
+  const i = tasks.findIndex((s) => s.id === step.id);
+  return i < 0 ? null : { n: i + 1, total: tasks.length };
+}
+
+const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty'];
+const numberWord = (n: number) => NUMBER_WORDS[n] ?? String(n);
+
 function taskBrief(ctx: BriefContext, step: TaskStep): ModeratorBrief {
   const mod = ctx.protocol.moderation;
   const hidden: Record<string, unknown> = { success_criteria: step.successCriteria || '(not specified)' };
   const phase = ctx.taskPhase ?? 'briefing';
   if (phase === 'briefing' || phase === 'active') {
     const retro = mod.style === 'think_aloud_retrospective';
+    const no = taskNumber(ctx.steps, step);
+    const english = (mod.language ?? 'en').toLowerCase().startsWith('en');
+    // The task is announced by number ("Task two of four.") so a new task never starts unnoticed.
+    const announce = no && no.total > 1 && english ? `Task ${numberWord(no.n)} of ${numberWord(no.total)}. ` : '';
+    // Before the first task, once: how to finish (otherwise people wait for the moderator to end it).
+    const howToFinish = no?.n === 1 && english ? " When you're finished, just tell me, or press I'm done." : '';
     return {
       ok: true,
       step: stepHeader(ctx, phase),
-      ...(phase === 'briefing' ? { say_verbatim: step.instruction } : { task_text: step.instruction }),
+      ...(no ? { task_number: `${no.n} of ${no.total}` } : {}),
+      ...(phase === 'briefing' ? { say_verbatim: `${announce}${step.instruction}${howToFinish}` } : { task_text: step.instruction }),
       ...(ctx.taskElapsedSec != null ? { elapsed_seconds: Math.round(ctx.taskElapsedSec) } : {}),
       ...(ctx.taskTimeLeftSec != null ? { time_left_seconds: Math.round(ctx.taskTimeLeftSec) } : {}),
       app_visible: Boolean(ctx.appVisible),
       your_job:
         (phase === 'briefing'
-          ? 'Read the task verbatim. Then stop talking and let the participant work. '
+          ? `Read the task verbatim.${no && no.total > 1 && !english ? ` First say which task this is (task_number, e.g. "task ${no.n} of ${no.total}") in the session language.` : ''}${no?.n === 1 && !english ? ' After the task text, add one short sentence in the session language: when they are finished they can just say so or press "I\'m done".' : ''} Then stop talking and let the participant work. `
           : 'The task is in progress. Do not re-read the task unless the participant asks to hear it again (then read task_text verbatim). ') +
         (retro
           ? 'They work silently; do not nudge them to talk. '
           : 'Stay quiet while they work and think aloud. ') +
-        `Do NOT call complete_step during the task. The task ends when: the system sends an [EVENT] that it ended; or the participant says they are done or presses "I'm done" (the system then asks how it went and tells you when to call set_task_outcome — never call it yourself); or they want to give up (call participant_requests_skip). Even if the task asks them to tell you something and they seem to have said it, do not end the task — wait for their "done". If they ask what the task was or what something you said means, answer plainly (re-read task_text verbatim). If they ask how to finish ("Do I click done?"), answer plainly that they can press "I'm done" or just tell you. Never give hints or confirm progress.`,
+        `Do NOT call complete_step during the task. The task ends when: the system sends an [EVENT] that it ended; or the participant says they are done or presses "I'm done" (the system then asks how it went and tells you when to call set_task_outcome — never call it yourself); or they want to give up (call participant_requests_skip). Even if the task asks them to tell you something and they seem to have said it, do not end the task yourself — when they seem finished the system has you ask whether that is all for this task, and their yes ends it. If they ask what the task was or what something you said means, answer plainly (re-read task_text verbatim). If they ask how to finish ("Do I click done?"), answer plainly that they can press "I'm done" or just tell you. Never give hints or confirm progress.`,
       hidden_researcher_notes: hidden,
     };
   }

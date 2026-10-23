@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { ArrowUp, ChevronDown, ChevronUp, Keyboard, Mic, MicOff, RotateCw, X } from 'lucide-react';
 import type { Question, TaskStep } from '@thinkaloud/shared';
 import { Button, cn, Modal } from '../ui/index.tsx';
-import { ORB_LABEL, VoiceOrb } from './VoiceOrb.tsx';
+import { VoiceOrb } from './VoiceOrb.tsx';
+import { STATUS_LABEL, StatusLabel } from './VoiceStatus.tsx';
 import { QuestionCard, QuestionnaireCard } from './QuestionCards.tsx';
 import type { SessionRunner } from './runner.ts';
 import { isReadingOf } from './rules.ts';
@@ -30,7 +31,8 @@ export function SessionView({ runner, title, preview, onWithdraw }: { runner: Se
   const mic = () => runner.micMeter?.read() ?? 0;
   const out = () => runner.remoteMeter?.read() ?? 0;
   const progress = s.total ? Math.min(1, Math.max(0, s.index) / s.total) : 0;
-  const stepLabel = s.index < 0 ? 'Introduction' : s.index >= s.total ? 'Wrapping up' : `Step ${s.index + 1} of ${s.total}`;
+  const taskLabel = s.taskNo && s.taskNo.total > 1 ? `Task ${s.taskNo.n} of ${s.taskNo.total}` : s.taskNo ? 'Task' : null;
+  const stepLabel = s.index < 0 ? 'Introduction' : s.index >= s.total ? 'Wrapping up' : taskLabel && s.taskNo!.total > 1 ? taskLabel : `Step ${s.index + 1} of ${s.total}`;
   const moderatorCaps = s.captions.filter((c) => c.role === 'moderator');
   const lastMod = moderatorCaps[moderatorCaps.length - 1];
   const prevMod = moderatorCaps[moderatorCaps.length - 2];
@@ -42,7 +44,7 @@ export function SessionView({ runner, title, preview, onWithdraw }: { runner: Se
   const onAnswer = (q: Question, a: Parameters<SessionRunner['answerFromScreen']>[2]) => s.card && runner.answerFromScreen(s.card.stepId, q, a);
 
   return (
-    <div className="fixed inset-0 flex flex-col bg-canvas text-label" data-testid="session" data-step={s.step?.id ?? (s.index < 0 ? 'intro' : 'closing')} data-task-phase={s.taskPhase ?? ''} data-app-visible={app ? '1' : '0'} data-orb={s.orb} data-mode={s.mode}>
+    <div className="fixed inset-0 flex flex-col bg-canvas text-label" data-testid="session" data-step={s.step?.id ?? (s.index < 0 ? 'intro' : 'closing')} data-task-phase={s.taskPhase ?? ''} data-app-visible={app ? '1' : '0'} data-orb={s.orb} data-status={s.status} data-mode={s.mode}>
       {preview && (
         <div className="flex h-7 shrink-0 items-center justify-center gap-2 bg-label text-[12px] font-medium text-white/90" data-testid="preview-banner">
           <span className="size-1.5 rounded-full bg-sys-orange" /> Preview — data excluded from results
@@ -118,17 +120,15 @@ export function SessionView({ runner, title, preview, onWithdraw }: { runner: Se
             {voice && !s.card && (
               <div className="flex flex-col items-center [animation:ta-fade_.4s_ease]">
                 <VoiceOrb state={s.orb} micLevel={mic} outLevel={out} size={176} />
-                <div className="mt-7 h-5 text-[13px] font-medium text-tertiary" data-testid="orb-label">
-                  {ORB_LABEL[s.orb]}
+                <div className="mt-7 flex h-5 items-center">
+                  <StatusLabel status={s.status} live={!app} className="text-[13px]" />
                 </div>
               </div>
             )}
             {voice && s.card && (
               <div className="mb-6 flex items-center gap-3 [animation:ta-fade_.4s_ease]">
                 <VoiceOrb state={s.orb} micLevel={mic} outLevel={out} size={40} />
-                <span className="text-[13px] font-medium text-tertiary" data-testid="orb-label">
-                  {ORB_LABEL[s.orb]}
-                </span>
+                <StatusLabel status={s.status} live={!app} className="text-[13px]" />
               </div>
             )}
 
@@ -210,6 +210,16 @@ export function SessionView({ runner, title, preview, onWithdraw }: { runner: Se
             </div>
           )}
         </div>
+
+        {/* A new task starts: say which one, over the app (the moderator announces it too). */}
+        {task && s.taskPhase === 'briefing' && taskLabel && (
+          <div key={task.id} className="pointer-events-none absolute inset-x-0 top-4 z-30 flex justify-center px-4 [animation:ta-toast_4.2s_cubic-bezier(.32,.72,0,1)_forwards]" data-testid="task-banner">
+            <div className="flex max-w-[min(92vw,520px)] items-baseline gap-2.5 rounded-full bg-surface px-5 py-2.5 shadow-[0_1px_2px_rgba(0,0,0,.06),0_8px_28px_rgba(0,0,0,.12)]">
+              <span className="shrink-0 text-[13px] font-semibold tabular-nums text-label">{taskLabel}</span>
+              {task.title && <span className="truncate text-[13px] text-secondary">{task.title}</span>}
+            </div>
+          </div>
+        )}
 
         {/* Dock (app mode) */}
         {(app || (s.step?.type === 'task' && s.taskPhase !== 'post')) && (
@@ -306,7 +316,7 @@ function TaskDock({ runner, task, instruction, caption, allowText, typingDefault
         {open && instruction && (
           <div className="border-b border-separator px-5 pb-3 pt-4 [animation:ta-fade_.25s_ease]" data-testid="task-text">
             <div className="mb-1 flex items-center justify-between text-[12px] text-tertiary">
-              <span>{task ? task.title : 'Instructions'}</span>
+              <span>{task ? [s.taskNo && s.taskNo.total > 1 ? `Task ${s.taskNo.n} of ${s.taskNo.total}` : null, task.title].filter(Boolean).join(' · ') : 'Instructions'}</span>
               {inTask && s.taskStartedAt && <span className="tabular-nums">{left != null ? `${fmt(left)} left` : fmt(elapsed)}</span>}
             </div>
             <p className="text-[15px] leading-relaxed text-label">{instruction}</p>
@@ -319,8 +329,11 @@ function TaskDock({ runner, task, instruction, caption, allowText, typingDefault
         )}
         <div className="flex items-center gap-2 px-2.5 py-2">
           {voice && (
-            <div className="flex size-10 shrink-0 items-center justify-center" title={ORB_LABEL[s.orb]} data-testid="dock-orb">
-              <VoiceOrb state={s.orb} micLevel={mic} outLevel={out} size={28} />
+            <div className="flex shrink-0 items-center gap-1.5 pr-1" title={STATUS_LABEL[s.status]} data-testid="dock-orb">
+              <span className="flex size-10 items-center justify-center">
+                <VoiceOrb state={s.orb} micLevel={mic} outLevel={out} size={28} />
+              </span>
+              <StatusLabel status={s.status} compact live={s.appVisible} className="max-w-[9.5rem] text-[12px]" />
             </div>
           )}
           <button onClick={() => setOpen((o) => !o)} className="flex min-w-0 flex-1 items-center gap-1.5 rounded-full px-2 py-1.5 text-left text-[13px] text-secondary hover:bg-black/5" data-testid="toggle-task">

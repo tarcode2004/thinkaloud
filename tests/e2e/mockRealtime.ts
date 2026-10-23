@@ -10,6 +10,7 @@
 //   userSays(text, ms?)          participant speech: speech_started → (ms) → speech_stopped → transcript
 //   config.rules                 [regex, label][] for out-of-band classifications (default "NO")
 //   config.oobDelayMs            how long a classification stays "in progress" on the server
+//   config.responseDelayMs       how long the model takes to start a reply (default 250)
 //   config.oobBlocksResponses    reject in-band response.create while a classification runs
 //                                (conversation_already_has_active_response), like the real API did
 //   sent                         every client event (for assertions)
@@ -24,6 +25,8 @@ export const MOCK_REALTIME = () => {
     rules: [] as [string, string][],
     oobDelayMs: 300,
     oobBlocksResponses: true,
+    /** How long the mock model takes before it answers a response.create. */
+    responseDelayMs: 250,
   };
   const st = {
     dc: null as null | { onmessage: ((m: { data: string }) => void) | null; onopen: (() => void) | null; onclose: (() => void) | null; readyState: string },
@@ -100,7 +103,7 @@ export const MOCK_REALTIME = () => {
     return speak(rid, 'Mm-hm.');
   }
 
-  function onCreate(ev: Ev, delayMs = 250) {
+  function onCreate(ev: Ev, delayMs = config.responseDelayMs) {
     const r = (ev.response ?? {}) as { conversation?: string; metadata?: Record<string, string>; instructions?: string; tool_choice?: unknown };
     if (r.conversation === 'none') {
       const rid = id('resp_oob');

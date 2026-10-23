@@ -51,6 +51,10 @@ body { @apply bg-canvas text-label antialiased; font-feature-settings: 'ss01', '
 @keyframes ta-pulse { 0%,100% { transform: scale(1); opacity: .9 } 50% { transform: scale(1.08); opacity: 1 } }
 
 @keyframes ta-fade { from { opacity: 0 } to { opacity: 1 } }
+/* Voice status: "thinking" dots and the speaking level bars. */
+@keyframes ta-dot { 0%,80%,100% { opacity: .25; transform: translateY(0) } 40% { opacity: 1; transform: translateY(-2px) } }
+@keyframes ta-bar { 0%,100% { transform: scaleY(.35) } 50% { transform: scaleY(1) } }
+@keyframes ta-toast { 0% { opacity: 0; transform: translateY(-6px) scale(.98) } 8%,88% { opacity: 1; transform: none } 100% { opacity: 0; transform: translateY(-4px) } }
 @keyframes ta-sheet { from { opacity: 0; transform: translateY(8px) scale(.98) } to { opacity: 1; transform: none } }
 
 /* Long-form documents participants read (consent forms): readable measure, calm rhythm. */
