@@ -30,6 +30,9 @@ const CORS = [WEB_URL, WEB_URL.replace(/\.web\.app$/, '.firebaseapp.com'), ...(e
   .filter(Boolean);
 const API_METRICS = env.API_METRICS || '127.0.0.1:20251';
 const APPS_METRICS = env.APPS_METRICS || '127.0.0.1:20252';
+// Optional third tunnel for a self-hosted OpenRealtime server (thinkaloud-tunnel-realtime.service).
+const REALTIME = env.SYNC_REALTIME === '1';
+const RT_METRICS = env.RT_METRICS || '127.0.0.1:20253';
 const ROUTING = env.APP_HOST_ROUTING || (env.APPS_URL ? 'subdomain' : 'path'); // quick tunnels have no wildcard DNS
 const SERVER_URL = env.SERVER_URL || `http://127.0.0.1:${env.PORT || 4000}`;
 const SERVER_UNIT = env.SERVER_UNIT || 'thinkaloud.service';
@@ -77,15 +80,18 @@ let pendingSince = 0;
 async function pass() {
   const api = await tunnelUrl(env.API_URL, API_METRICS);
   const apps = await tunnelUrl(env.APPS_URL, APPS_METRICS);
-  if (!api || !apps) {
-    log(`waiting for tunnels (api=${api || '–'}, apps=${apps || '–'})`);
+  const rt = REALTIME ? await tunnelUrl(env.REALTIME_URL, RT_METRICS) : null;
+  if (!api || !apps || (REALTIME && !rt)) {
+    log(`waiting for tunnels (api=${api || '–'}, apps=${apps || '–'}${REALTIME ? `, realtime=${rt || '–'}` : ''})`);
     return false;
   }
+  const rtPublic = rt ? `${rt}/v1` : null;
 
   // 1. Server env.
   const runtimeEnv =
     `# Written by scripts/deploy/tunnel-sync.mjs. Do not edit: it is rewritten whenever a tunnel URL changes.\n` +
     `PUBLIC_URL=${WEB_URL}\nAPP_HOST_URL=${apps}\nAPP_HOST_ROUTING=${ROUTING}\nCORS_ORIGINS=${CORS.join(',')}\n` +
+    (rtPublic ? `REALTIME_PUBLIC_URL=${rtPublic}\n` : '') +
     `# Informational (not read by the server): the API's current public URL.\nAPI_PUBLIC_URL=${api}\n`;
   const current = fs.existsSync(ENV_FILE) ? fs.readFileSync(ENV_FILE, 'utf8') : '';
   if (current !== runtimeEnv) {
@@ -101,9 +107,9 @@ async function pass() {
     log('server not answering yet');
     return false;
   }
-  if (health.appHostUrl !== apps) {
+  if (health.appHostUrl !== apps || (rtPublic && health.realtimeUrl !== rtPublic)) {
     if (Date.now() - state.lastRestart < 30_000) return false; // just restarted; give it time
-    log(`server runs APP_HOST_URL=${health.appHostUrl}; restarting ${SERVER_UNIT} for ${apps}`);
+    log(`server runs APP_HOST_URL=${health.appHostUrl} realtime=${health.realtimeUrl}; restarting ${SERVER_UNIT}`);
     state.lastRestart = Date.now();
     writeAtomic(STATE_FILE, JSON.stringify(state, null, 2));
     try {

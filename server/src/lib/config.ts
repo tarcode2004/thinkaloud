@@ -22,6 +22,8 @@ export const config = {
   /** Base the participant's browser uses for the SDP exchange (defaults to realtimeBaseUrl). */
   realtimePublicUrl: (env.REALTIME_PUBLIC_URL || env.REALTIME_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
   realtimeKey: env.REALTIME_API_KEY || env.OPENAI_API_KEY || '',
+  /** ICE servers for the participant's WebRTC connection to a self-hosted realtime server (comma list of stun:/turn: URLs). */
+  realtimeIceServers: (env.REALTIME_ICE_SERVERS || '').split(',').map((s) => s.trim()).filter(Boolean),
   realtimeVoice: env.OPENAI_REALTIME_VOICE || 'marin',
   realtimeEffort: env.OPENAI_REALTIME_REASONING_EFFORT || 'low',
   transcribeModel: env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',

@@ -632,6 +632,8 @@ export interface RealtimeTokenResponse {
   transcription?: { model: string; language: string; prompt?: string };
   /** Where the browser posts its SDP offer (OpenAI or a self-hosted OpenRealtime server). */
   callsUrl?: string;
+  /** ICE servers for the RTCPeerConnection (self-hosted realtime servers behind NAT). */
+  iceServers?: { urls: string | string[]; username?: string; credential?: string }[];
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

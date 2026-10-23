@@ -33,7 +33,7 @@ export function createApp() {
   app.use('/api/p', express.json({ type: 'text/plain', limit: '25mb' }));
   app.use(loadUser);
 
-  app.get('/api/health', (_req, res) => res.json({ ok: true, appHostUrl: config.appHostUrl, ai: Boolean(config.openaiKey) }));
+  app.get('/api/health', (_req, res) => res.json({ ok: true, appHostUrl: config.appHostUrl, realtimeUrl: config.realtimePublicUrl, ai: Boolean(config.openaiKey) }));
   app.use('/api', sameOriginGuard);
   app.use(['/api/auth/login', '/api/auth/signup'], rateLimit({ windowMs: 10 * 60_000, max: Number(process.env.AUTH_RATE_LIMIT || (config.isProd ? 30 : 1000)) }));
   app.use('/api/auth', authRouter);

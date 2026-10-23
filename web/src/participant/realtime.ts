@@ -121,7 +121,7 @@ export class RealtimeClient {
     this.model = token.model;
     this.voice = token.voice;
     this.transcription = token.transcription ?? null;
-    const pc = new RTCPeerConnection();
+    const pc = new RTCPeerConnection(token.iceServers?.length ? { iceServers: token.iceServers } : undefined);
     this.pc = pc;
     pc.ontrack = (e) => {
       const stream = e.streams[0] ?? new MediaStream([e.track]);

@@ -1,0 +1,16 @@
+[Unit]
+Description=ThinkAloud Cloudflare quick tunnel (OpenRealtime → 127.0.0.1:8787)
+Documentation=file://@REPO@/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Carries token minting and the WebRTC SDP exchange (HTTP). Voice media itself is UDP (ICE/STUN), not tunnelled.
+ExecStart=@CLOUDFLARED@ tunnel --no-autoupdate --metrics 127.0.0.1:20253 --url http://127.0.0.1:8787
+Restart=always
+RestartSec=5
+SyslogIdentifier=thinkaloud-tunnel-realtime
+
+[Install]
+WantedBy=default.target

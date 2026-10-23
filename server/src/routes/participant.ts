@@ -527,6 +527,7 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
     voice,
     transcription,
     callsUrl: `${config.realtimePublicUrl}/realtime/calls`,
+    ...(config.realtimeIceServers.length ? { iceServers: config.realtimeIceServers.map((urls) => ({ urls })) } : {}),
   };
   markVoiceStarted(sessionId);
   res.json(out);
