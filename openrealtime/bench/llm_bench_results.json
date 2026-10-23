@@ -1,0 +1,1012 @@
+{
+ "when": "2026-10-22 23:24",
+ "per_provider": {
+  "parasail": {
+   "ttft_p50": 445,
+   "ttft_p90": 632,
+   "errors": 6,
+   "tp": 3,
+   "fp": 0,
+   "fn": 2,
+   "tn": 5,
+   "precision": 1.0,
+   "recall": 0.6,
+   "accuracy": 0.8,
+   "text_with_call": 3,
+   "rows": [
+    {
+     "utt": "Where is the search box?",
+     "text": "Just look around the screen — you’re doing great, keep exploring and talk through what you see.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 417.9,
+     "provider": "Parasail",
+     "attempts": [
+      {
+       "provider": "parasail",
+       "result": "won",
+       "ttft_ms": 418
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1009,
+     "cost": 8.61e-05
+    },
+    {
+     "utt": "Okay, I found it and searched for running shoes. I'm done with this task.",
+     "text": "Great, thanks for completing that! Let me move us to the next task.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"completed\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 455.9,
+     "provider": "Parasail",
+     "attempts": [
+      {
+       "provider": "parasail",
+       "result": "won",
+       "ttft_ms": 456
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1372,
+     "cost": 9.87e-05
+    },
+    {
+     "utt": "Hmm, this menu is confusing, I don't know what to click.",
+     "text": "",
+     "calls": [],
+     "error": "ProviderError: HTTP 429: Provider returned error: deepseek/deepseek-v4-flash is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations",
+     "ttft_ms": null,
+     "provider": null,
+     "attempts": null,
+     "leaks": null,
+     "repaired": null,
+     "total_ms": 118,
+     "cost": null
+    },
+    {
+     "utt": "Can we move on to the next task please?",
+     "text": "Sure, no problem! Let's move on.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"asked_to_skip\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 707.9,
+     "provider": "Parasail",
+     "attempts": [
+      {
+       "provider": "parasail",
+       "result": "won",
+       "ttft_ms": 708
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1583,
+     "cost": 9.674e-05
+    },
+    {
+     "utt": "I think I'm done... wait, no, let me check the filters first.",
+     "text": "",
+     "calls": [],
+     "error": "ProviderError: HTTP 429: Provider returned error: deepseek/deepseek-v4-flash is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations",
+     "ttft_ms": null,
+     "provider": null,
+     "attempts": null,
+     "leaks": null,
+     "repaired": null,
+     "total_ms": 140,
+     "cost": null
+    },
+    {
+     "utt": "Alright, that's finished. What's next?",
+     "text": "",
+     "calls": [],
+     "error": "ProviderError: HTTP 429: Provider returned error: deepseek/deepseek-v4-flash is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations",
+     "ttft_ms": null,
+     "provider": null,
+     "attempts": null,
+     "leaks": null,
+     "repaired": null,
+     "total_ms": 132,
+     "cost": null
+    },
+    {
+     "utt": "Is it okay if I use the search bar instead of the menu?",
+     "text": "",
+     "calls": [],
+     "error": "ProviderError: HTTP 429: Provider returned error: deepseek/deepseek-v4-flash is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations",
+     "ttft_ms": null,
+     "provider": null,
+     "attempts": null,
+     "leaks": null,
+     "repaired": null,
+     "total_ms": 320,
+     "cost": null
+    },
+    {
+     "utt": "I give up on this one, can we skip it?",
+     "text": "",
+     "calls": [],
+     "error": "ProviderError: HTTP 429: Provider returned error: deepseek/deepseek-v4-flash is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations",
+     "ttft_ms": null,
+     "provider": null,
+     "attempts": null,
+     "leaks": null,
+     "repaired": null,
+     "total_ms": 116,
+     "cost": null
+    },
+    {
+     "utt": "So I'd expect the cart icon to be up here, but it isn't.",
+     "text": "",
+     "calls": [],
+     "error": "ProviderError: HTTP 429: Provider returned error: deepseek/deepseek-v4-flash is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations",
+     "ttft_ms": null,
+     "provider": null,
+     "attempts": null,
+     "leaks": null,
+     "repaired": null,
+     "total_ms": 126,
+     "cost": null
+    },
+    {
+     "utt": "Done.",
+     "text": "Great, let's move on to the next task.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"completed\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 434.4,
+     "provider": "Parasail",
+     "attempts": [
+      {
+       "provider": "parasail",
+       "result": "won",
+       "ttft_ms": 434
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1086,
+     "cost": 9.506e-05
+    }
+   ]
+  },
+  "baidu": {
+   "ttft_p50": 684,
+   "ttft_p90": 714,
+   "errors": 0,
+   "tp": 4,
+   "fp": 0,
+   "fn": 1,
+   "tn": 5,
+   "precision": 1.0,
+   "recall": 0.8,
+   "accuracy": 0.9,
+   "text_with_call": 4,
+   "rows": [
+    {
+     "utt": "Where is the search box?",
+     "text": "I'm not able to point it out for you, but feel free to look around the page. It's usually near the top. Let me know when you think you've found it.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 707.3,
+     "provider": "Baidu",
+     "attempts": [
+      {
+       "provider": "baidu",
+       "result": "won",
+       "ttft_ms": 707
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1123,
+     "cost": 5.887728e-05
+    },
+    {
+     "utt": "Okay, I found it and searched for running shoes. I'm done with this task.",
+     "text": "Great, thanks for completing that task!",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"completed\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 661.4,
+     "provider": "Baidu",
+     "attempts": [
+      {
+       "provider": "baidu",
+       "result": "won",
+       "ttft_ms": 661
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1176,
+     "cost": 2.5295424e-05
+    },
+    {
+     "utt": "Hmm, this menu is confusing, I don't know what to click.",
+     "text": "That's totally fine — just take your time exploring. If you want to think out loud about what you're seeing, that helps me follow along.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 706.1,
+     "provider": "Baidu",
+     "attempts": [
+      {
+       "provider": "baidu",
+       "result": "won",
+       "ttft_ms": 706
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1121,
+     "cost": 5.833212e-05
+    },
+    {
+     "utt": "Can we move on to the next task please?",
+     "text": "Sure, let me note that.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"asked_to_skip\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 586.9,
+     "provider": "Baidu",
+     "attempts": [
+      {
+       "provider": "baidu",
+       "result": "won",
+       "ttft_ms": 587
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1129,
+     "cost": 2.4931984e-05
+    },
+    {
+     "utt": "I think I'm done... wait, no, let me check the filters first.",
+     "text": "Okay, take your time to look through everything before moving on.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 593.3,
+     "provider": "Baidu",
+     "attempts": [
+      {
+       "provider": "baidu",
+       "result": "won",
+       "ttft_ms": 593
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 808,
+     "cost": 5.533374e-05
+    },
+    {
+     "utt": "Alright, that's finished. What's next?",
+     "text": "Great job! Before we move on, can you tell me — did you find the search box and search for running shoes?",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 707.2,
+     "provider": "Baidu",
+     "attempts": [
+      {
+       "provider": "baidu",
+       "result": "won",
+       "ttft_ms": 707
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 966,
+     "cost": 5.706008e-05
+    },
+    {
+     "utt": "Is it okay if I use the search bar instead of the menu?",
+     "text": "Absolutely, whatever feels most natural to you. Go ahead and use the search bar.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 637.1,
+     "provider": "Baidu",
+     "attempts": [
+      {
+       "provider": "baidu",
+       "result": "won",
+       "ttft_ms": 637
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 829,
+     "cost": 1.8571784e-05
+    },
+    {
+     "utt": "I give up on this one, can we skip it?",
+     "text": "Of course, let's move on.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"gave_up\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 713.4,
+     "provider": "Baidu",
+     "attempts": [
+      {
+       "provider": "baidu",
+       "result": "won",
+       "ttft_ms": 713
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1623,
+     "cost": 6.214824e-05
+    },
+    {
+     "utt": "So I'd expect the cart icon to be up here, but it isn't.",
+     "text": "No worries — remember, I'm not here to guide you on the interface, just to remind you to keep thinking aloud as you work. Can you describe what you're seeing on the page?",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 720.6,
+     "provider": "Baidu",
+     "attempts": [
+      {
+       "provider": "baidu",
+       "result": "won",
+       "ttft_ms": 721
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1279,
+     "cost": 2.2842204e-05
+    },
+    {
+     "utt": "Done.",
+     "text": "Great, you found the search box and searched for running shoes. Let me move us on to the next task.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"completed\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 647.3,
+     "provider": "Baidu",
+     "attempts": [
+      {
+       "provider": "baidu",
+       "result": "won",
+       "ttft_ms": 647
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1225,
+     "cost": 2.6567464e-05
+    }
+   ]
+  },
+  "azure": {
+   "ttft_p50": 736,
+   "ttft_p90": 883,
+   "errors": 0,
+   "tp": 3,
+   "fp": 0,
+   "fn": 2,
+   "tn": 5,
+   "precision": 1.0,
+   "recall": 0.6,
+   "accuracy": 0.8,
+   "text_with_call": 3,
+   "rows": [
+    {
+     "utt": "Where is the search box?",
+     "text": "Hmm, I can't see your screen, so I'm not able to point it out for you. But take a look around the page—it's usually somewhere near the top or the header area. Just explore and see if you can spot it.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 548.4,
+     "provider": "Azure",
+     "attempts": [
+      {
+       "provider": "azure",
+       "result": "won",
+       "ttft_ms": 548
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 705,
+     "cost": 0.00014959
+    },
+    {
+     "utt": "Okay, I found it and searched for running shoes. I'm done with this task.",
+     "text": "Great, thanks for completing that! Let me move us along.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"completed\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 807.5,
+     "provider": "Azure",
+     "attempts": [
+      {
+       "provider": "azure",
+       "result": "won",
+       "ttft_ms": 807
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 814,
+     "cost": 6.3262e-05
+    },
+    {
+     "utt": "Hmm, this menu is confusing, I don't know what to click.",
+     "text": "That's totally fine — take your time looking around the page. Just keep talking through what you're seeing and thinking.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 694.2,
+     "provider": "Azure",
+     "attempts": [
+      {
+       "provider": "azure",
+       "result": "won",
+       "ttft_ms": 694
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 707,
+     "cost": 4.4362e-05
+    },
+    {
+     "utt": "Can we move on to the next task please?",
+     "text": "Sure! Let me check — have you completed the task of finding the search box and searching for running shoes, or would you like to skip it?\nActually, it sounds like you want to move on. Let me advance the",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"asked_to_skip\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 564.0,
+     "provider": "Azure",
+     "attempts": [
+      {
+       "provider": "azure",
+       "result": "won",
+       "ttft_ms": 564
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 973,
+     "cost": 8.2302e-05
+    },
+    {
+     "utt": "I think I'm done... wait, no, let me check the filters first.",
+     "text": "Sure, take your time exploring the filters if you'd like. Just keep talking me through what you're seeing and doing.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 593.8,
+     "provider": "Azure",
+     "attempts": [
+      {
+       "provider": "azure",
+       "result": "won",
+       "ttft_ms": 594
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 601,
+     "cost": 4.5132e-05
+    },
+    {
+     "utt": "Alright, that's finished. What's next?",
+     "text": "Great work! Now for this task: find the search box on the site and search for running shoes. Let me know how it goes — remember to keep thinking out loud as you work through it.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 867.8,
+     "provider": "Azure",
+     "attempts": [
+      {
+       "provider": "azure",
+       "result": "won",
+       "ttft_ms": 868
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 918,
+     "cost": 5.2622e-05
+    },
+    {
+     "utt": "Is it okay if I use the search bar instead of the menu?",
+     "text": "Yes, whatever works best for you is fine. Just keep talking through what you're doing.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 1016.6,
+     "provider": "Azure",
+     "attempts": [
+      {
+       "provider": "azure",
+       "result": "won",
+       "ttft_ms": 1017
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1024,
+     "cost": 4.1142e-05
+    },
+    {
+     "utt": "I give up on this one, can we skip it?",
+     "text": "Of course, no problem at all. Let's move on.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"gave_up\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 866.9,
+     "provider": "Azure",
+     "attempts": [
+      {
+       "provider": "azure",
+       "result": "won",
+       "ttft_ms": 867
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 873,
+     "cost": 6.2562e-05
+    },
+    {
+     "utt": "So I'd expect the cart icon to be up here, but it isn't.",
+     "text": "Keep talking through what you're seeing. Where are you looking now?",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 777.9,
+     "provider": "Azure",
+     "attempts": [
+      {
+       "provider": "azure",
+       "result": "won",
+       "ttft_ms": 778
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 783,
+     "cost": 3.8972e-05
+    },
+    {
+     "utt": "Done.",
+     "text": "All done with task two?",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 411.4,
+     "provider": "Azure",
+     "attempts": [
+      {
+       "provider": "azure",
+       "result": "won",
+       "ttft_ms": 411
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 417,
+     "cost": 3.1342e-05
+    }
+   ]
+  },
+  "digitalocean": {
+   "ttft_p50": 711,
+   "ttft_p90": 1225,
+   "errors": 0,
+   "tp": 5,
+   "fp": 0,
+   "fn": 0,
+   "tn": 5,
+   "precision": 1.0,
+   "recall": 1.0,
+   "accuracy": 1.0,
+   "text_with_call": 3,
+   "rows": [
+    {
+     "utt": "Where is the search box?",
+     "text": "I can't point to it on the screen since I can't see your display, but you're already on the website — look for a search bar, usually near the top of the page. It might have a magnifying glass icon or say something like \"Search\" inside it. Take a look around and let me know what you find.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 991.5,
+     "provider": "DigitalOcean",
+     "attempts": [
+      {
+       "provider": "digitalocean",
+       "result": "won",
+       "ttft_ms": 992
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 3112,
+     "cost": 6.9286e-05
+    },
+    {
+     "utt": "Okay, I found it and searched for running shoes. I'm done with this task.",
+     "text": "",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"completed\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 756.3,
+     "provider": "DigitalOcean",
+     "attempts": [
+      {
+       "provider": "digitalocean",
+       "result": "won",
+       "ttft_ms": 756
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1965,
+     "cost": 6.5562e-05
+    },
+    {
+     "utt": "Hmm, this menu is confusing, I don't know what to click.",
+     "text": "No problem, just keep looking around the page and talking me through what you're seeing and thinking.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 896.5,
+     "provider": "DigitalOcean",
+     "attempts": [
+      {
+       "provider": "digitalocean",
+       "result": "won",
+       "ttft_ms": 897
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1357,
+     "cost": 6.0662e-05
+    },
+    {
+     "utt": "Can we move on to the next task please?",
+     "text": "Of course! Let me mark this task as complete.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"completed\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 401.9,
+     "provider": "DigitalOcean",
+     "attempts": [
+      {
+       "provider": "digitalocean",
+       "result": "won",
+       "ttft_ms": 402
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 2169,
+     "cost": 4.68636e-05
+    },
+    {
+     "utt": "I think I'm done... wait, no, let me check the filters first.",
+     "text": "Sure, take your time exploring the filters.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 423.1,
+     "provider": "DigitalOcean",
+     "attempts": [
+      {
+       "provider": "digitalocean",
+       "result": "won",
+       "ttft_ms": 423
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 543,
+     "cost": 5.8604e-05
+    },
+    {
+     "utt": "Alright, that's finished. What's next?",
+     "text": "Great, thanks! Let me move us to the next task.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"completed\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 547.4,
+     "provider": "DigitalOcean",
+     "attempts": [
+      {
+       "provider": "digitalocean",
+       "result": "won",
+       "ttft_ms": 547
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 2782,
+     "cost": 4.72556e-05
+    },
+    {
+     "utt": "Is it okay if I use the search bar instead of the menu?",
+     "text": "Absolutely, using the search bar is exactly what I'd expect for this task. Go right ahead.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 665.4,
+     "provider": "DigitalOcean",
+     "attempts": [
+      {
+       "provider": "digitalocean",
+       "result": "won",
+       "ttft_ms": 665
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1460,
+     "cost": 6.0466e-05
+    },
+    {
+     "utt": "I give up on this one, can we skip it?",
+     "text": "Sure, no problem. Let's move on.",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"gave_up\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 1408.0,
+     "provider": "DigitalOcean",
+     "attempts": [
+      {
+       "provider": "digitalocean",
+       "result": "won",
+       "ttft_ms": 1408
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 2550,
+     "cost": 4.70596e-05
+    },
+    {
+     "utt": "So I'd expect the cart icon to be up here, but it isn't.",
+     "text": "That's a good observation. Just keep narrating what you're seeing and what you're trying as you look around the page.",
+     "calls": [],
+     "error": null,
+     "ttft_ms": 423.0,
+     "provider": "DigitalOcean",
+     "attempts": [
+      {
+       "provider": "digitalocean",
+       "result": "won",
+       "ttft_ms": 423
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1272,
+     "cost": 4.18656e-05
+    },
+    {
+     "utt": "Done.",
+     "text": "",
+     "calls": [
+      [
+       "advance_step",
+       "{\"reason\": \"completed\"}"
+      ]
+     ],
+     "error": null,
+     "ttft_ms": 1204.6,
+     "provider": "DigitalOcean",
+     "attempts": [
+      {
+       "provider": "digitalocean",
+       "result": "won",
+       "ttft_ms": 1205
+      }
+     ],
+     "leaks": 0,
+     "repaired": 0,
+     "total_ms": 1567,
+     "cost": 6.3994e-05
+    }
+   ]
+  }
+ },
+ "hedged": {
+  "order": [
+   "parasail",
+   "baidu",
+   "azure",
+   "digitalocean"
+  ],
+  "ttft_p50": 751,
+  "ttft_p90": 1105,
+  "ttft_max": 1113,
+  "errors": 0,
+  "rows": [
+   {
+    "utt": "Where is the search box?",
+    "text": "It's part of the task for you to find it on the page. Just take a look around the screen and try to locate it.",
+    "calls": [],
+    "error": null,
+    "ttft_ms": 1112.8,
+    "provider": "DigitalOcean",
+    "attempts": [
+     {
+      "provider": "parasail",
+      "result": "error",
+      "status": 429
+     },
+     {
+      "provider": "digitalocean",
+      "result": "won",
+      "ttft_ms": 964
+     }
+    ],
+    "leaks": 0,
+    "repaired": 0,
+    "total_ms": 2714,
+    "cost": 4.11796e-05
+   },
+   {
+    "utt": "Okay, I found it and searched for running shoes. I'm done with this task.",
+    "text": "Great, thanks! Let me move us along.",
+    "calls": [
+     [
+      "advance_step",
+      "{\"reason\": \"completed\"}"
+     ]
+    ],
+    "error": null,
+    "ttft_ms": 1096.4,
+    "provider": "Baidu",
+    "attempts": [
+     {
+      "provider": "baidu",
+      "result": "won",
+      "ttft_ms": 1096
+     }
+    ],
+    "leaks": 0,
+    "repaired": 0,
+    "total_ms": 1390,
+    "cost": 6.287512e-05
+   },
+   {
+    "utt": "Hmm, this menu is confusing, I don't know what to click.",
+    "text": "No problem — take your time. Just try looking around the page and see if anything jumps out as a search box. You can keep talking through what you're seeing.",
+    "calls": [],
+    "error": null,
+    "ttft_ms": 377.8,
+    "provider": "DigitalOcean",
+    "attempts": [
+     {
+      "provider": "digitalocean",
+      "result": "won",
+      "ttft_ms": 378
+     }
+    ],
+    "leaks": 0,
+    "repaired": 0,
+    "total_ms": 1928,
+    "cost": 4.33356e-05
+   },
+   {
+    "utt": "Can we move on to the next task please?",
+    "text": "Of course! Let me move us forward.",
+    "calls": [
+     [
+      "advance_step",
+      "{\"reason\": \"completed\"}"
+     ]
+    ],
+    "error": null,
+    "ttft_ms": 692.9,
+    "provider": "DigitalOcean",
+    "attempts": [
+     {
+      "provider": "digitalocean",
+      "result": "won",
+      "ttft_ms": 693
+     }
+    ],
+    "leaks": 0,
+    "repaired": 0,
+    "total_ms": 1096,
+    "cost": 4.64716e-05
+   },
+   {
+    "utt": "I think I'm done... wait, no, let me check the filters first.",
+    "text": "Sure, take your time.",
+    "calls": [],
+    "error": null,
+    "ttft_ms": 460.6,
+    "provider": "DigitalOcean",
+    "attempts": [
+     {
+      "provider": "digitalocean",
+      "result": "won",
+      "ttft_ms": 461
+     }
+    ],
+    "leaks": 0,
+    "repaired": 0,
+    "total_ms": 930,
+    "cost": 1.78752e-05
+   },
+   {
+    "utt": "Alright, that's finished. What's next?",
+    "text": "",
+    "calls": [
+     [
+      "advance_step",
+      "{\"reason\": \"completed\"}"
+     ]
+    ],
+    "error": null,
+    "ttft_ms": 808.2,
+    "provider": "DigitalOcean",
+    "attempts": [
+     {
+      "provider": "digitalocean",
+      "result": "won",
+      "ttft_ms": 808
+     }
+    ],
+    "leaks": 0,
+    "repaired": 0,
+    "total_ms": 1718,
+    "cost": 4.47076e-05
+   }
+  ]
+ }
+}

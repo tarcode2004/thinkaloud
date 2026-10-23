@@ -13,3 +13,4 @@ tests/fixtures/*.y4m
 tests/fixtures/*.png
 tests/fixtures/real-sessions/
 tests/harness/reports/
+tests/fixtures/ort/

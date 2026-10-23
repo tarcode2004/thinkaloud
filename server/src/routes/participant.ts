@@ -432,7 +432,8 @@ export function transcriptionConfig(lang: string | undefined): { model: string; 
 
 participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
   const row = sessionFor(req);
-  if (!config.openaiKey) throw new HttpError(503, 'Voice moderation is not configured on this server (missing OPENAI_API_KEY)');
+  const selfHosted = !config.realtimeBaseUrl.startsWith('https://api.openai.com');
+  if (!config.realtimeKey && !selfHosted) throw new HttpError(503, 'Voice moderation is not configured on this server (missing OPENAI_API_KEY)');
   const sessionId = row.id as string;
   const used = tokenCounts.get(sessionId) ?? 0;
   if (used >= MAX_TOKENS_PER_SESSION) throw new HttpError(429, 'Too many voice connections for this session');
@@ -459,9 +460,9 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
   };
 
   const mint = async (withReasoning: boolean) =>
-    fetch('https://api.openai.com/v1/realtime/client_secrets', {
+    fetch(`${config.realtimeBaseUrl}/realtime/client_secrets`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${config.openaiKey}`, 'Content-Type': 'application/json' },
+      headers: { ...(config.realtimeKey ? { Authorization: `Bearer ${config.realtimeKey}` } : {}), 'Content-Type': 'application/json' },
       body: JSON.stringify({ session: withReasoning ? { ...session, reasoning: { effort: config.realtimeEffort } } : session }),
       signal: AbortSignal.timeout(15_000),
     });
@@ -481,13 +482,20 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
   }
   if (!r.ok) {
     const text = await r.text().catch(() => '');
-    console.error('[realtime-token] OpenAI error', r.status, text.slice(0, 500));
+    console.error('[realtime-token] upstream error', r.status, text.slice(0, 500));
     throw new HttpError(r.status === 429 ? 503 : 502, 'Could not start the voice session', { upstreamStatus: r.status });
   }
   const j = (await r.json()) as { value?: string; expires_at?: number; client_secret?: { value?: string; expires_at?: number } };
   const value = j.value ?? j.client_secret?.value;
   if (!value) throw new HttpError(502, 'Voice service returned no key');
-  const out: RealtimeTokenResponse = { value, expiresAt: Number(j.expires_at ?? j.client_secret?.expires_at ?? 0), model, voice, transcription };
+  const out: RealtimeTokenResponse = {
+    value,
+    expiresAt: Number(j.expires_at ?? j.client_secret?.expires_at ?? 0),
+    model,
+    voice,
+    transcription,
+    callsUrl: `${config.realtimePublicUrl}/realtime/calls`,
+  };
   res.json(out);
 });
 

@@ -166,7 +166,7 @@ export class RealtimeClient {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    const res = await fetch('https://api.openai.com/v1/realtime/calls', {
+    const res = await fetch(token.callsUrl ?? 'https://api.openai.com/v1/realtime/calls', {
       method: 'POST',
       body: offer.sdp,
       headers: { Authorization: `Bearer ${token.value}`, 'Content-Type': 'application/sdp' },

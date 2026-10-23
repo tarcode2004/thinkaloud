@@ -616,4 +616,6 @@ export interface RealtimeTokenResponse {
   voice: string;
   /** Input transcription settings (re-sent with every client turn-detection update). */
   transcription?: { model: string; language: string; prompt?: string };
+  /** Where the browser posts its SDP offer (OpenAI or a self-hosted OpenRealtime server). */
+  callsUrl?: string;
 }
