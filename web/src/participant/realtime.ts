@@ -2,7 +2,20 @@
 // Responsibilities: connect (ephemeral token → SDP exchange), data-channel events,
 // function-call dedupe on call_id, response scheduling (never two active responses),
 // one automatic reconnect, and exposing remote audio for playback/recording.
+//
+// Self-hosted servers (OpenRealtime) also get a WebSocket transport, used when the token says so
+// or when WebRTC media cannot connect (ICE stuck behind symmetric NAT): mic and moderator audio
+// travel as base64 pcm16 events, and the WebRTC-only output_audio_buffer.started/stopped/cleared
+// events are emulated from local playback (wsAudio.ts), so the runner behaves identically.
 import type { RealtimeTokenResponse } from '@thinkaloud/shared';
+import { WS_RATE, WsAudio, pcm16ToBase64 } from './wsAudio.ts';
+
+/** Without connectivity after this long, a self-hosted session switches from WebRTC to the WebSocket. */
+const ICE_FALLBACK_MS = 4500;
+/** WebSocket send buffer above which mic chunks are held back (~1 s of base64 audio). */
+const WS_HIGH_WATER = 64 * 1024;
+/** Held-back mic audio kept at most (the oldest is dropped beyond it): 2 s. */
+const WS_MAX_BACKLOG = 50;
 
 export type RealtimeStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'failed' | 'closed';
 
@@ -68,6 +81,28 @@ export class RealtimeClient {
   transcription: RealtimeTokenResponse['transcription'] | null = null;
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
+  /** The transport of the current (or last) connection. */
+  transport: 'webrtc' | 'websocket' = 'webrtc';
+  private ws: WebSocket | null = null;
+  /** WebRTC failed once in this session: reconnects go straight to the WebSocket. */
+  private useWs = false;
+  private wsAudio: WsAudio | null = null;
+  /** Mic chunks waiting for the WebSocket send buffer to drain. */
+  private wsBacklog: string[] = [];
+  private wsDropped = 0;
+  /** Assistant audio per response / item (24 kHz samples handed to the player). */
+  private wsPushed = new Map<string, number>();
+  private wsItems = new Map<string, { rid: string; samples: number }>();
+  /** Responses whose playback we cut: their late deltas are dropped. */
+  private wsCut = new Set<string>();
+  /** Responses audible now (emulated output_audio_buffer.started sent). */
+  private wsAudible = new Set<string>();
+  /** response.done held until its audio has started playing (it may arrive while still prebuffering). */
+  private wsHeldDone = new Map<string, { ev: ServerEvent; timer: ReturnType<typeof setTimeout> }>();
+  /** Items whose truncation we already sent with the exact played position. */
+  private wsTruncated = new Set<string>();
+  /** turn_detection.interrupt_response of the session (barge-in cuts playback on the client over WS). */
+  private interruptOnSpeech = true;
   private seenCalls = new Set<string>();
   private activeResponse = false;
   private wantResponse: CreateReq | null = null;
@@ -117,10 +152,51 @@ export class RealtimeClient {
   async connect(): Promise<void> {
     this.closedByUs = false;
     this.setStatus(this.reconnects ? 'reconnecting' : 'connecting');
-    const token = await this.opts.getToken();
+    let token = await this.opts.getToken();
+    this.applyToken(token);
+    // Self-hosted servers also offer a WebSocket (`wsUrl`): used when the server says so, after a
+    // fallback earlier in this session, or when WebRTC media cannot get through (ICE never connects,
+    // e.g. symmetric NAT / carrier-grade NAT with the server behind a home router).
+    const canWs = Boolean(token.wsUrl) && token.transport !== 'webrtc';
+    if (canWs && (this.useWs || token.transport === 'websocket')) {
+      await this.connectWs(token);
+    } else {
+      try {
+        await this.connectRtc(token, canWs ? ICE_FALLBACK_MS : 0);
+      } catch (e) {
+        if (!canWs || this.closedByUs) throw e;
+        console.warn(`[realtime] WebRTC did not connect (${(e as Error).message}); falling back to WebSocket`);
+        this.tr(`! webrtc failed (${(e as Error).message}); websocket fallback`);
+        this.teardown();
+        this.useWs = true;
+        // The same ephemeral key works for the WebSocket while it is still valid.
+        if (!(token.expiresAt > 0 && token.expiresAt * 1000 - Date.now() > 30_000)) {
+          token = await this.opts.getToken();
+          this.applyToken(token);
+        }
+        if (this.closedByUs) throw e;
+        await this.connectWs(token);
+      }
+    }
+    this.activeResponse = false;
+    this.connectedAt = Date.now();
+    this.setStatus('connected');
+    const queued = this.outbox.splice(0);
+    const resumed = this.everReady;
+    this.everReady = true;
+    this.opts.handlers.onReady?.(resumed);
+    for (const q of queued) this.send(q);
+  }
+
+  private applyToken(token: RealtimeTokenResponse) {
     this.model = token.model;
     this.voice = token.voice;
     this.transcription = token.transcription ?? null;
+  }
+
+  /** WebRTC: SDP exchange, then wait for the data channel. `iceMs` > 0: give up after that long without connectivity. */
+  private async connectRtc(token: RealtimeTokenResponse, iceMs: number): Promise<void> {
+    this.transport = 'webrtc';
     const pc = new RTCPeerConnection(token.iceServers?.length ? { iceServers: token.iceServers } : undefined);
     this.pc = pc;
     pc.ontrack = (e) => {
@@ -143,6 +219,7 @@ export class RealtimeClient {
         resolve();
       };
     });
+    opened.catch(() => {});
     dc.onmessage = (m) => {
       try {
         this.handle(JSON.parse(m.data as string) as ServerEvent);
@@ -166,7 +243,8 @@ export class RealtimeClient {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    const res = await fetch(token.callsUrl ?? 'https://api.openai.com/v1/realtime/calls', {
+    const callsUrl = token.callsUrl ?? 'https://api.openai.com/v1/realtime/calls';
+    const res = await fetch(callsUrl, {
       method: 'POST',
       body: offer.sdp,
       headers: { Authorization: `Bearer ${token.value}`, 'Content-Type': 'application/sdp' },
@@ -177,15 +255,78 @@ export class RealtimeClient {
     }
     const sdp = await res.text();
     await pc.setRemoteDescription({ type: 'answer', sdp });
-    await opened;
-    this.activeResponse = false;
-    this.connectedAt = Date.now();
-    this.setStatus('connected');
-    const queued = this.outbox.splice(0);
-    const resumed = this.everReady;
-    this.everReady = true;
-    this.opts.handlers.onReady?.(resumed);
-    for (const q of queued) this.send(q);
+    if (!iceMs) return opened;
+    const location = res.headers.get('Location');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stalled = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`ICE not connected after ${iceMs} ms (${pc.iceConnectionState})`)), iceMs);
+      pc.addEventListener('iceconnectionstatechange', () => {
+        if (pc.iceConnectionState === 'failed') reject(new Error('ICE failed'));
+      });
+    });
+    try {
+      await Promise.race([opened, stalled]);
+    } catch (e) {
+      // Free the server's half-open call right away (it would time out on its own, later).
+      if (location) {
+        void fetch(new URL(`${location.replace(/\/$/, '')}/hangup`, callsUrl), { method: 'POST', headers: { Authorization: `Bearer ${token.value}` } }).catch(() => {});
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** WebSocket: OpenAI Realtime WS protocol, base64 pcm16 24 kHz both ways, playback emulated locally. */
+  private async connectWs(token: RealtimeTokenResponse): Promise<void> {
+    this.transport = 'websocket';
+    if (!this.wsAudio) {
+      const audio = await WsAudio.create(this.opts.mic, {
+        onChunk: (pcm) => this.sendAudio(pcm),
+        onStarted: (rid) => this.wsStarted(rid),
+        onStopped: (rid) => this.wsStopped(rid),
+      });
+      if (this.closedByUs) {
+        audio.dispose();
+        throw new Error('closed');
+      }
+      this.wsAudio = audio;
+      this.remoteStream = audio.stream;
+      this.opts.handlers.onRemoteStream?.(audio.stream);
+    }
+    console.info(`[realtime] transport=websocket (${token.wsUrl})`);
+    const ws = new WebSocket(token.wsUrl!, ['realtime', `openai-insecure-api-key.${token.value}`]);
+    this.ws = ws;
+    await new Promise<void>((resolve, reject) => {
+      const to = setTimeout(() => reject(new Error('Realtime WebSocket timeout')), 15000);
+      ws.onopen = () => {
+        clearTimeout(to);
+        resolve();
+      };
+      ws.onerror = () => {
+        clearTimeout(to);
+        reject(new Error('Realtime WebSocket failed'));
+      };
+      ws.onclose = (e) => {
+        clearTimeout(to);
+        reject(new Error(`Realtime WebSocket closed (${e.code})`));
+      };
+    });
+    ws.onerror = null;
+    ws.onmessage = (m) => {
+      if (this.ws !== ws) return;
+      let ev: ServerEvent;
+      try {
+        ev = JSON.parse(m.data as string) as ServerEvent;
+      } catch (e) {
+        console.warn('[realtime] bad event', e);
+        return;
+      }
+      this.wsEvent(ev);
+    };
+    ws.onclose = (e) => {
+      if (!this.closedByUs && this.ws === ws) void this.handleDrop(`websocket closed (${e.code})`);
+    };
   }
 
   /**
@@ -233,6 +374,17 @@ export class RealtimeClient {
     const pc = this.pc;
     this.pc = null;
     this.dc = null;
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+      try {
+        ws.close(1000);
+      } catch {
+        /* ignore */
+      }
+    }
+    this.wsReset();
     for (const o of this.oob.values()) o.resolve(null);
     this.oob.clear();
     this.oobByResponse.clear();
@@ -259,11 +411,20 @@ export class RealtimeClient {
   close() {
     this.closedByUs = true;
     this.teardown();
+    this.wsAudio?.dispose();
+    this.wsAudio = null;
     this.setStatus('closed');
   }
 
   get open() {
-    return this.dc?.readyState === 'open';
+    return this.dc?.readyState === 'open' || this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  private rawSend(data: string): boolean {
+    if (this.dc?.readyState === 'open') this.dc.send(data);
+    else if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(data);
+    else return false;
+    return true;
   }
 
   private createSeq = 0;
@@ -288,8 +449,7 @@ export class RealtimeClient {
     }
     const e = ev as { type?: string; response?: { instructions?: string; tool_choice?: unknown } };
     this.tr(`> ${e.type}${e.response?.tool_choice ? ` tool_choice=${JSON.stringify(e.response.tool_choice)}` : ''}${e.response?.instructions ? ` NOW:${e.response.instructions.split('# NOW').pop()?.slice(0, 60).replace(/\s+/g, ' ')}` : ''}`);
-    if (this.dc?.readyState === 'open') this.dc.send(JSON.stringify(ev));
-    else if (this.status === 'connecting' || this.status === 'reconnecting') this.outbox.push(ev);
+    if (!this.rawSend(JSON.stringify(ev)) && (this.status === 'connecting' || this.status === 'reconnecting')) this.outbox.push(ev);
   }
 
   /**
@@ -298,7 +458,7 @@ export class RealtimeClient {
    * far, including the participant's latest audio. Resolves null on timeout / no connection.
    */
   classify(instructions: string, timeoutMs = 4000): Promise<string | null> {
-    if (this.dc?.readyState !== 'open') return Promise.resolve(null);
+    if (!this.open) return Promise.resolve(null);
     const id = `ta_oob_${++this.oobSeq}`;
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -313,7 +473,7 @@ export class RealtimeClient {
         resolve(t);
       };
       this.oob.set(id, { resolve: done, text: '' });
-      this.dc!.send(
+      this.rawSend(
         JSON.stringify({
           type: 'response.create',
           event_id: id,
@@ -336,6 +496,8 @@ export class RealtimeClient {
   }
 
   updateSession(session: Record<string, unknown>) {
+    const td = (session.audio as { input?: { turn_detection?: { interrupt_response?: boolean } | null } } | undefined)?.input?.turn_detection;
+    if (td !== undefined) this.interruptOnSpeech = td !== null && td.interrupt_response !== false;
     this.send({ type: 'session.update', session: { type: 'realtime', ...session } });
   }
 
@@ -419,11 +581,15 @@ export class RealtimeClient {
       this.clearRequestedAt = performance.now();
       this.send({ type: 'output_audio_buffer.clear' });
     }
+    // Over the WebSocket the audio already received plays locally: cut it here (and truncate to what was heard).
+    if (this.transport === 'websocket' && this.wsAudio?.busy) void this.wsCutPlayback();
   }
 
   /** Tell the server how much of an assistant item was actually heard (after we cut its playback). */
   truncate(itemId: string, audioEndMs: number) {
     if (!itemId) return;
+    // WebSocket: the player already sent the exact played position for this item.
+    if (this.wsTruncated.has(itemId)) return;
     this.send({ type: 'conversation.item.truncate', event_id: `ta_trunc_${++this.truncSeq}`, item_id: itemId, content_index: 0, audio_end_ms: Math.max(0, Math.round(audioEndMs)) });
   }
 
@@ -469,6 +635,127 @@ export class RealtimeClient {
       this.activeResponse = true;
       this.sendCreate({});
     }
+  }
+
+  // ── WebSocket transport: mic upload, playback and emulated playout events ───────
+  private sendAudio(pcm: ArrayBuffer) {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const msg = JSON.stringify({ type: 'input_audio_buffer.append', audio: pcm16ToBase64(pcm) });
+    if (!this.wsBacklog.length && ws.bufferedAmount <= WS_HIGH_WATER) return ws.send(msg);
+    // Backpressure (slow uplink): hold chunks back, keep at most the newest 2 s, send them in order once it drains.
+    this.wsBacklog.push(msg);
+    if (this.wsBacklog.length > WS_MAX_BACKLOG) {
+      this.wsBacklog.shift();
+      if (this.wsDropped++ % 25 === 0) console.warn(`[realtime] uplink congested: dropped ${this.wsDropped} mic chunk(s)`);
+    }
+    while (this.wsBacklog.length && ws.bufferedAmount <= WS_HIGH_WATER) ws.send(this.wsBacklog.shift()!);
+  }
+
+  private wsEvent(ev: ServerEvent) {
+    switch (ev.type) {
+      case 'response.output_audio.delta': {
+        const rid = ev.response_id as string | undefined;
+        const item = (ev.item_id as string | undefined) ?? '';
+        if (!rid || !this.wsAudio || this.wsCut.has(rid) || typeof ev.delta !== 'string') break;
+        const n = this.wsAudio.push(rid, item, ev.delta);
+        this.wsPushed.set(rid, (this.wsPushed.get(rid) ?? 0) + n);
+        const it = this.wsItems.get(item) ?? { rid, samples: 0 };
+        it.samples += n;
+        this.wsItems.set(item, it);
+        break;
+      }
+      case 'response.done': {
+        const rid = (ev.response as { id?: string } | undefined)?.id;
+        if (rid && this.wsPushed.has(rid) && !this.wsCut.has(rid)) {
+          this.wsAudio?.end(rid);
+          // Its audio is still in the prebuffer: report the response as done once it is audible, like
+          // WebRTC (where the server's response.done never precedes output_audio_buffer.started).
+          if (!this.wsAudible.has(rid)) {
+            this.wsHeldDone.set(rid, { ev, timer: setTimeout(() => this.releaseDone(rid), 3000) });
+            return;
+          }
+        }
+        break;
+      }
+      case 'input_audio_buffer.speech_started':
+        // OpenAI WS semantics: the client stops its own playback on an interruption and truncates the
+        // item to what was actually played (the server cannot know how far the client got).
+        this.handle(ev);
+        if (this.interruptOnSpeech && this.wsAudio?.busy) void this.wsCutPlayback();
+        return;
+    }
+    this.handle(ev);
+  }
+
+  private releaseDone(rid: string) {
+    const h = this.wsHeldDone.get(rid);
+    if (!h) return;
+    clearTimeout(h.timer);
+    this.wsHeldDone.delete(rid);
+    this.handle(h.ev);
+  }
+
+  private wsStarted(rid: string) {
+    if (this.wsCut.has(rid) || !this.wsPushed.has(rid)) return;
+    this.wsAudible.add(rid);
+    if (this.wsAudible.size > 200) this.wsAudible.delete(this.wsAudible.values().next().value!);
+    this.handle({ type: 'output_audio_buffer.started', response_id: rid });
+    this.releaseDone(rid);
+  }
+
+  private wsStopped(rid: string) {
+    if (!this.wsPushed.has(rid)) return;
+    this.wsAudio?.settle(this.wsPushed.get(rid) ?? 0);
+    this.wsPushed.delete(rid);
+    for (const [item, it] of [...this.wsItems]) {
+      if (it.rid !== rid) continue;
+      this.wsItems.delete(item);
+      this.wsAudio?.forget(item);
+    }
+    if (this.wsCut.has(rid)) return;
+    this.handle({ type: 'output_audio_buffer.stopped', response_id: rid });
+  }
+
+  /** Stop local playback now, truncate the cut items to what was played, emit output_audio_buffer.cleared. */
+  private async wsCutPlayback() {
+    const audio = this.wsAudio;
+    if (!audio) return;
+    const rids = [...this.wsPushed.keys()].filter((r) => !this.wsCut.has(r));
+    if (!rids.length) return;
+    for (const r of rids) this.markCut(r);
+    const res = await audio.clear();
+    if (this.wsAudio !== audio) return;
+    for (const [item, it] of [...this.wsItems]) {
+      if (!rids.includes(it.rid)) continue;
+      this.wsItems.delete(item);
+      const played = Math.min(it.samples, res.played[item] ?? 0);
+      if (!item || played >= it.samples) continue;
+      this.wsTruncated.add(item);
+      if (this.wsTruncated.size > 200) this.wsTruncated.delete(this.wsTruncated.values().next().value!);
+      this.send({ type: 'conversation.item.truncate', event_id: `ta_trunc_${++this.truncSeq}`, item_id: item, content_index: 0, audio_end_ms: Math.floor((played * 1000) / WS_RATE) });
+    }
+    for (const r of rids) {
+      this.wsPushed.delete(r);
+      this.releaseDone(r);
+    }
+    if (res.audible && rids.includes(res.audible)) this.handle({ type: 'output_audio_buffer.cleared', response_id: res.audible });
+  }
+
+  private markCut(rid: string) {
+    this.wsCut.add(rid);
+    if (this.wsCut.size > 200) this.wsCut.delete(this.wsCut.values().next().value!);
+  }
+
+  /** Connection gone: drop queued playback silently (like a closed peer connection) and the bookkeeping. */
+  private wsReset() {
+    for (const h of this.wsHeldDone.values()) clearTimeout(h.timer);
+    this.wsHeldDone.clear();
+    for (const r of this.wsPushed.keys()) this.markCut(r);
+    if (this.wsAudio?.busy || this.wsPushed.size) void this.wsAudio?.clear();
+    this.wsPushed.clear();
+    this.wsItems.clear();
+    this.wsBacklog = [];
   }
 
   private handle(ev: ServerEvent) {

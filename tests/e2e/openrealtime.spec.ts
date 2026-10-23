@@ -1,4 +1,4 @@
-// The REAL participant runtime (browser, WebRTC) against the self-hosted OpenRealtime server
+// The REAL participant runtime (browser; WebSocket, WebRTC and WebRTC→WebSocket fallback) against the self-hosted OpenRealtime server
 // (openrealtime/, python) instead of OpenAI. Nothing reaches OpenAI: the servers run with
 // OPENAI_API_KEY blanked, ThinkAloud mints its realtime token at OpenRealtime
 // (REALTIME_BASE_URL=http://localhost:8790/v1), every browser request to api.openai.com is aborted
@@ -102,6 +102,47 @@ async function waitUp(url: string, ms = 60_000) {
   }
   throw new Error(`${url} did not come up`);
 }
+type Transport = 'webrtc' | 'websocket' | 'auto';
+let api: { proc: ChildProcess; transport: Transport } | null = null;
+function kill(p: ChildProcess) {
+  try {
+    process.kill(-p.pid!, 'SIGTERM');
+  } catch {
+    p.kill('SIGTERM');
+  }
+}
+/** (Re)start this spec's ThinkAloud API with REALTIME_TRANSPORT=`transport` (data persists in DATA_DIR). */
+async function startApi(transport: Transport) {
+  if (api?.transport === transport) return;
+  if (api) {
+    kill(api.proc);
+    const t0 = Date.now();
+    while ((await up(`${API}/api/health`)) && Date.now() - t0 < 15_000) await new Promise((r) => setTimeout(r, 200));
+  } else if (await up(`${API}/api/health`)) {
+    throw new Error(`Port ${API_PORT} is already in use: this spec starts its own API server (it switches REALTIME_TRANSPORT between tests)`);
+  }
+  const proc = spawn('npx', ['tsx', 'src/index.ts'], {
+    cwd: path.join(ROOT, 'server'),
+    env: {
+      ...noOpenAI,
+      PORT: API_PORT,
+      APP_HOST_PORT: APP_PORT,
+      APP_HOST_URL: `http://localhost:${APP_PORT}`,
+      PUBLIC_URL: WEB,
+      DATA_DIR,
+      BUILD_MODE: 'local',
+      SESSION_SECRET: 'ort-tests',
+      REALTIME_BASE_URL: `${ORT}/v1`,
+      REALTIME_PUBLIC_URL: `${ORT}/v1`,
+      REALTIME_API_KEY: '',
+      REALTIME_TRANSPORT: transport,
+    },
+    stdio: 'inherit',
+    detached: true,
+  });
+  api = { proc, transport };
+  await waitUp(`${API}/api/health`);
+}
 async function ensureServers() {
   if (await up(`${ORT}/health`)) {
     const h = (await (await fetch(`${ORT}/health`)).json()) as { llm?: string };
@@ -116,29 +157,7 @@ async function ensureServers() {
       }),
     );
   }
-  if (!(await up(`${API}/api/health`))) {
-    procs.push(
-      spawn('npx', ['tsx', 'src/index.ts'], {
-        cwd: path.join(ROOT, 'server'),
-        env: {
-          ...noOpenAI,
-          PORT: API_PORT,
-          APP_HOST_PORT: APP_PORT,
-          APP_HOST_URL: `http://localhost:${APP_PORT}`,
-          PUBLIC_URL: WEB,
-          DATA_DIR,
-          BUILD_MODE: 'local',
-          SESSION_SECRET: 'ort-tests',
-          REALTIME_BASE_URL: `${ORT}/v1`,
-          REALTIME_PUBLIC_URL: `${ORT}/v1`,
-          REALTIME_API_KEY: '',
-        },
-        stdio: 'inherit',
-        detached: true,
-      }),
-    );
-    await waitUp(`${API}/api/health`);
-  }
+  await startApi('websocket');
   if (!(await up(`${WEB}/`))) {
     procs.push(spawn('npx', ['vite', '--port', WEB_PORT, '--strictPort'], { cwd: path.join(ROOT, 'web'), env: { ...noOpenAI, PORT: API_PORT, VITE_NO_HMR: '1' }, stdio: 'inherit', detached: true }));
     await waitUp(`${WEB}/`);
@@ -277,6 +296,63 @@ const DC_TAP = () => {
     return dc;
   } as typeof orig;
 };
+/**
+ * WebRTC media that can never connect, like behind symmetric NAT: relay-only ICE with no TURN server
+ * gathers no candidates. (--force-webrtc-ip-handling-policy doesn't block loopback, so it can't simulate this.)
+ */
+const NO_ICE = () => {
+  const Orig = window.RTCPeerConnection;
+  window.RTCPeerConnection = class extends Orig {
+    constructor(cfg?: RTCConfiguration) {
+      super({ ...(cfg ?? {}), iceServers: [], iceTransportPolicy: 'relay' });
+    }
+  } as typeof RTCPeerConnection;
+};
+/** The same tap for the realtime WebSocket transport (mic appends and audio deltas left out). */
+const WS_TAP = () => {
+  if (window.top !== window) return;
+  const w = window as unknown as { __dcTap?: { t: number; dir: string; type: string; info: string }[] };
+  const evs = (w.__dcTap = w.__dcTap ?? []);
+  const brief = (e: Record<string, unknown>) => {
+    const r = e.response as { status?: string; tool_choice?: unknown; instructions?: string } | undefined;
+    const x =
+      e.error ??
+      (e.type === 'response.done' ? { status: r?.status } : undefined) ??
+      (e.type === 'conversation.item.truncate' ? { item: e.item_id, audio_end_ms: e.audio_end_ms } : undefined) ??
+      (e.type === 'response.create' ? { tc: r?.tool_choice, now: r?.instructions?.split('# NOW').pop()?.slice(0, 80) } : undefined) ??
+      e.transcript ??
+      e.name ??
+      '';
+    return typeof x === 'string' ? x.slice(0, 100) : JSON.stringify(x).slice(0, 200);
+  };
+  const skip = (t: string) => t.endsWith('.delta') || t === 'input_audio_buffer.append';
+  const Orig = window.WebSocket;
+  class Tapped extends Orig {
+    constructor(url: string | URL, protocols?: string | string[]) {
+      super(url, protocols);
+      if (!String(url).includes('/v1/realtime')) return;
+      this.addEventListener('message', (m) => {
+        try {
+          const e = JSON.parse(m.data as string);
+          if (!skip(String(e.type))) evs.push({ t: performance.now(), dir: '<', type: e.type, info: brief(e) });
+        } catch {
+          /* ignore */
+        }
+      });
+      const send = this.send.bind(this);
+      this.send = (d: string | ArrayBufferLike | Blob | ArrayBufferView) => {
+        try {
+          const e = JSON.parse(d as string);
+          if (!skip(String(e.type))) evs.push({ t: performance.now(), dir: '>', type: e.type, info: brief(e), ...(e.type === 'conversation.item.truncate' ? { ms: e.audio_end_ms } : {}) });
+        } catch {
+          /* ignore */
+        }
+        return send(d);
+      };
+    }
+  }
+  window.WebSocket = Tapped;
+};
 const tap = async (page: Page, last = 80) =>
   (await page.evaluate(() => (window as unknown as { __dcTap?: { t: number; dir: string; type: string; info: string }[] }).__dcTap ?? []))
     .slice(-last)
@@ -286,27 +362,20 @@ const speak = (page: Page, clip: string) =>
   page.evaluate((b) => (window as unknown as { __taSpeak: (b: string) => Promise<number> }).__taSpeak(b), fs.readFileSync(path.join(FIX, `${clip}.wav`)).toString('base64'));
 
 let browser: Browser;
+const LAUNCH_ARGS = ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-audio-capture=${path.join(FIX, 'room.wav')}`, '--autoplay-policy=no-user-gesture-required'];
 test.use({ screenshot: 'off' });
+test.describe.configure({ mode: 'serial' });
 test.beforeAll(async () => {
   test.setTimeout(360_000);
   ensureClips();
   await ensureServers();
   await call('POST', '/api/auth/signup', { email: `ort-${Date.now()}@example.com`, password: 'password123', name: 'ORT Researcher' });
-  browser = await chromium.launch({
-    headless: true,
-    executablePath: fs.existsSync(CHROME) ? CHROME : undefined,
-    args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-audio-capture=${path.join(FIX, 'room.wav')}`, '--autoplay-policy=no-user-gesture-required'],
-  });
+  browser = await chromium.launch({ headless: true, executablePath: fs.existsSync(CHROME) ? CHROME : undefined, args: LAUNCH_ARGS });
 });
 test.afterAll(async () => {
   await browser?.close();
-  for (const p of procs) {
-    try {
-      process.kill(-p.pid!, 'SIGTERM');
-    } catch {
-      p.kill('SIGTERM');
-    }
-  }
+  if (api) kill(api.proc);
+  for (const p of procs) kill(p);
 });
 
 const log = (page: Page) => page.evaluate(() => ((window as unknown as { __taRunner?: { queue: { log: unknown[] } } }).__taRunner?.queue.log ?? []) as LogEvent[]);
@@ -338,14 +407,27 @@ async function waitIdle(page: Page, quietMs = 800, ms = 60_000) {
   }
   throw new Error(`moderator never went idle. Log:\n${fmt(await log(page))}`);
 }
+const nowQ = (page: Page) => page.evaluate(() => (window as unknown as { __taRunner: { queue: { now(): number } } }).__taRunner.queue.now()) as Promise<number>;
+const rtTransport = (page: Page) => page.evaluate(() => (window as unknown as { __taRunner: { rt: { transport: string } | null } }).__taRunner.rt?.transport ?? null);
 
-// ─────────────────────────────────────────────────────────────────────────────
-test(`OpenRealtime (${LIVE ? 'DeepSeek via OpenRouter' : 'mock LLM'}): consent → mic check → voice session over WebRTC; intro spoken, participant transcribed, complete_step advances; zero OpenAI requests`, async () => {
-  test.setTimeout(300_000);
-  const { token, studyId } = await createStudy(`ORT ${LIVE ? 'live' : 'mock'}`);
+type Kind = 'websocket' | 'webrtc' | 'fallback';
+interface Opened {
+  page: Page;
+  close: () => Promise<void>;
+  openaiHits: string[];
+  ortRequests: string[];
+  wsUrls: string[];
+  consoleLines: string[];
+  tok: { value: string; callsUrl?: string; wsUrl?: string; transport?: string };
+  callStatus: number | null;
+}
+/** New participant context → landing → consent → mic check → session (realtime connected, voice mode). */
+async function openSession(kind: Kind, token: string): Promise<Opened> {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, permissions: ['microphone', 'camera'] });
   await context.addInitScript(MIC_HOOK);
   await context.addInitScript(DC_TAP);
+  await context.addInitScript(WS_TAP);
+  if (kind === 'fallback') await context.addInitScript(NO_ICE);
   const openaiHits: string[] = [];
   await context.route('https://api.openai.com/**', (r) => {
     openaiHits.push(r.request().url());
@@ -357,11 +439,14 @@ test(`OpenRealtime (${LIVE ? 'DeepSeek via OpenRouter' : 'mock LLM'}): consent �
     if (r.url().includes('openai.com')) openaiHits.push(r.url());
   });
   const page = await context.newPage();
+  const wsUrls: string[] = [];
+  page.on('websocket', (w) => wsUrls.push(w.url()));
+  const consoleLines: string[] = [];
   page.on('console', (m) => {
+    if (m.text().includes('[realtime]')) consoleLines.push(m.text());
     if (m.type() === 'error' || m.text().includes('[realtime]')) console.log(`[browser:${m.type()}] ${m.text()}`);
   });
 
-  // Landing → consent → mic check (Kokoro speech mixed into the fake mic).
   await page.goto(`${WEB}/s/${token}`);
   await page.getByTestId('get-started').click();
   await page.getByTestId('opt-age').click();
@@ -370,40 +455,61 @@ test(`OpenRealtime (${LIVE ? 'DeepSeek via OpenRouter' : 'mock LLM'}): consent �
   await speak(page, 'mic_check');
   await expect(page.getByText('We can hear you.')).toBeVisible({ timeout: 20_000 });
   const tokenRes = page.waitForResponse((r) => r.url().includes('/realtime-token'), { timeout: 30_000 });
-  const callRes = page.waitForResponse((r) => r.url() === `${ORT}/v1/realtime/calls` && r.request().method() === 'POST', { timeout: 30_000 });
+  const callRes = kind === 'websocket' ? null : page.waitForResponse((r) => r.url() === `${ORT}/v1/realtime/calls` && r.request().method() === 'POST', { timeout: 30_000 });
   await page.getByTestId('device-continue').click();
+  const tok = (await (await tokenRes).json()) as Opened['tok'];
+  const call = callRes ? await callRes : null;
+  await expect(page.getByTestId('session')).toHaveAttribute('data-mode', 'voice', { timeout: 30_000 });
+  return { page, close: () => context.close(), openaiHits, ortRequests, wsUrls, consoleLines, tok, callStatus: call?.status() ?? null };
+}
 
-  // (1) The token is minted at OpenRealtime and the browser's SDP offer is answered by it.
-  const tok = (await (await tokenRes).json()) as { value: string; callsUrl?: string };
-  expect(tok.value).toMatch(/^ek_/);
-  expect(tok.callsUrl).toBe(`${ORT}/v1/realtime/calls`);
-  const sdp = await callRes;
-  expect(sdp.status()).toBe(201);
-  expect(await sdp.text()).toContain('a=fingerprint');
+const transportOf: Record<Kind, Transport> = { websocket: 'websocket', webrtc: 'webrtc', fallback: 'auto' };
+const latencies: Record<string, Record<string, number>> = {};
+
+/** The whole session: intro, voice answer (Whisper), complete_step tool call, task, interview answer, closing. */
+async function fullSession(kind: Kind) {
+  await startApi(transportOf[kind]);
+  const { token, studyId } = await createStudy(`ORT ${kind} ${LIVE ? 'live' : 'mock'}`);
+  const o = await openSession(kind, token);
+  const { page } = o;
   const session = page.getByTestId('session');
-  await expect(session).toHaveAttribute('data-mode', 'voice', { timeout: 20_000 });
 
-  // (2) The moderator reads the intro: audio over the WebRTC track + captions.
+  // (1) The token is minted at OpenRealtime; the transport is the one this variant expects.
+  expect(o.tok.value).toMatch(/^ek_/);
+  expect(o.tok.callsUrl).toBe(`${ORT}/v1/realtime/calls`);
+  expect(o.tok.transport).toBe(transportOf[kind]);
+  if (kind === 'webrtc') expect(o.tok.wsUrl).toBeUndefined();
+  else expect(o.tok.wsUrl).toBe(`${ORT.replace(/^http/, 'ws')}/v1/realtime`);
+  if (kind !== 'websocket') expect(o.callStatus).toBe(201); // the SDP exchange itself works (HTTP); in 'fallback' only the UDP media can't
+  await expect.poll(() => rtTransport(page), { timeout: 20_000 }).toBe(kind === 'webrtc' ? 'webrtc' : 'websocket');
+  if (kind === 'webrtc') expect(o.wsUrls.filter((u) => u.includes('/v1/realtime'))).toEqual([]);
+  else {
+    await expect.poll(() => o.wsUrls.some((u) => u.startsWith(`${ORT.replace(/^http/, 'ws')}/v1/realtime`)), { timeout: 20_000 }).toBe(true);
+    await expect.poll(() => o.consoleLines.some((l) => l.includes('[realtime] transport=websocket')), { timeout: 20_000 }).toBe(true);
+  }
+  if (kind === 'fallback') await expect.poll(() => o.consoleLines.some((l) => /WebRTC did not connect/.test(l)), { timeout: 20_000 }).toBe(true);
+
+  // (2) The moderator reads the intro: audio + captions.
   const introStart = await waitEvent(page, (e) => e.kind === 'speech.start' && e.data.who === 'moderator', 60_000, 'intro audio');
   const intro = await waitEvent(page, (e) => e.kind === 'transcript.moderator', 60_000, 'intro transcript');
-  console.log(`intro: "${intro.data.text}"`);
+  console.log(`[${kind}] intro: "${intro.data.text}"`);
   if (!LIVE) expect(String(intro.data.text)).toBe(INTRO);
   else expect(String(intro.data.text)).toMatch(/thanks for joining/i);
   const caption = await page.evaluate(() => (window as unknown as { __taRunner: { snapshot: { captions: { role: string; text: string }[] } } }).__taRunner.snapshot.captions.filter((c) => c.role === 'moderator').map((c) => c.text));
   expect(caption.join(' ')).toMatch(/thanks for joining/i);
   const remote = await page.evaluate(() => {
-    const a = [...document.querySelectorAll('audio')].find((el) => el.srcObject instanceof MediaStream);
-    return a ? (a.srcObject as MediaStream).getAudioTracks().map((t) => t.readyState) : [];
+    const rs = (window as unknown as { __taRunner: { rt: { remoteStream: MediaStream | null } } }).__taRunner.rt.remoteStream;
+    return rs ? rs.getAudioTracks().map((t) => t.readyState) : [];
   });
   expect(remote).toContain('live');
   await waitIdle(page);
 
   // (3) The participant answers by voice: OpenRealtime's VAD + Whisper transcribe it.
-  const spokeAt = (await page.evaluate(() => (window as unknown as { __taRunner: { queue: { now(): number } } }).__taRunner.queue.now())) as number;
+  const spokeAt = await nowQ(page);
   const dur = await speak(page, 'ready');
   const saidEnd = spokeAt + dur * 1000;
   const heard = await waitEvent(page, (e) => e.kind === 'transcript.participant' && e.t > spokeAt, 30_000, 'participant transcript');
-  console.log(`participant (transcribed): "${heard.data.text}"`);
+  console.log(`[${kind}] participant (transcribed): "${heard.data.text}"`);
   expect(String(heard.data.text)).toMatch(/ready/i);
 
   // (4) Tool call round trip: complete_step → the runner moves to the first task, whose text is read.
@@ -412,7 +518,7 @@ test(`OpenRealtime (${LIVE ? 'DeepSeek via OpenRouter' : 'mock LLM'}): consent �
   await expect(session).toHaveAttribute('data-step', 'task_find', { timeout: 20_000 });
   const taskStart = await waitEvent(page, (e) => e.kind === 'speech.start' && e.data.who === 'moderator' && e.t > tool.t, 60_000, 'task audio');
   const taskRead = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_find', 60_000, 'task reading');
-  console.log(`task: "${taskRead.data.text}"`);
+  console.log(`[${kind}] task: "${taskRead.data.text}"`);
   expect(String(taskRead.data.text)).toMatch(/Aurora desk lamp/i);
   await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 30_000 });
   await waitIdle(page);
@@ -420,49 +526,45 @@ test(`OpenRealtime (${LIVE ? 'DeepSeek via OpenRouter' : 'mock LLM'}): consent �
   // (5) "I'm done" → the moderator asks how it went → spoken answer → set_task_outcome ends the task.
   await page.getByTestId('im-done').click();
   const ask = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > taskRead.t, 60_000, 'how did it go');
-  console.log(`after done: "${ask.data.text}"`);
+  console.log(`[${kind}] after done: "${ask.data.text}"`);
   await waitIdle(page);
   await speak(page, 'went');
   const end = await waitEvent(page, (e) => e.kind === 'task.end' && e.stepId === 'task_find', 60_000, 'task.end');
-  console.log(`task.end: ${JSON.stringify(end.data)}`);
+  console.log(`[${kind}] task.end: ${JSON.stringify(end.data)}`);
   await expect(session).toHaveAttribute('data-step', 'wrapup', { timeout: 30_000 });
   const question = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'wrapup', 60_000, 'interview question');
-  console.log(`wrapup: "${question.data.text}"`);
+  console.log(`[${kind}] wrapup: "${question.data.text}"`);
   if (!LIVE) expect(String(ask.data.text)).toBe('How do you feel that went?');
   if (!LIVE) expect(String(question.data.text)).toMatch(/describe the website to a friend/);
   await waitIdle(page);
 
   // (6) Interview answer by voice → record_answer → closing text → session ends.
-  await speak(page, 'friend');
+  const answerAt = await nowQ(page);
+  const answerDur = await speak(page, 'friend');
   const rec = await waitEvent(page, (e) => e.kind === 'moderator.tool' && e.data.name === 'record_answer', 60_000, 'record_answer');
-  console.log(`record_answer: ${JSON.stringify(rec.data)}`);
+  console.log(`[${kind}] record_answer: ${JSON.stringify(rec.data)}`);
   expect(rec.data.ok).toBe(true);
   // A short preamble ("Got it.") can share the complete_step turn and be logged under the closing
   // step; the runner then dictates the closing itself. Wait for the verbatim reading.
-  const closing = await waitEvent(
-    page,
-    (e) => e.kind === 'transcript.moderator' && e.stepId === 'closing' && /thank you so much/i.test(String(e.data.text)),
-    60_000,
-    'closing',
-  );
-  const preambles = (await log(page)).filter((e) => e.kind === 'transcript.moderator' && e.stepId === 'closing' && e.data.text !== closing.data.text);
-  for (const p of preambles) console.log(`closing preamble: "${p.data.text}"`);
-  console.log(`closing: "${closing.data.text}"`);
+  const closing = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'closing' && /thank you so much/i.test(String(e.data.text)), 60_000, 'closing');
+  const closingStart = (await log(page)).find((e) => e.kind === 'speech.start' && e.data.who === 'moderator' && e.t > rec.t);
+  console.log(`[${kind}] closing: "${closing.data.text}"`);
 
   const evs = await log(page);
   fs.mkdirSync(OUT, { recursive: true });
-  fs.writeFileSync(path.join(OUT, `ort-${LIVE ? 'live' : 'mock'}.txt`), `${fmt(evs)}\n\n# realtime events\n${await tap(page, 1000)}`);
+  fs.writeFileSync(path.join(OUT, `ort-${kind}-${LIVE ? 'live' : 'mock'}.txt`), `${fmt(evs)}\n\n# realtime events\n${await tap(page, 1000)}`);
   const lat = {
     introAudioAfterSessionStartMs: Math.round(introStart.t - (evs.find((e) => e.kind === 'session.start')?.t ?? introStart.t)),
     transcriptAfterSpeechEndMs: Math.round(heard.t - saidEnd),
     toolCallAfterSpeechEndMs: Math.round(tool.t - saidEnd),
     taskAudioAfterToolMs: Math.round(taskStart.t - tool.t),
     taskAudioAfterSpeechEndMs: Math.round(taskStart.t - saidEnd),
+    closingAudioAfterSpeechEndMs: closingStart ? Math.round(closingStart.t - (answerAt + answerDur * 1000)) : -1,
   };
-  console.log('latencies:', JSON.stringify(lat));
-  console.log('moderator said:\n' + evs.filter((e) => e.kind === 'transcript.moderator').map((e) => `  - ${e.data.text}`).join('\n'));
+  latencies[kind] = lat;
+  console.log(`[${kind}] latencies:`, JSON.stringify(lat));
 
-  // (7) Stored in ThinkAloud: the participant transcript and the tool call reach the server.
+  // (7) Stored in ThinkAloud: the participant transcript and the tool calls reach the server.
   await expect
     .poll(
       async () => {
@@ -476,16 +578,67 @@ test(`OpenRealtime (${LIVE ? 'DeepSeek via OpenRouter' : 'mock LLM'}): consent �
   {
     const { sessions } = await call<{ sessions: { id: string }[] }>('GET', `/api/studies/${studyId}/sessions`);
     const d = await call<{ answers: { questionId: string; text?: string }[]; taskResults: { stepId: string; outcome: string }[] }>('GET', `/api/sessions/${sessions[0].id}`);
-    console.log('stored:', JSON.stringify({ answers: d.answers.map((a) => [a.questionId, a.text]), tasks: d.taskResults.map((t) => [t.stepId, t.outcome]) }));
     expect(d.taskResults.map((t) => t.stepId)).toContain('task_find');
     expect(d.answers.some((a) => a.questionId === 'wrapup_q1' && (LIVE ? Boolean(a.text) : /clean and simple/i.test(a.text ?? '')))).toBe(true);
   }
 
-  // (8) Not a single request to OpenAI; the WebRTC call went to OpenRealtime.
-  expect(ortRequests.some((r) => r.startsWith(`POST ${ORT}/v1/realtime/calls`))).toBe(true);
-  expect(openaiHits).toEqual([]);
-  const health = (await (await fetch(`${ORT}/health`)).json()) as { calls_total: number; llm: string };
-  expect(health.calls_total).toBeGreaterThan(0);
+  // (8) Not a single request to OpenAI.
+  expect(o.openaiHits).toEqual([]);
+  if (kind === 'webrtc') expect(o.ortRequests.some((r) => r.startsWith(`POST ${ORT}/v1/realtime/calls`))).toBe(true);
+  const health = (await (await fetch(`${ORT}/health`)).json()) as { llm: string };
   expect(health.llm).toBe(LIVE ? 'openrouter' : 'mock');
-  await context.close();
+  await o.close();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+test(`OpenRealtime (${LIVE ? 'DeepSeek via OpenRouter' : 'mock LLM'}) over the WebSocket (REALTIME_TRANSPORT=websocket, the self-hosted default): full session; zero OpenAI requests`, async () => {
+  test.setTimeout(300_000);
+  await fullSession('websocket');
+});
+
+test('WebSocket barge-in: participant speech during the moderator stops playback at once and truncates to what was played', async () => {
+  test.setTimeout(180_000);
+  await startApi('websocket');
+  const { token } = await createStudy('ORT barge-in');
+  const o = await openSession('websocket', token);
+  const { page } = o;
+  const introStart = await waitEvent(page, (e) => e.kind === 'speech.start' && e.data.who === 'moderator', 60_000, 'intro audio');
+  // Let ~2.5 s of the (~12 s) intro play, then talk over it.
+  while ((await nowQ(page)) - introStart.t < 2500) await page.waitForTimeout(100);
+  const spokeAt = await nowQ(page);
+  void speak(page, 'ready').catch(() => {});
+  const userStart = await waitEvent(page, (e) => e.kind === 'speech.start' && e.data.who === 'participant' && e.t >= spokeAt, 15_000, 'participant speech start');
+  const modStop = await waitEvent(page, (e) => e.kind === 'speech.stop' && e.data.who === 'moderator' && e.t >= introStart.t, 15_000, 'moderator audio stop');
+  const playedMs = modStop.t - introStart.t;
+  const cutAfterSpeechStartMs = Math.round(modStop.t - userStart.t);
+  console.log(`[barge-in] speech onset → speech_started ${Math.round(userStart.t - spokeAt)} ms; speech_started → playback stopped ${cutAfterSpeechStartMs} ms; moderator audible for ${Math.round(playedMs)} ms`);
+  expect(cutAfterSpeechStartMs).toBeLessThan(250); // client-side cut: no network round trip
+  // The client sent conversation.item.truncate with the played position (≈ how long it was audible).
+  const truncs = await page.evaluate(() => ((window as unknown as { __dcTap: { dir: string; type: string; ms?: number }[] }).__dcTap ?? []).filter((e) => e.dir === '>' && e.type === 'conversation.item.truncate'));
+  console.log(`[barge-in] truncate sent: ${JSON.stringify(truncs)}`);
+  if (!truncs.length) console.log(`[barge-in] realtime events:\n${await tap(page, 60)}\nclient trace:\n${(await page.evaluate(() => (window as unknown as { __taRunner: { rt: { trace: string[] } } }).__taRunner.rt.trace)).slice(-40).join('\n')}`);
+  expect(truncs.length).toBeGreaterThan(0);
+  const ms = truncs[0].ms!;
+  expect(ms).toBeGreaterThan(1500);
+  expect(ms).toBeLessThan(12_000);
+  expect(Math.abs(ms - playedMs)).toBeLessThan(400);
+  // The moderator's logged intro is cut to what was heard (not the whole paragraph).
+  const said = await waitEvent(page, (e) => e.kind === 'transcript.moderator', 30_000, 'cut intro transcript');
+  console.log(`[barge-in] heard: "${said.data.text}" truncated=${said.data.truncated}`);
+  expect(String(said.data.text).length).toBeLessThan(INTRO.length);
+  // Server side: the item was truncated (conversation.item.truncated comes back).
+  await expect.poll(() => page.evaluate(() => ((window as unknown as { __dcTap: { dir: string; type: string }[] }).__dcTap ?? []).some((e) => e.dir === '<' && e.type === 'conversation.item.truncated')), { timeout: 10_000 }).toBe(true);
+  expect(o.openaiHits).toEqual([]);
+  await o.close();
+});
+
+test(`OpenRealtime: WebRTC whose ICE can never connect (REALTIME_TRANSPORT=auto) falls back to the WebSocket and completes the session`, async () => {
+  test.setTimeout(300_000);
+  await fullSession('fallback');
+});
+
+test(`OpenRealtime (${LIVE ? 'DeepSeek via OpenRouter' : 'mock LLM'}) over WebRTC (REALTIME_TRANSPORT=webrtc): full session; zero OpenAI requests`, async () => {
+  test.setTimeout(300_000);
+  await fullSession('webrtc');
+  if (latencies.websocket) console.log('latency WS vs WebRTC (ms):', JSON.stringify(Object.fromEntries(Object.keys(latencies.webrtc).map((k) => [k, { ws: latencies.websocket[k], webrtc: latencies.webrtc[k], fallback: latencies.fallback?.[k] }]))));
 });
