@@ -21,7 +21,7 @@ from aiohttp import web
 
 from . import events as E
 from .config import Config
-from .session import Engine, NullOutput, Session
+from .session import SCHED, Engine, NullOutput, Session
 
 log = logging.getLogger("ort.server")
 
@@ -36,6 +36,7 @@ class ServerState:
         self.tokens: dict[str, dict] = {}
         self.calls: dict[str, object] = {}
         self.sessions: set[Session] = set()
+        self._reserved = 0          # slots held by WebRTC offers still being negotiated
         self.started = time.time()
         self.counters = {"sessions_total": 0, "tokens_minted": 0, "calls_total": 0}
 
@@ -91,15 +92,22 @@ class ServerState:
             cfg = self.build_session_config(patch, model)
         s = Session(self.engine, self.cfg, cfg, transport=transport)
         if output_factory is not None:
-            out = output_factory(s)
-            s.output = out
-            out.on_event = s._on_output_event
-            out.emit = s._emit
+            s.attach_output(output_factory(s))
         self.counters["sessions_total"] += 1
         return s
 
     def at_capacity(self) -> bool:
-        return len(self.sessions) >= self.cfg.max_sessions
+        return len(self.sessions) + self._reserved >= self.cfg.max_sessions
+
+    def reserve(self) -> bool:
+        """Hold a session slot across the awaits of an SDP negotiation (no over-admission)."""
+        if self.at_capacity():
+            return False
+        self._reserved += 1
+        return True
+
+    def release(self) -> None:
+        self._reserved = max(0, self._reserved - 1)
 
     def track(self, s: Session) -> None:
         self.sessions.add(s)
@@ -196,8 +204,16 @@ async def calls(request: web.Request) -> web.Response:
     ok, token, err = state.authorize(state.bearer(request))
     if not ok:
         return _err(401, err, "invalid_api_key")
-    if state.at_capacity():
+    if not state.reserve():
         return _err(503, "Too many concurrent sessions", "session_limit_reached", "server_error")
+    try:
+        return await _calls(request, state, token)
+    finally:
+        state.release()
+
+
+async def _calls(request: web.Request, state: ServerState, token) -> web.Response:
+    from .transport_webrtc import create_call
     ctype = request.content_type or ""
     patch = None
     if ctype.startswith("multipart/"):
@@ -229,6 +245,7 @@ async def calls(request: web.Request) -> web.Response:
             E.apply_session_patch(call.session.config, {k: v for k, v in patch.items() if k != "model"})
             call.session._apply_turn_detection()
         except E.SessionConfigError as e:
+            await call.close()
             return _err(400, str(e), e.code, param=e.param)
     state.counters["calls_total"] += 1
     return web.Response(status=201, text=call.pc.localDescription.sdp, content_type="application/sdp",
@@ -253,7 +270,7 @@ async def health(request: web.Request) -> web.Response:
     return web.json_response({
         "ok": True, "uptime_s": round(time.time() - state.started, 1), "sessions": len(state.sessions),
         "calls": len(state.calls), "engine": getattr(eng, "name", None) if eng else "not_loaded",
-        "llm": state.cfg.llm, **state.counters,
+        "llm": state.cfg.llm, **state.counters, "scheduler": SCHED.snapshot(),
     })
 
 

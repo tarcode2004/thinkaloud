@@ -145,3 +145,179 @@ def test_force_stop():
     ev = td.force_stop()
     assert ev.type == "speech_stopped" and len(ev.audio) > SR
     assert not td.in_speech
+
+
+# ---------------------------------------------------------------- hardening
+from engine_common import at_level, babble  # noqa: E402
+
+SENT = "I would like to book a table for two people tomorrow evening."
+
+
+def _speech_case(x, cfg=None):
+    return _types(feed_stream(TurnDetector(cfg or {"type": "server_vad"}), x))
+
+
+@requires_gpu
+def test_nan_input_does_not_kill_vad():
+    """Regression: NaN samples made Silero's recurrent state NaN forever: no speech ever again."""
+    td = TurnDetector({"type": "server_vad"})
+    bad = np.zeros(SR, np.float32)
+    bad[100:200] = np.nan
+    bad[300] = np.inf
+    feed_stream(td, bad)
+    ev = feed_stream(td, pad(speech16k(SENT), 0.5, 1.5))
+    assert _types(ev) == ["speech_started", "speech_stopped"]
+
+
+@requires_gpu
+@pytest.mark.parametrize("name,make", [
+    ("quiet -45 dBFS", lambda s: at_level(s, -45)),
+    ("quiet -50 dBFS + noise", lambda s: at_level(s, -50) + pink_noise(len(s), -75)),
+    ("DC +0.3", lambda s: s + 0.3),
+    ("DC -0.2 + pink", lambda s: s - 0.2 + pink_noise(len(s), -45)),
+    ("clipped x30", lambda s: np.clip(s * 30, -1, 1)),
+    ("fan SNR 6 dB", lambda s: s + pink_noise(len(s), -30, seed=2)),
+])
+def test_speech_detected_under_odd_levels(name, make):
+    x = make(pad(speech16k(SENT), 1.0, 2.0)).astype(np.float32)
+    assert _speech_case(x) == ["speech_started", "speech_stopped"], name
+
+
+def _music(n, db):
+    t = np.arange(n) / SR
+    y = np.zeros(n)
+    notes = [220, 277, 330, 440, 330, 277]
+    for k in range(int(n / (0.4 * SR))):
+        s0, s1 = int(k * 0.4 * SR), min(n, int((k + 1) * 0.4 * SR))
+        env = np.exp(-np.arange(s1 - s0) / SR * 4)
+        for h in (1, 2, 3, 4):
+            y[s0:s1] += env * np.sin(2 * np.pi * notes[k % 6] * h * t[s0:s1]) / h
+    return (y / np.sqrt(np.mean(y * y)) * 10 ** (db / 20)).astype(np.float32)
+
+
+@requires_gpu
+@pytest.mark.parametrize("name,make", [
+    ("babble8 -35", lambda n: babble(n, -35)),
+    ("babble8 -45", lambda n: babble(n, -45)),
+    ("music -25", lambda n: _music(n, -25)),
+    ("fan -25", lambda n: pink_noise(n, -25, seed=5)),
+    ("DC 0.3 + pink -40", lambda n: np.full(n, 0.3, np.float32) + pink_noise(n, -40)),
+])
+def test_noise_only_never_starts_a_turn(name, make):
+    assert _speech_case(make(SR * 10)) == [], name
+
+
+@requires_gpu
+@pytest.mark.parametrize("db", [-35, -45])
+def test_user_over_babble_starts_and_ends(db):
+    """Babble is 'speech' to Silero: the onset must stand out from the ambient level, and the
+    turn must end when the user stops (it used to run forever while the babble went on)."""
+    s = speech16k(SENT)
+    n = SR * 10
+    x = babble(n, db)
+    x[3 * SR:3 * SR + len(s)] += s
+    ev = feed_stream(TurnDetector({"type": "server_vad"}), x)
+    assert _types(ev) == ["speech_started", "speech_stopped"], [(e.type, e.audio_ms) for e in ev]
+    user_end = 3000 + np.flatnonzero(np.abs(s) > 0.02)[-1] * 1000 // SR
+    assert ev[1].detected_ms - user_end <= 2000          # 500 ms silence_duration + babble tail
+
+
+@requires_gpu
+@pytest.mark.parametrize("word", ["Yes.", "No.", "Okay.", "Mhm.", "Five.", "Two."])
+@pytest.mark.parametrize("voice", ["af_heart", "am_michael", "bf_emma"])
+def test_one_word_answers_trigger_both_events(word, voice):
+    x = pad(speech16k(word, voice), 1.0, 5.0)
+    for cfg in ({"type": "server_vad"}, {"type": "semantic_vad", "eagerness": "auto"}):
+        ev = feed_stream(TurnDetector(cfg), x)
+        assert _types(ev) == ["speech_started", "speech_stopped"], (word, voice, cfg)
+        assert ev[1].audio is not None and len(ev[1].audio) > 0.2 * SR
+
+
+@requires_gpu
+def test_long_monologue_memory_and_smart_turn_window_bounded():
+    """90 s of speech without a stop: ring buffer stays at its capacity and smart-turn only ever
+    sees <= 8 s (it used to copy the whole utterance each re-score)."""
+    import ort.turn as T
+    seen = []
+    orig = T.SmartTurn.predict
+    T.SmartTurn.predict = lambda self, a: (seen.append(len(a)), orig(self, a))[1]
+    try:
+        td = TurnDetector({"type": "semantic_vad", "eagerness": "low"}, history_s=120)
+        one = pad(speech16k("So I was thinking that maybe we could go there, and then"), 0.0, 0.45)
+        x = np.tile(one, int(np.ceil(90 * SR / len(one))))
+        ev = feed_stream(td, x, chunk=1600)
+        assert td.ring._buf.nbytes == 120 * SR * 4
+        assert seen and max(seen) <= 8 * SR
+        assert _types(ev)[:1] == ["speech_started"]
+    finally:
+        T.SmartTurn.predict = orig
+
+
+def _paused(text, after_word, gap_s):
+    """`text` spoken in one go (continuation prosody), with a pause inserted after `after_word`."""
+    from engine_common import tts
+    from ort.audio import resample
+    t = tts()
+    kv, key = t.resolve("af_heart", "en")
+
+    def synth():
+        import torch
+        torch.manual_seed(0)
+        return t._synth(text, kv, key, 1.0, None)
+    a, words = t._executor.submit(synth).result()
+    ws = [w for w in words if w[0].strip()]
+    k = [i for i, w in enumerate(ws) if w[0].strip(" .,").lower() == after_word][0]
+    cut = int((ws[k][2] + ws[k + 1][1]) / 2 * 24000)
+    r = lambda y: resample(y, 24000, SR)  # noqa: E731
+    return np.concatenate([np.zeros(SR, np.float32), r(a[:cut]), np.zeros(int(gap_s * SR), np.float32),
+                           r(a[cut:]), np.zeros(9 * SR, np.float32)])
+
+
+@requires_gpu
+@pytest.mark.parametrize("gap", [0.8, 1.5])
+@pytest.mark.parametrize("eagerness", ["low", "auto"])
+def test_semantic_vad_waits_through_mid_sentence_pause(gap, eagerness):
+    x = _paused("So I was thinking that maybe we could go to the beach tomorrow.", "could", gap)
+    ev = feed_stream(TurnDetector({"type": "semantic_vad", "eagerness": eagerness}), x)
+    assert _types(ev) == ["speech_started", "speech_stopped"]
+
+
+@requires_gpu
+@pytest.mark.parametrize("gap", [0.8, 1.5])
+@pytest.mark.parametrize("eagerness", ["low", "auto"])
+def test_transcript_hint_keeps_floor_when_prosody_sounds_final(gap, eagerness):
+    """smart-turn scores "I'd like to <pause>" as complete (p~0.98). With the speculative
+    transcript as a hint (the session has it ~100 ms into the pause) the turn is kept."""
+    x = _paused("I'd like to book a table for two.", "to", gap)
+    plain = feed_stream(TurnDetector({"type": "semantic_vad", "eagerness": eagerness}), x)
+    assert _types(plain).count("speech_stopped") == 2          # the problem
+    td = TurnDetector({"type": "semantic_vad", "eagerness": eagerness},
+                      on_pause=lambda a, s, e: td.set_transcript_hint("I'd like to."))
+    ev = feed_stream(td, x)
+    assert _types(ev) == ["speech_started", "speech_stopped"]
+
+
+@requires_gpu
+def test_transcript_hint_short_answer_ends_fast():
+    x = pad(speech16k("Five.", "am_onyx"), 1.0, 6.0)
+    td = TurnDetector({"type": "semantic_vad", "eagerness": "auto"},
+                      on_pause=lambda a, s, e: td.set_transcript_hint("5."))
+    sp = [e for e in feed_stream(td, x) if e.type == "speech_stopped"][0]
+    assert sp.detected_ms - sp.audio_ms <= 700
+
+
+@requires_gpu
+@pytest.mark.parametrize("sd,gap,stops", [(500, 0.8, 2), (2000, 0.8, 1), (2000, 1.5, 1), (2000, 2.5, 2)])
+def test_server_vad_mid_sentence_pause_follows_silence_duration(sd, gap, stops):
+    x = _paused("I'd like to book a table for two.", "to", gap)
+    ev = feed_stream(TurnDetector({"type": "server_vad", "silence_duration_ms": sd}), x)
+    assert _types(ev).count("speech_stopped") == stops
+
+
+def test_transcript_hint_classification():
+    td = TurnDetector({"type": "server_vad"})
+    for text, inc in [("I'd like to", True), ("I'd like to.", True), ("I want to, um", True), ("and the", True),
+                      ("Ich möchte einen Tisch für", True), ("So...", True), ("Book a table.", False),
+                      ("Is it open?", False), ("I need it.", False), ("Yes, I can.", False), ("", False)]:
+        td.set_transcript_hint(text)
+        assert td._hint_incomplete is inc, text

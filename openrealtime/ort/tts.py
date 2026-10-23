@@ -26,7 +26,6 @@ accented. If espeak-ng lacks the language too, English is used.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
 import re
 import threading
@@ -36,6 +35,7 @@ from typing import AsyncIterator, Iterable
 
 import numpy as np
 
+from .audio import GPU_GATE, PriorityExecutor
 from .textnorm import SpeechNormalizer
 
 log = logging.getLogger("ort.tts")
@@ -135,6 +135,9 @@ class ClauseSegmenter:
                 prev = re.search(r"(\S+)$", b[:m.start()])
                 w = prev.group(1).lower().rstrip(".") if prev else ""
                 if w in _ABBREV or (len(w) == 1 and w.isalpha()):
+                    continue
+                # "1. First item": a list marker at the start of a line is not a sentence
+                if w.isdigit() and re.search(r"(^|\n)[ \t]*\d+$", b[:m.start()]):
                     continue
             if b[:end].strip():
                 return end
@@ -250,6 +253,30 @@ class SpokenAudio(np.ndarray):
         return self.view(np.ndarray)
 
 
+def _phoneme_safe_chunks(text: str, max_chars: int = 200) -> list[str]:
+    """Split text so each piece stays well below Kokoro's 510-phoneme limit (espeak output is
+    roughly 1-1.3 phonemes per character): at sentence ends, else clause marks, else spaces."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+    out = []
+    while len(text) > max_chars:
+        window = text[:max_chars]
+        cut = -1
+        for pat in (r"[.!?…](?=\s)", r"[,;:](?=\s)", r"\s"):
+            ms = list(re.finditer(pat, window))
+            if ms and ms[-1].end() > max_chars // 3:
+                cut = ms[-1].end()
+                break
+        if cut <= 0:
+            cut = max_chars                      # one giant 'word': hard cut
+        out.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        out.append(text)
+    return [p for p in out if p]
+
+
 def _trim(a: np.ndarray, lead_ms: int, trail_ms: int, thresh: float = 2e-3) -> tuple[np.ndarray, int]:
     """Trim leading/trailing near-silence, keeping some margin. Returns (audio, start_index)."""
     if not len(a):
@@ -279,7 +306,9 @@ class TTS:
         self.device = device
         self.repo_id = repo_id
         self.default_language = default_language
-        self._executor = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="ort-tts")
+        # one GPU thread shared by all sessions; the first clause of any response jumps the
+        # queue, later clauses go round-robin (clause k of every stream before clause k+1)
+        self._executor = PriorityExecutor("ort-tts")
         self._model = None
         self._pipes: dict[str, object] = {}
         self._lock = threading.Lock()
@@ -287,7 +316,9 @@ class TTS:
 
     # ---------------- loading ----------------
     def _load(self):
-        with self._lock:
+        if self._model is not None:
+            return self._model
+        with GPU_GATE.exclusive(), self._lock:
             if self._model is None:
                 import torch
                 from kokoro import KModel
@@ -302,7 +333,10 @@ class TTS:
             return p
         from kokoro import KPipeline
         model = self._load()
-        with self._lock:
+        with GPU_GATE.exclusive(), self._lock:
+            p = self._pipes.get(key)
+            if p is not None:
+                return p
             if key.startswith("x:"):
                 from misaki import espeak
                 p = KPipeline(lang_code="e", repo_id=self.repo_id, model=model)
@@ -380,8 +414,15 @@ class TTS:
         if cancel is not None and cancel.is_set():
             return None
         pipe = self._pipeline(key)
+        with GPU_GATE.shared():
+            return self._synth_locked(pipe, text, kvoice, key, speed, cancel)
+
+    def _synth_locked(self, pipe, text, kvoice, key, speed, cancel):
         audios, words, off = [], [], 0.0
-        for r in pipe(text, voice=kvoice, speed=speed, split_pattern=None):
+        # English G2P splits at Kokoro's 510-phoneme limit itself; the espeak path only cuts at
+        # sentence ends and silently TRUNCATES longer phoneme strings, so pre-split those.
+        parts = [text] if key in ("a", "b") else _phoneme_safe_chunks(text)
+        for r in (r for part in parts for r in pipe(part, voice=kvoice, speed=speed, split_pattern=None)):
             if cancel is not None and cancel.is_set():
                 return None
             if r.audio is None:
@@ -408,13 +449,19 @@ class TTS:
 
     async def stream(self, text_chunks: AsyncIterator[str] | Iterable[str], voice: str = "alloy",
                      speed: float = 1.0, language: str | None = None,
-                     lookahead: int = 2) -> AsyncIterator[SpokenAudio]:
-        """LLM text deltas -> SpokenAudio chunks (float32 @24 kHz). Cancel-safe."""
+                     lookahead: int = 2, priority: int | None = None) -> AsyncIterator[SpokenAudio]:
+        """LLM text deltas -> SpokenAudio chunks (float32 @24 kHz). Cancel-safe.
+
+        Scheduling across concurrent streams: segment 0 runs before any later segment of any
+        stream; segment k>0 of every stream before segment k+1 (round-robin). `priority` (lower
+        = sooner, default 1) shifts this stream's later segments, e.g. 0 for a short urgent
+        prompt, 2 for background synthesis. A closed stream's queued work is dropped."""
         loop = asyncio.get_running_loop()
         kvoice, key = self.resolve(voice, language)
         lang = (language or self.default_language or "en").lower().split("-")[0]
         speed = float(min(1.5, max(0.25, speed or 1.0)))
         cancel = threading.Event()
+        job_key = ("tts", id(cancel))
         seg_q: asyncio.Queue = asyncio.Queue()
         out_q: asyncio.Queue = asyncio.Queue(maxsize=max(1, lookahead))
         t0 = time.perf_counter()
@@ -457,8 +504,9 @@ class TTS:
                     if not spoken:
                         continue
                     ts = time.perf_counter()
-                    res = await loop.run_in_executor(self._executor, self._synth, spoken, kvoice, key,
-                                                     speed, cancel)
+                    prio = (0, 0, 0) if idx == 0 else (1, 1 if priority is None else int(priority), idx)
+                    res = await asyncio.wrap_future(self._executor.submit_prio(
+                        prio, self._synth, spoken, kvoice, key, speed, cancel, key=job_key))
                     if res is None:
                         return
                     audio, words = res
@@ -494,6 +542,7 @@ class TTS:
                 yield item
         finally:
             cancel.set()
+            self._executor.drop(job_key)          # queued clauses of an abandoned stream: skip
             for t in (rtask, stask):
                 t.cancel()
             for t in (rtask, stask):

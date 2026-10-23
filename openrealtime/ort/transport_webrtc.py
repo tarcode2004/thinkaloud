@@ -31,6 +31,45 @@ RTC_SR = 48000
 FRAME_MS = 20
 FRAME_24 = OUT_SR * FRAME_MS // 1000      # 480
 FRAME_48 = RTC_SR * FRAME_MS // 1000      # 960
+MIC_GAP_S = 0.3                           # no mic frame for this long → feed silence
+
+
+class PassThroughAudioJitterBuffer:
+    """Replacement for aiortc's audio JitterBuffer(capacity=16, prefetch=4) on the *mic* receiver.
+
+    The server never plays the mic audio, it only feeds VAD/STT, so there is nothing to smooth:
+    frames are released the moment they arrive, in sequence order. A gap (lost packet) is skipped
+    immediately (the hole is filled with silence from the RTP timestamps in `Call._read_mic`), and a
+    packet older than one already released is dropped. aiortc's buffer instead stalls at every hole
+    until 16 later packets arrived and then keeps discarding real frames: at 15 % packet loss it
+    delivered ~40 % of the audio."""
+
+    capacity = 16
+
+    def __init__(self) -> None:
+        self._next: int | None = None
+        self.released = 0
+        self.lost = 0
+        self.late = 0
+
+    def add(self, packet):
+        from aiortc.jitterbuffer import JitterFrame
+        seq = packet.sequence_number
+        if self._next is not None:
+            d = (seq - self._next) & 0xFFFF
+            if d >= 0x8000:            # behind what was already released
+                self.late += 1
+                return False, None
+            self.lost += d
+        self._next = (seq + 1) & 0xFFFF
+        self.released += 1
+        return False, JitterFrame(data=packet._data, timestamp=packet.timestamp)
+
+
+def install_mic_jitter_buffer(pc) -> None:
+    for t in pc.getTransceivers():
+        if t.kind == "audio" and t.receiver is not None and hasattr(t.receiver, "_RTCRtpReceiver__jitter_buffer"):
+            t.receiver._RTCRtpReceiver__jitter_buffer = PassThroughAudioJitterBuffer()
 
 
 class RTCAudioOutput(AudioOutput):
@@ -44,6 +83,7 @@ class RTCAudioOutput(AudioOutput):
         self._playing: str | None = None     # response id whose audio is currently going out
         self.frames = 0
         self.last_nonsilent_at = 0.0
+        self._clock_end = 0.0                 # playout time (monotonic) at which the last pulled frame ends
 
     def _emit_buf(self, typ: str, response_id: str) -> None:
         if self.on_event is not None:
@@ -53,7 +93,14 @@ class RTCAudioOutput(AudioOutput):
         """Next 20 ms at 24 kHz (zeros where nothing is queued) and its bookkeeping."""
         out = np.zeros(FRAME_24, np.float32)
         filled = 0
-        base = time.monotonic() + self.delay
+        # Frames play back to back at the receiver: a burst after a stall plays sequentially, so a
+        # frame plays at max(arrival + delay, end of the previous frame). A jitter buffer that has
+        # grown (stall) speeds up a little until it is back at its target delay (NetEQ "accelerate"):
+        # converge by <= 2 ms per frame, re-sync if more than 300 ms behind. No drift, no bunching.
+        now = time.monotonic() + self.delay
+        excess = self._clock_end - now
+        base = now if excess <= 0 or excess > 0.3 else self._clock_end - min(excess, 0.002)
+        self._clock_end = base + FRAME_MS / 1000
         while filled < FRAME_24:
             it = self._head()
             if it is None:
@@ -67,7 +114,7 @@ class RTCAudioOutput(AudioOutput):
             if pcm.size == 0:
                 break
             out[filled:filled + pcm.size] = pcm
-            it.mark_sent(int(pcm.size), base + filled / OUT_SR)
+            self._mark(it, pcm, base + filled / OUT_SR)
             filled += pcm.size
         if filled:
             self.last_nonsilent_at = time.monotonic()
@@ -82,14 +129,18 @@ class RTCAudioOutput(AudioOutput):
                 self._playing = None
                 self._emit_buf("stopped", it.response_id)
 
+    def _cut_time(self, now: float) -> float:
+        return float("inf")      # RTP already sent cannot be recalled: all of it is heard
+
     def _on_clear(self, hit) -> None:
         seen = []
         for it in hit:
             if it.response_id not in seen:
                 seen.append(it.response_id)
-        if self._playing and self._playing not in seen:
+        if self._playing and self._playing not in seen and not any(it.response_id == self._playing for it in self.order):
             seen.append(self._playing)
-        self._playing = None
+        if self._playing in seen:
+            self._playing = None
         for rid in seen:
             self._emit_buf("cleared", rid)
 
@@ -189,6 +240,8 @@ class Call:
         self.in_q: asyncio.Queue = asyncio.Queue()
         self.tasks: list[asyncio.Task] = []
         self.closed = False
+        self.mic_gaps = 0
+        self.mic_filled_s = 0.0
         session.add_listener(self._on_event)
 
     # session → client
@@ -202,6 +255,8 @@ class Call:
                 log.exception("datachannel send failed")
         else:
             self.pending.append(data)
+            if len(self.pending) > 5000:      # channel never opened: keep the newest, bounded
+                del self.pending[:1000]
 
     def attach_channel(self, dc) -> None:
         self.dc = dc
@@ -226,24 +281,62 @@ class Call:
         def _close():
             asyncio.ensure_future(self.close())
 
+    def pending_events(self) -> list[dict]:
+        """Events queued while the data channel is not open (tests / diagnostics)."""
+        return [json.loads(d) for d in self.pending]
+
     async def _event_worker(self) -> None:
+        limit = getattr(self.session.cfg, "max_event_bytes", None)
         while True:
             m = await self.in_q.get()
             try:
-                ev = json.loads(m)
-            except ValueError:
-                self._on_event(E.error_event("invalid_json", "The server could not parse the event as JSON."))
-                continue
-            await self.session.handle(ev)
+                ev, err = E.parse_client_event(m, limit)
+                if err is not None:
+                    self._on_event(err)
+                    continue
+                await self.session.handle(ev)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - handle() already reports; never let the worker die
+                log.exception("data channel event failed")
 
     async def _read_mic(self, track) -> None:
         from aiortc.mediastreams import MediaStreamError
         rs: Resampler | None = None
         rate = 0
+        got_any = False
+        gap = MIC_GAP_S
+        next_pts: float | None = None     # RTP-timeline position (s) where the next frame should start
+        wall_filled = 0.0                 # silence already fed by the wall-clock gap filler
         try:
             while True:
-                frame = await track.recv()
+                try:
+                    frame = await (asyncio.wait_for(track.recv(), gap) if got_any else track.recv())
+                except asyncio.TimeoutError:
+                    # No frames (track removed / network gap): keep the input timeline moving with
+                    # silence, so a turn in progress still ends and idle timeouts still count.
+                    self.session.feed_input_16k(np.zeros(int(IN_SR * gap), np.float32))
+                    wall_filled += gap
+                    self.mic_gaps += 1
+                    continue
+                got_any = True
                 x, sr = frame_to_mono_float(frame)
+                # Lost / jitter-buffer-dropped RTP packets leave holes in the RTP timeline (aiortc
+                # drops whole runs of frames around a loss). Fill them with silence so the input
+                # timeline (VAD timing, audio_start/end_ms, truncation) stays real time.
+                if frame.pts is not None and frame.time_base:
+                    t = float(frame.pts * frame.time_base)
+                    if next_pts is not None:
+                        hole = t - next_pts
+                        if hole < -0.01 and hole > -600:
+                            continue                          # late duplicate / reordered frame
+                        if 0.005 < hole < 10:
+                            fill = hole - wall_filled
+                            if fill > 0.005:
+                                self.session.feed_input_16k(np.zeros(int(IN_SR * fill), np.float32))
+                                self.mic_filled_s += fill
+                    next_pts = t + x.size / sr
+                    wall_filled = 0.0
                 if rs is None or sr != rate:
                     rate = sr
                     rs = Resampler(sr, IN_SR)
@@ -259,15 +352,26 @@ class Call:
         if track.kind == "audio":
             self.tasks.append(asyncio.get_running_loop().create_task(self._read_mic(track)))
 
+    async def _connect_watchdog(self, timeout: float) -> None:
+        """A peer that never completes ICE/DTLS (blocked UDP, tab closed right after the offer) would
+        otherwise hold its session forever. Once connected, aioice consent checks (RFC 7675) turn a
+        vanished peer into connectionState 'failed', which closes the call."""
+        await asyncio.sleep(timeout)
+        if not self.closed and self.pc.connectionState != "connected":
+            log.info("call %s not connected after %.0fs (%s): closing", self.id, timeout, self.pc.connectionState)
+            await self.close()
+
     async def close(self) -> None:
         if self.closed:
             return
         self.closed = True
         self.state.calls.pop(self.id, None)
         self.state.untrack(self.session)
+        me = asyncio.current_task()
         for t in self.tasks:
-            t.cancel()
-        await self.session.close()
+            if t is not me:
+                t.cancel()
+        await asyncio.shield(self.session.close())
         with contextlib.suppress(Exception):
             await self.pc.close()
 
@@ -297,6 +401,7 @@ async def create_call(state, offer_sdp: str, token, model: str | None) -> Call:
 
     try:
         await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
+        install_mic_jitter_buffer(pc)
         pc.addTrack(outbound_track(output))   # binds to the offer's audio m-line (sendrecv or recvonly)
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
@@ -308,4 +413,5 @@ async def create_call(state, offer_sdp: str, token, model: str | None) -> Call:
     state.track(session)
     call.start()
     session.start()
+    call.tasks.append(asyncio.get_running_loop().create_task(call._connect_watchdog(state.cfg.webrtc_connect_timeout_s)))
     return call

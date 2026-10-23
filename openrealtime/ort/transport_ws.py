@@ -41,7 +41,8 @@ class WSAudioOutput(AudioOutput):
         self._task = asyncio.get_running_loop().create_task(self._run())
 
     def _on_clear(self, hit) -> None:
-        self._clock_end = time.monotonic()
+        # The playout clock now ends where the audio still queued (other responses) ends.
+        self._clock_end = max([time.monotonic()] + [it.play_end() for it in self.order])
         self.wakeup.set()
 
     def _encode(self, it, pcm: np.ndarray) -> str:
@@ -76,7 +77,7 @@ class WSAudioOutput(AudioOutput):
             play_start = max(now, self._clock_end)
             self._clock_end = play_start + pcm.size / OUT_SR
             data = self._encode(it, pcm)
-            it.mark_sent(int(pcm.size), play_start)
+            self._mark(it, pcm, play_start)
             if self.emit is not None:
                 self.emit(E.server_event("response.output_audio.delta", response_id=it.response_id, item_id=it.item_id,
                                          output_index=it.output_index, content_index=it.content_index, delta=data))
@@ -109,7 +110,9 @@ async def handle_ws(request: web.Request) -> web.StreamResponse:
     call_id = request.query.get("call_id")
     offered = [p.strip() for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()]
     protocols = tuple(p for p in offered if p in ("realtime", "openai-beta.realtime-v1")) or ("realtime",)
-    ws = web.WebSocketResponse(protocols=protocols, max_msg_size=32 * 1024 * 1024, heartbeat=30, compress=False)
+    # Frames up to 4x the event limit are read so an oversized event gets an `error` instead of a close.
+    ws = web.WebSocketResponse(protocols=protocols, max_msg_size=4 * state.cfg.max_event_bytes,
+                               heartbeat=state.cfg.ws_heartbeat_s, compress=False)
     await ws.prepare(request)
 
     out_q: asyncio.Queue = asyncio.Queue()
@@ -158,14 +161,16 @@ async def handle_ws(request: web.Request) -> web.StreamResponse:
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
-                try:
-                    ev = json.loads(msg.data)
-                except ValueError:
-                    listener(E.error_event("invalid_json", "The server could not parse the event as JSON."))
+                ev, err = E.parse_client_event(msg.data, state.cfg.max_event_bytes)
+                if err is not None:
+                    listener(err)
                     continue
                 await session.handle(ev)
             elif msg.type == WSMsgType.BINARY:
                 # Non-standard convenience: raw pcm16 frames as binary messages.
+                if len(msg.data) > state.cfg.max_event_bytes:
+                    listener(E.error_event("event_too_large", f"Binary frame of {len(msg.data)} bytes is too large."))
+                    continue
                 session.append_input(msg.data, session.config["audio"]["input"].get("format"))
             elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
                 break

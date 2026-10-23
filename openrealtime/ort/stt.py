@@ -24,7 +24,6 @@ kept only as a secondary signal.) Repeated n-gram loops are collapsed.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import hashlib
 import logging
 import os
@@ -35,6 +34,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import numpy as np
+
+from .audio import GPU_GATE, PriorityExecutor, sanitize
 
 log = logging.getLogger("ort.stt")
 
@@ -52,6 +53,7 @@ PARTIAL_BUCKETS = _env_buckets("ORT_STT_PARTIAL_BUCKETS", (15, 20, 30))
 BUCKETS_S = tuple(sorted(set(FINAL_BUCKETS) | set(PARTIAL_BUCKETS)))
 MIN_TAIL_S = 3.0          # trailing context a truncated encoder window needs to terminate cleanly
 MAX_AUDIO_S = 28.0        # per window; longer audio is transcribed in consecutive windows
+MIN_WINDOW_S = 18.0       # long audio is cut at the quietest point between 18 and 28 s of a window
 MAX_TOKENS = 448
 
 # Classic Whisper silence/noise hallucinations (normalised: lowercase, no punctuation)
@@ -68,6 +70,22 @@ HALLUCINATIONS = {
 }
 
 LANG_ALIASES = {"iw": "he", "jw": "jv"}
+
+# STT queue priorities (lower runs first). Finals / speculative finals are latency-critical;
+# partial transcripts are optional and give the GPU up as soon as anything more urgent is queued.
+PRIO_FINAL = 0
+PRIO_NORMAL = 1
+PRIO_PARTIAL = 2
+_PRIO_NAMES = {"final": PRIO_FINAL, "urgent": PRIO_FINAL, "speculative": PRIO_FINAL,
+               "normal": PRIO_NORMAL, "partial": PRIO_PARTIAL, "background": PRIO_PARTIAL}
+
+
+def _prio(priority, partial: bool) -> int:
+    if priority is None:
+        return PRIO_PARTIAL if partial else PRIO_FINAL
+    if isinstance(priority, str):
+        return _PRIO_NAMES.get(priority.lower(), PRIO_NORMAL)
+    return int(priority)
 
 
 @dataclass
@@ -88,6 +106,35 @@ def _norm(s: str) -> str:
     s = s.lower().strip()
     s = re.sub(r"[^\w\s']", "", s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def split_points(x: np.ndarray, max_s: float = MAX_AUDIO_S, min_s: float = MIN_WINDOW_S,
+                 min_last_s: float = 1.0) -> list[tuple[int, int]]:
+    """Cut long audio into <= max_s windows at the quietest 100 ms between min_s and max_s of each
+    window (a pause between words), never mid-word at a fixed offset, and never leaving a tail
+    shorter than min_last_s. Returns [(start, end), ...] covering all of x."""
+    n, win = len(x), int(max_s * SR)
+    out, s = [], 0
+    while n - s > win:
+        cut = quietest_point(x, s + int(min_s * SR), min(s + win, n - int(min_last_s * SR)))
+        out.append((s, cut))
+        s = cut
+    out.append((s, n))
+    return out
+
+
+def quietest_point(x: np.ndarray, lo: int, hi: int) -> int:
+    """Sample index in [lo, hi) at the centre of the quietest 100 ms (latest one on ties)."""
+    hop = SR // 50                                             # 20 ms
+    lo, hi = max(0, lo), min(len(x), hi)
+    if hi - lo < 5 * hop:
+        return max(lo, hi)
+    seg = x[lo:hi]
+    k = len(seg) // hop
+    e = (seg[:k * hop].reshape(k, hop) ** 2).mean(1)
+    e = np.convolve(e, np.ones(5) / 5, mode="same")
+    j = int(np.flatnonzero(e <= e.min() * 1.05 + 1e-12)[-1])
+    return lo + j * hop + hop // 2
 
 
 def has_duplicate_phrase(text: str, min_n: int = 3) -> bool:
@@ -251,6 +298,10 @@ class _FastWhisper:
         b = self.buckets.get(sec)
         if b is not None:
             return b
+        with GPU_GATE.exclusive():      # no other GPU work may run while a graph is captured
+            return self._make_bucket(sec)
+
+    def _make_bucket(self, sec: int) -> dict:
         torch = self.torch
         n_frames = sec * 50
         b = {
@@ -301,7 +352,7 @@ class _FastWhisper:
         return b
 
     def run(self, audio: np.ndarray, sec: int, prefix_ids: list[int], sot_index: int,
-            lang_ids: dict[str, int] | None, max_new: int, first_chunk: int = 4):
+            lang_ids: dict[str, int] | None, max_new: int, first_chunk: int = 4, abort=None):
         """Encode `audio` in bucket `sec`, decode greedily.
 
         prefix_ids: [<|startofprev|> prompt...] <|sot|> [lang] <|transcribe|> <|notimestamps|>;
@@ -312,7 +363,11 @@ class _FastWhisper:
         t0 = time.perf_counter()
         b = self.bucket(sec)
         tm = {}
-        with torch.inference_mode():
+        with GPU_GATE.shared(), torch.inference_mode():
+            # stale self-attention K/V beyond the current length is masked, but 0 * NaN = NaN in
+            # the attention product: one bad decode would poison every later one. Start clean.
+            self.kc.zero_()
+            self.vc.zero_()
             a = torch.from_numpy(np.ascontiguousarray(audio[: b["n_samples"]], dtype=np.float32))
             b["audio"].zero_()
             b["audio"][: len(a)].copy_(a, non_blocking=False)
@@ -354,6 +409,9 @@ class _FastWhisper:
             cur = P
             n = max(1, first_chunk)
             while not done and cur < limit:
+                if abort is not None and abort():
+                    tm["aborted"] = True
+                    break
                 steps = min(n, limit - cur)
                 for _ in range(steps):
                     if b["step_graph"] is not None:
@@ -383,7 +441,7 @@ class STT:
         self.device = device
         self.dtype_name = dtype
         self.fast = (os.environ.get("ORT_STT_FAST", "1") != "0") if fast is None else fast
-        self._executor = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="ort-stt")
+        self._executor = PriorityExecutor("ort-stt")   # one GPU thread; finals before partials
         self._loaded = False
         self._load_lock = threading.Lock()
         self._cache: OrderedDict[str, Transcript] = OrderedDict()
@@ -392,7 +450,9 @@ class STT:
 
     # ---------------- loading ----------------
     def _load(self):
-        with self._load_lock:
+        if self._loaded:
+            return
+        with self._load_lock, GPU_GATE.exclusive():
             if self._loaded:
                 return
             import torch
@@ -431,22 +491,36 @@ class STT:
 
     # ---------------- public API ----------------
     async def transcribe(self, pcm16k: np.ndarray, language: str | None = None,
-                         prompt: str | None = None) -> str:
-        r = await self.transcribe_full(pcm16k, language, prompt)
+                         prompt: str | None = None, priority=None, stream=None) -> str:
+        r = await self.transcribe_full(pcm16k, language, prompt, priority=priority, stream=stream)
         return r.text
 
     async def transcribe_full(self, pcm16k: np.ndarray, language: str | None = None,
-                              prompt: str | None = None, partial: bool = False) -> Transcript:
+                              prompt: str | None = None, partial: bool = False, priority=None,
+                              stream=None) -> Transcript:
         """Like transcribe() but returns the Transcript with language, confidences and timings.
-        partial=True uses the faster (slightly less exact) encoder windows."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self._transcribe_sync,
-                                          np.asarray(pcm16k, dtype=np.float32), language, prompt,
-                                          True, partial)
+        partial=True uses the faster (slightly less exact) encoder windows.
+
+        Scheduling (one GPU thread, shared by all sessions): finals run before partials
+        (`priority`: "final" (default) | "normal" | "partial" or an int, lower first). `stream`
+        (any hashable, e.g. StreamingTranscriber.stream_key) groups a session's requests: a
+        queued partial of that stream is dropped when a newer partial or a final for it is
+        queued, and a running partial stops decoding as soon as a final from anyone is queued.
+        A dropped / pre-empted partial returns Transcript('', filtered='superseded')."""
+        prio = _prio(priority, partial)
+        x = np.asarray(pcm16k, dtype=np.float32)
+        key = ("partial", stream) if stream is not None else None
+        if stream is not None and prio < PRIO_PARTIAL:
+            self._executor.drop(key)                  # its partials are moot now
+        fut = self._executor.submit_prio(
+            prio, self._transcribe_sync, x, language, prompt, True, partial,
+            key=key if prio >= PRIO_PARTIAL else None, supersede=prio >= PRIO_PARTIAL and key is not None,
+            dropped_result=Transcript("", language, filtered="superseded"))
+        return await asyncio.wrap_future(fut)
 
     def transcribe_sync(self, pcm16k, language=None, prompt=None) -> str:
-        return self._executor.submit(self._transcribe_sync, np.asarray(pcm16k, np.float32),
-                                     language, prompt).result().text
+        return self._executor.submit_prio(PRIO_FINAL, self._transcribe_sync, np.asarray(pcm16k, np.float32),
+                                          language, prompt).result().text
 
     def cached(self, pcm16k: np.ndarray, language=None, prompt=None) -> Transcript | None:
         """Return a previous result for exactly this audio (e.g. from a speculative call)."""
@@ -485,6 +559,7 @@ class STT:
         t0 = time.perf_counter()
         x = np.asarray(x, dtype=np.float32).ravel()
         key = self._key(x, language, prompt) if use_cache else None
+        x = sanitize(x)                       # NaN / inf would turn the whole decode into garbage
         if key and partial:
             key = "p:" + key
         if key and partial:
@@ -500,6 +575,9 @@ class STT:
         if len(x) < SR * 0.1:
             r = Transcript("", language, filtered="too_short")
             return self._remember(key, r)
+        if abs(float(x.mean())) > 1e-3:       # DC offset: inflates the energy / peak gates
+            from scipy.signal import lfilter
+            x = lfilter([1.0, -1.0], [1.0, -0.995], x - x[:SR // 10].mean()).astype(np.float32)
         peak = float(np.max(np.abs(x))) if len(x) else 0.0
         energy = float(np.sqrt(np.mean(x * x)))
         if peak < 1e-3 or energy < 3e-4:          # < ~ -70 dBFS: nothing there
@@ -508,13 +586,23 @@ class STT:
         if peak < 0.1:
             x = x * (0.3 / peak)
         texts, metas = [], []
-        win = int(MAX_AUDIO_S * SR)
-        for s in range(0, len(x), win):
-            seg = x[s:s + win]
-            if len(seg) < SR * 0.2 and s > 0:
-                break
-            ptxt = prompt if s == 0 else " ".join(texts)[-400:] or prompt
-            metas.append(self._decode_window(seg, language, ptxt, partial))
+        windows = split_points(x)
+        for s, e in windows:
+            seg = x[s:e]
+            ptxt = prompt if s == 0 else " ".join(t for t in texts if t)[-400:] or prompt
+            seg_energy = float(np.sqrt(np.mean(seg * seg))) if len(seg) else 0.0
+            if len(windows) > 1 and (len(seg) < SR * 0.1 or seg_energy < 3e-4):
+                metas.append(Transcript("", language, filtered="silence"))   # silent window
+            else:
+                abort = (lambda: self._executor.urgent_waiting(PRIO_PARTIAL)) if partial else None
+                m = self._decode_window(seg, language, ptxt, partial, abort)
+                if m.filtered == "superseded":      # gave the GPU up for a final: not cached
+                    return m
+                if not partial:
+                    m = self._check_coverage(m, seg, language, ptxt)
+                if len(windows) > 1:          # a silent / noisy window must not add "Thank you."
+                    m = self._guard(m, seg_energy, len(seg) / SR, seg)
+                metas.append(m)
             texts.append(metas[-1].text)
             if language is None and metas[-1].language:
                 language = metas[-1].language
@@ -535,7 +623,7 @@ class STT:
                     self._cache.popitem(last=False)
         return r
 
-    def _decode_window(self, seg: np.ndarray, language, prompt, partial: bool = False) -> Transcript:
+    def _decode_window(self, seg: np.ndarray, language, prompt, partial: bool = False, abort=None) -> Transcript:
         dur = len(seg) / SR
         ids, sot_index, detect = self._prefix(language, prompt)
         # token budget: generous for finals; tight for partials so a looping truncated window
@@ -547,17 +635,43 @@ class STT:
         if not self.fast:
             sec = 30
         first = max(2, int(dur * 2.2))      # ~expected token count: avoid wasted steps after EOT
-        toks, lps, nsp, lang, overflow, tm = self.fw.run(seg, sec, ids, sot_index, detect, max_new, first)
+        toks, lps, nsp, lang, overflow, tm = self.fw.run(seg, sec, ids, sot_index, detect, max_new, first, abort)
+        if tm.get("aborted"):
+            return Transcript("", lang or language, filtered="superseded", timings=tm)
         text = self.tok.decode(toks, skip_special_tokens=True).strip()
         _, looped = collapse_repeats(text)
         if (overflow or looped or has_duplicate_phrase(text)) and sec != 30:
             # truncated context can loop: retry on the full 30 s window
-            toks, lps, nsp, lang, overflow, tm2 = self.fw.run(seg, 30, ids, sot_index, detect, max_new, first)
+            toks, lps, nsp, lang, overflow, tm2 = self.fw.run(seg, 30, ids, sot_index, detect, max_new, first, abort)
+            if tm2.get("aborted"):
+                return Transcript("", lang or language, filtered="superseded", timings=tm)
             text = self.tok.decode(toks, skip_special_tokens=True).strip()
             tm["retry_ms"] = tm2["total_ms"]
             sec = 30
         avg = float(np.mean(lps)) if lps else 0.0
         return Transcript(text, lang or language, nsp, avg, len(toks), sec, raw=text, timings=tm)
+
+    def _check_coverage(self, m: Transcript, seg: np.ndarray, language, prompt) -> Transcript:
+        """Whisper sometimes stops early on a long window (EOT after the first of several similar
+        sentences) and silently drops speech. If a long window yields far fewer words than its
+        voiced duration implies (< 1 word per voiced second), decode it again in two halves cut at
+        a pause and keep that if it covers more."""
+        dur = len(seg) / SR
+        if dur < 8 or len(m.text.split()) >= dur:
+            return m
+        voiced = self.speech_ms(seg) / 1000
+        if len(m.text.split()) >= voiced:
+            return m
+        cut = quietest_point(seg, len(seg) // 2 - 3 * SR, len(seg) // 2 + 3 * SR)
+        a = self._decode_window(seg[:cut], language, prompt)
+        b = self._decode_window(seg[cut:], language, (a.text[-400:] or prompt))
+        text = _join_seam(a.text, b.text)
+        if len(text.split()) > len(m.text.split()):
+            m.text = m.raw = text
+            m.tokens = a.tokens + b.tokens
+            m.avg_logprob = (a.avg_logprob + b.avg_logprob) / 2
+            m.timings["coverage_retry"] = 1
+        return m
 
     @staticmethod
     def speech_ms(x: np.ndarray, threshold: float = 0.5) -> int:
@@ -570,6 +684,12 @@ class STT:
                    "subtitles by the amaraorg community", "like and subscribe", "amaraorg",
                    "untertitel im auftrag des zdf", "transcribed by", "thanks for watching and see you next time",
                    "see you in the next video", "sous-titres réalisés par la communauté d'amaraorg"}
+
+    # silence hallucinations proper; other blacklisted short words ("Two.", "Okay.", "Bye.") are
+    # also real one-word answers and only need 200 ms of voiced audio to survive a low logprob
+    _CLASSIC = {"you", "you you", "thank you", "thank you very much", "thank you so much", "the", "and",
+                "a", "i", "thanks for listening", "thank you for listening", "see you next time", "music",
+                "applause", "silence", "laughter", "subscribe", "please subscribe", "thanks for watching"}
 
     def _guard(self, r: Transcript, energy: float, dur: float, x: np.ndarray | None = None) -> Transcript:
         """Suppress Whisper's classic hallucinations on silence / noise.
@@ -593,13 +713,25 @@ class STT:
                 r.timings["vad_speech_ms"] = sp
                 if sp < 120:
                     reason = "no_voiced_audio"
-                elif n in HALLUCINATIONS and r.avg_logprob < -0.6 and sp < 400:
+                elif n in HALLUCINATIONS and r.avg_logprob < -0.6 and \
+                        sp < (400 if n in self._CLASSIC else 200):
                     reason = "hallucination_phrase"
         if reason:
             r.filtered, r.text = reason, ""
         else:
             r.text = text
         return r
+
+
+def _join_seam(a: str, b: str) -> str:
+    """Concatenate two transcripts of adjacent audio, dropping a word (or up to 3) that both sides
+    transcribed because the cut fell inside it."""
+    aw, bw = a.split(), b.split()
+    for n in (3, 2, 1):
+        if len(aw) >= n and len(bw) >= n and [_norm(w) for w in aw[-n:]] == [_norm(w) for w in bw[:n]]:
+            bw = bw[n:]
+            break
+    return " ".join(aw + bw).strip()
 
 
 class StreamingTranscriber:
@@ -610,16 +742,32 @@ class StreamingTranscriber:
     to append (words confirmed by two consecutive hypotheses: "local agreement"), or None.
     `await final()` returns the full final transcript (the text OpenAI puts in
     ...input_audio_transcription.completed). `self.hypothesis` is the latest unstable full text.
+
+    Long monologues: once the utterance exceeds `max_partial_s`, the audio before a pause about
+    `keep_s` before the end is transcribed once (final quality) and frozen; later partials only
+    re-transcribe the audio after it (prompted with the frozen text), so partial latency stays
+    flat and partials keep flowing past Whisper's 30 s window.
     """
 
     def __init__(self, stt: STT, language: str | None = None, interval_ms: int = 600,
-                 prompt: str | None = None, max_partial_s: float = 25.0):
+                 prompt: str | None = None, max_partial_s: float = 12.0, keep_s: float = 5.0):
         self.stt = stt
         self.language = language
         self.prompt = prompt
         self.interval = int(interval_ms * SR / 1000)
         self.max_partial = int(max_partial_s * SR)
+        self.keep = int(keep_s * SR)
+        # scheduling kwargs only for STT objects that take them (test doubles may not)
+        import inspect
+        try:
+            ps = inspect.signature(stt.transcribe_full).parameters
+            self._sched = "stream" in ps or any(p.kind is p.VAR_KEYWORD for p in ps.values())
+        except (TypeError, ValueError, AttributeError):
+            self._sched = False
         self.reset()
+
+    def _kw(self, **kw) -> dict:
+        return kw if self._sched else {}
 
     def reset(self) -> None:
         self._chunks: list[np.ndarray] = []
@@ -630,6 +778,19 @@ class StreamingTranscriber:
         self._committed_words = 0
         self.hypothesis = ""
         self._busy = False
+        self._base = 0              # audio before this sample is frozen into _frozen
+        self._frozen = ""
+
+    @property
+    def stream_key(self):
+        """Pass as `stream=` to STT.transcribe() for this utterance's final transcript: queued
+        partials of this stream are then dropped instead of delaying it."""
+        return ("st", id(self))
+
+    def _prompt_for_window(self) -> str | None:
+        if not self._frozen:
+            return self.prompt
+        return ((self.prompt + " ") if self.prompt else "") + self._frozen[-400:]
 
     def feed(self, pcm16k_chunk: np.ndarray) -> None:
         x = np.asarray(pcm16k_chunk, dtype=np.float32).ravel()
@@ -654,16 +815,32 @@ class StreamingTranscriber:
         if not self.due():
             return None
         self._busy = True
+        prev_n = self._last_n
         try:
             self._last_n = self._n
             x = self.audio
-            if len(x) > self.max_partial:
-                return None   # very long monologue: wait for the final transcript
-            r = await self.stt.transcribe_full(x, self.language, self.prompt, partial=True)
+            if len(x) - self._base > self.max_partial:
+                # freeze everything up to a pause ~keep_s before the end
+                hi = len(x) - self.keep
+                cut = quietest_point(x, max(self._base + SR, hi - 8 * SR), hi)
+                fr = await self.stt.transcribe_full(x[self._base:cut], self.language,
+                                                    self._prompt_for_window(), **self._kw(priority="partial"))
+                if self.language is None and fr.language:
+                    self.language = fr.language
+                self._frozen = (self._frozen + " " + fr.text).strip()
+                self._base = cut
+            r = await self.stt.transcribe_full(x[self._base:], self.language, self._prompt_for_window(),
+                                               partial=True, **self._kw(stream=self.stream_key))
+            if getattr(r, "filtered", None) == "superseded":   # yielded the GPU to a final: retry later
+                self._last_n = prev_n
+                return None
             if self.language is None and r.language:
                 self.language = r.language
-            words = r.text.split()
-            self.hypothesis = r.text
+            full = _join_seam(self._frozen, r.text)
+            words = full.split()
+            self.hypothesis = full
+            if self._committed_words:
+                self._reanchor(words)
             # local agreement: longest common prefix of the last two hypotheses
             k = 0
             for a, b in zip(self._prev_words, words):
@@ -683,10 +860,36 @@ class StreamingTranscriber:
         finally:
             self._busy = False
 
+    def _reanchor(self, words: list[str]) -> None:
+        """Re-transcriptions can re-split words ("slow-cooked" -> "slow cooked") or shift them at a
+        freeze seam; keep `_committed_words` pointing just past the already emitted text so a
+        word is never emitted twice or skipped."""
+        def chars(ws):
+            return re.sub(r"[\W_]+", "", " ".join(ws).lower())
+        target = chars([self.committed])
+        if chars(words[:self._committed_words]) == target:
+            return
+        acc = ""
+        for j, w in enumerate(words):
+            acc += chars([w])
+            if acc == target:
+                self._committed_words = j + 1
+                return
+            if not target.startswith(acc):
+                break
+        cw = [_norm(w) for w in self.committed.split()[-3:]]
+        nw = [_norm(w) for w in words]
+        cands = [j for j in range(max(len(cw), self._committed_words - 6),
+                                  min(len(nw), self._committed_words + 6) + 1) if nw[j - len(cw):j] == cw]
+        if cands:
+            self._committed_words = min(cands, key=lambda j: abs(j - self._committed_words))
+
     async def final(self) -> str:
         x = self.audio
         if not len(x):
             return ""
+        if self._sched:
+            return await self.stt.transcribe(x, self.language, self.prompt, stream=self.stream_key)
         return await self.stt.transcribe(x, self.language, self.prompt)
 
     def remaining_delta(self, final_text: str) -> str:

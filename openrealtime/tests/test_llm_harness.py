@@ -294,7 +294,7 @@ async def collect(h, fake, msgs=None):
 async def test_run_text_and_tool_allow_mode():
     fake = FakeLLMStream(text("\n\nLet me", " move us on.") + tool("advance_step", '{"reason":"done"}')
                          + [Raw("finish", text="tool_calls"), Raw("usage", data={"total_tokens": 5})])
-    evs = await collect(Harness([ADV, NOTE]), fake)
+    evs = await collect(Harness([ADV, NOTE], options=HarnessOptions(preamble="allow")), fake)
     assert [e.type for e in evs] == ["text_delta", "text_delta", "tool_call", "done"]
     assert evs[0].text == "Let me"
     tc = evs[2].tool_call

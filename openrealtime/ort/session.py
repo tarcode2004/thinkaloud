@@ -35,6 +35,8 @@ from typing import Any, AsyncIterator, Callable
 
 import numpy as np
 
+from . import audio as _audio
+
 from . import events as E
 from .audio import Resampler, pcm16_bytes_to_float32
 from .config import Config
@@ -43,6 +45,47 @@ log = logging.getLogger("ort.session")
 
 IN_SR = 16000      # engine input rate (VAD / STT)
 OUT_SR = 24000     # TTS / wire output rate
+
+
+# ===================================================================== cross-session scheduling
+
+class _Scheduler:
+    """Process-wide view of the shared STT / TTS executors (one GPU thread each, FIFO).
+
+    Latency-critical work: final / speculative transcripts, and the first TTS chunk of a response.
+    Partial transcripts are optional: they are skipped while any session waits for critical work,
+    so with N concurrent sessions they never sit in the queue in front of someone's final
+    transcript. TTS read-ahead is bounded per session (`tts_ahead_s` of unplayed audio), so one
+    long answer cannot fill the TTS queue ahead of another session's first clause."""
+
+    def __init__(self) -> None:
+        self.urgent_stt = 0
+        self.first_tts = 0
+        self.counters = {"stt_urgent": 0, "partials_run": 0, "partials_skipped": 0, "tts_first": 0, "tts_throttled": 0}
+        self.ewma = {"stt_urgent_ms": 0.0, "tts_first_ms": 0.0}
+
+    def busy(self) -> bool:
+        return self.urgent_stt > 0 or self.first_tts > 0
+
+    def note(self, key: str, ms: float) -> None:
+        self.ewma[key] = ms if not self.ewma[key] else 0.8 * self.ewma[key] + 0.2 * ms
+
+    async def urgent_transcribe(self, stt, audio, **kw) -> str:
+        self.urgent_stt += 1
+        self.counters["stt_urgent"] += 1
+        t0 = time.monotonic()
+        try:
+            return await stt.transcribe(audio, **kw)
+        finally:
+            self.urgent_stt -= 1
+            self.note("stt_urgent_ms", (time.monotonic() - t0) * 1000)
+
+    def snapshot(self) -> dict:
+        return {**self.counters, **{k: round(v, 1) for k, v in self.ewma.items()},
+                "urgent_stt_now": self.urgent_stt, "first_tts_now": self.first_tts}
+
+
+SCHED = _Scheduler()
 
 
 # ===================================================================== engine bundle
@@ -143,6 +186,17 @@ class AudioOutput:
         self.on_event: Callable[[str, str], None] | None = None
         self.emit: Callable[[dict], None] | None = None
         self.wakeup = asyncio.Event()
+        # Echo-gating hooks: what was sent to the speaker (pcm @24 kHz, monotonic play start) and cuts.
+        self.on_sent: Callable[[np.ndarray, float], None] | None = None
+        self.on_cleared: Callable[[], None] | None = None
+
+    def _mark(self, it: "_OutItem", pcm: np.ndarray, play_start: float) -> None:
+        it.mark_sent(int(pcm.size), play_start)
+        if self.on_sent is not None:
+            try:
+                self.on_sent(pcm, play_start)
+            except Exception:  # pragma: no cover - never let a hook break playout
+                log.exception("on_sent hook failed")
 
     # --- producer side (session)
     def begin(self, response_id: str, item_id: str, output_index: int, content_index: int = 0) -> None:
@@ -165,31 +219,61 @@ class AudioOutput:
             it._check_drained()
             self.wakeup.set()
 
-    def clear(self) -> list[_OutItem]:
-        """Drop everything not yet played. Returns the items that still had audio queued or playing."""
+    def clear(self, response_ids: set[str] | None = None) -> list[_OutItem]:
+        """Drop everything not yet played (only of `response_ids` when given). Returns the items that
+        still had audio queued or playing."""
         now = time.monotonic()
         hit = []
-        for it in list(self.order):
+        keep: deque[_OutItem] = deque()
+        queued = list(self.order)
+        # items fully sent (no longer queued) whose audio is still playing are cut too
+        playing = [it for it in self.items.values() if it not in queued and not it.cleared and it.play_end() > now]
+        for it in queued + playing:
+            if response_ids is not None and it.response_id not in response_ids:
+                if it in queued:
+                    keep.append(it)
+                continue
             if it.pending() > 0 or it.play_end() > now or not it.finished:
                 hit.append(it)
-            # Sent-but-unplayed audio is cut too: the played clock stops at `now`.
+            # Sent-but-unplayed audio is cut too where the transport can recall it (WS clients flush their
+            # buffer): the played clock stops at the cut time. WebRTC frames already sent will still play.
             it.chunks.clear()
             it.cleared = True
+            cut = self._cut_time(now)
             if it.starts:
-                p = it.played(now)
-                i = bisect.bisect_right(it.starts, now) - 1
+                p = it.sent if cut == float("inf") else it.played(cut)
+                i = bisect.bisect_right(it.starts, cut) - 1
                 del it.starts[i + 1:], it.offs[i + 1:], it.lens[i + 1:]
                 if i >= 0:
                     it.lens[i] = max(0, p - it.offs[i])
-            it.pushed = it.sent = it.played(now) if it.starts else 0
+                it.pushed = it.sent = p
+            else:
+                it.pushed = it.sent      # nothing went through a playout clock (NullOutput: all "played")
             it.finished = True
             it.drained.set()
-        self.order.clear()
+        self.order = keep
         self._on_clear(hit)
+        if hit and self.on_cleared is not None:
+            try:
+                self.on_cleared()
+            except Exception:  # pragma: no cover
+                log.exception("on_cleared hook failed")
         return hit
+
+    def was_cleared(self, item_id: str) -> bool:
+        it = self.items.get(item_id)
+        return bool(it and it.cleared)
 
     def _on_clear(self, hit: list[_OutItem]) -> None:
         pass
+
+    def _cut_time(self, now: float) -> float:
+        """Up to when queued-and-sent audio counts as heard after a clear."""
+        return now
+
+    def sent_samples(self, item_id: str) -> int:
+        it = self.items.get(item_id)
+        return it.sent if it else 0
 
     # --- clock
     def played_samples(self, item_id: str) -> int:
@@ -210,10 +294,16 @@ class AudioOutput:
         it = self.items.get(item_id)
         if it is None:
             return
-        if it.drained.is_set() and it.play_end() <= time.monotonic():
+        now = time.monotonic()
+        if it.drained.is_set() and it.play_end() <= now:
             self.items.pop(item_id, None)
             with contextlib.suppress(ValueError):
                 self.order.remove(it)
+        elif it.drained.is_set() and it not in self.order:
+            # all audio is out but still playing: drop the clock once playback has ended
+            with contextlib.suppress(RuntimeError):
+                asyncio.get_running_loop().call_later(max(0.0, it.play_end() - now) + 0.05,
+                                                      lambda: self.items.pop(item_id, None))
         else:
             it.forget = True  # type: ignore[attr-defined]
 
@@ -286,7 +376,9 @@ def _chunk_marks(text: str, words: list | None, start: int, n: int, joiner: str)
     nd = len(dwords)
     mids: list[float] = []
     if words:
-        mids = sorted((float(a) + float(b)) / 2 for w, a, b in words if str(w).strip())
+        # only real words: Kokoro also reports punctuation (', ', '.') as timed tokens, which would
+        # shift every later display word towards the end (truncation would under-count what was heard)
+        mids = sorted((float(a) + float(b)) / 2 for w, a, b in words if any(ch.isalnum() for ch in str(w)))
     dur = n / OUT_SR
     out = []
     for k, w in enumerate(dwords):
@@ -312,6 +404,12 @@ async def _queue_iter(q: asyncio.Queue) -> AsyncIterator[str]:
 # ===================================================================== responses
 
 class _LLMFailure(Exception):
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code or "llm_error"
+
+
+class _ContextExceeded(Exception):
     pass
 
 
@@ -378,9 +476,7 @@ class Session:
         self.config["id"] = self.id
         self.conversation_id = E.new_id("conv")
         self.transport = transport
-        self.output = output or NullOutput()
-        self.output.on_event = self._on_output_event
-        self.output.emit = self._emit
+        self.attach_output(output or NullOutput())
         self.listeners: list[Callable[[dict], None]] = []
         self.closed = False
         # conversation
@@ -411,6 +507,8 @@ class Session:
         self._partial_emitted: dict[str, str] = {}
         self._transcripts: dict[str, asyncio.Future] = {}
         self._spec: dict | None = None
+        self._idle_task: asyncio.Task | None = None
+        self._call_ids: dict[str, None] = {}     # every function call id seen (in-band and out-of-band)
         self._tasks: set[asyncio.Task] = set()
         self.stats: dict[str, Any] = {}
         self._apply_turn_detection()
@@ -450,6 +548,7 @@ class Session:
     def start(self) -> None:
         self._emit(E.server_event("session.created", session=self.public_session()))
         self._in_task = self._spawn(self._input_worker())
+        self._arm_idle()
 
     def public_session(self) -> dict:
         return copy.deepcopy(self.config)
@@ -474,10 +573,15 @@ class Session:
 
     # ------------------------------------------------------------------ client events
     async def handle(self, ev: Any) -> None:
-        if not isinstance(ev, dict) or not isinstance(ev.get("type"), str):
-            return self._error("invalid_event", "The event must be a JSON object with a string 'type'.", param="type")
+        if not isinstance(ev, dict):
+            return self._error("invalid_type", f"Invalid type for event: expected an object, but got {E._type_name(ev)} instead.")
+        eid = ev.get("event_id") if isinstance(ev.get("event_id"), str) else None
+        if "type" not in ev:
+            return self._error("missing_required_parameter", "Missing required parameter: 'type'.", param="type", event_id=eid)
+        if not isinstance(ev["type"], str):
+            return self._error("invalid_type", f"Invalid type for 'type': expected a string, but got {E._type_name(ev['type'])} instead.",
+                               param="type", event_id=eid)
         t = ev["type"]
-        eid = ev.get("event_id")
         h = self._HANDLERS.get(t)
         if h is None:
             return self._error("invalid_value", f"Invalid value: '{t}'. Supported values are: "
@@ -493,15 +597,23 @@ class Session:
             self._error("server_error", f"Failed to handle {t}: {e}", event_id=eid, type_="server_error")
 
     # --- session
-    def _h_session_update(self, ev: dict) -> None:
-        patch = ev.get("session")
+    async def _h_session_update(self, ev: dict) -> None:
+        if "session" not in ev:
+            raise E.SessionConfigError("Missing required parameter: 'session'.", "session", "missing_required_parameter")
+        patch = ev["session"]
         if not isinstance(patch, dict):
-            raise E.SessionConfigError("Missing 'session' object", "session", "missing_required_parameter")
+            raise E._bad_type("session", "an object", patch)
         if patch.get("model") and patch["model"] != self.config.get("model"):
             name, _ = self.cfg.resolve_model(patch["model"])
             patch = {**patch, "model": name}
+        was = copy.deepcopy(self.td)
         E.apply_session_patch(self.config, patch)
+        if self.td != was:
+            await self._drain_input()
+            if self._speech_item is not None and (self.td is None or (was or {}).get("type") != self.td.get("type")):
+                await self._reset_turn()    # VAD off / switched mid-speech: that turn is abandoned
         self._apply_turn_detection()
+        self._arm_idle()
         self._emit(E.server_event("session.updated", session=self.public_session()))
 
     def _apply_turn_detection(self) -> None:
@@ -529,13 +641,9 @@ class Session:
 
     # --- input audio buffer
     def _h_append(self, ev: dict) -> None:
-        audio = ev.get("audio")
-        if not isinstance(audio, str):
-            raise E.SessionConfigError("Missing 'audio' (base64 pcm16)", "audio", "missing_required_parameter")
-        try:
-            raw = base64.b64decode(audio, validate=False)
-        except (ValueError, TypeError):
-            raise E.SessionConfigError("'audio' is not valid base64", "audio")
+        if "audio" not in ev:
+            raise E.SessionConfigError("Missing required parameter: 'audio'.", "audio", "missing_required_parameter")
+        raw = _b64(ev["audio"], "audio")
         fmt = self.config["audio"]["input"].get("format") or {}
         self.append_input(raw, fmt)
 
@@ -556,7 +664,12 @@ class Session:
     def feed_input_16k(self, pcm: np.ndarray) -> None:
         if self.closed or pcm.size == 0:
             return
-        self._in_q.put_nowait(np.asarray(pcm, np.float32))
+        pcm = np.asarray(pcm, np.float32).ravel()
+        # Huge appends reach the detector in <= 0.5 s pieces: bounded work per executor call and the
+        # pause / speech hooks keep their per-chunk timing.
+        step = IN_SR // 2
+        for i in range(0, pcm.size, step):
+            self._in_q.put_nowait(pcm[i:i + step])
 
     async def _drain_input(self) -> None:
         await self._in_q.join()
@@ -586,6 +699,7 @@ class Session:
                             self._on_turn_event(tev)
                 if self._speech_item is None:
                     self._trim_buffer()
+                self._cap_buffer()
             except Exception:
                 log.exception("input processing failed")
             finally:
@@ -597,6 +711,15 @@ class Session:
             return
         keep = int(IN_SR * (self.td.get("prefix_padding_ms", 300) + 700) / 1000)
         while self._buf and self._buf_len - self._buf[0].size >= keep:
+            c = self._buf.pop(0)
+            self._buf_len -= c.size
+            self._buf_start += c.size
+
+    def _cap_buffer(self) -> None:
+        """Never keep more than max_input_buffer_s of uncommitted audio (manual mode with a mic that
+        never commits, or a VAD stuck in speech): the oldest audio goes."""
+        cap = int(IN_SR * max(30, int(getattr(self.cfg, "max_input_buffer_s", 600))))
+        while self._buf and self._buf_len - self._buf[0].size >= cap:
             c = self._buf.pop(0)
             self._buf_len -= c.size
             self._buf_start += c.size
@@ -636,19 +759,41 @@ class Session:
         self._discard_spec()
         self._commit_item(item_id, audio)
 
-    def _h_clear(self, ev: dict) -> None:
+    async def _h_clear(self, ev: dict) -> None:
+        await self._drain_input()          # audio appended before the clear is part of what is cleared
         self._buf, self._buf_len = [], 0
         self._buf_start = self._in_total
+        await self._reset_turn()           # a turn in progress is dropped: no dangling speech_stopped
+        self._emit(E.server_event("input_audio_buffer.cleared"))
+
+    async def _reset_turn(self) -> None:
+        """Forget the current turn: speech item, partials, speculation and the detector's state."""
         self._speech_item = None
         self._stop_partials()
         self._discard_spec()
-        self._emit(E.server_event("input_audio_buffer.cleared"))
+        self._pause_hit = None
+        det = self._turn
+        if det is None:
+            return
+        if hasattr(det, "reset"):
+            try:
+                await asyncio.get_running_loop().run_in_executor(self._exec, det.reset)
+            except Exception:  # pragma: no cover
+                log.exception("turn detector reset failed")
+        else:
+            self._turn = self.engine.turn_factory(self.td)
+            if hasattr(self._turn, "on_pause"):
+                self._turn.on_pause = self._on_pause
+        self._turn_offset = self._in_total   # the detector's timeline restarts here
 
     def _commit_item(self, item_id: str, audio16k: np.ndarray, transcript_future: asyncio.Future | None = None) -> dict:
         item = {"id": item_id, "object": "realtime.item", "type": "message", "status": "completed", "role": "user",
                 "content": [{"type": "input_audio", "transcript": None}],
                 "_audio_ms": int(audio16k.size * 1000 / IN_SR)}
         prev = self._insert(item, None)
+        if len(self._transcripts) > 64:      # finished transcriptions are already stored on their items
+            for k in [k for k, f in self._transcripts.items() if f.done()][:-16]:
+                self._transcripts.pop(k, None)
         self._emit(E.server_event("input_audio_buffer.committed", previous_item_id=prev, item_id=item_id))
         self._announce_item(item, prev)
         if transcript_future is not None:
@@ -668,7 +813,8 @@ class Session:
             else:
                 lang = (tcfg or {}).get("language")
                 prompt = (tcfg or {}).get("prompt")
-                text = await self.engine.stt.transcribe(audio, language=lang, prompt=prompt) if audio.size else ""
+                text = await SCHED.urgent_transcribe(self.engine.stt, audio, language=lang, prompt=prompt,
+                                                     **self._stt_stream_kw()) if audio.size else ""
             text = (text or "").strip()
         except asyncio.CancelledError:
             raise
@@ -708,6 +854,7 @@ class Session:
         ms = pos * 1000 // IN_SR                 # session ms (OpenAI: since the session's first audio)
         td = self.td or {}
         if typ == "speech_started":
+            self._disarm_idle()
             self._discard_spec()
             if self._speech_item is None:
                 self._speech_item = E.new_id("item")
@@ -735,6 +882,8 @@ class Session:
                 else:
                     self._start_response(self._response_from_session(auto=True),
                                          llm_source=self._spec_source(spec) if spec and spec.get("llm") else None)
+            else:
+                self._arm_idle()
         elif typ in ("likely_end", "speech_paused", "end_of_turn_candidate", "turn_likely_end"):
             self._maybe_speculate(None, pos)
         elif typ in ("speech_resumed", "resumed"):
@@ -743,12 +892,55 @@ class Session:
             self._emit(E.server_event("input_audio_buffer.timeout_triggered", audio_start_ms=ms, audio_end_ms=ms,
                                       item_id=E.new_id("item")))
 
+    # --- idle timeout (turn_detection.idle_timeout_ms, server_vad)
+    def _arm_idle(self) -> None:
+        """(Re)start the idle timer. It counts from the end of the last response's playback."""
+        self._disarm_idle()
+        td = self.td or {}
+        ms = td.get("idle_timeout_ms")
+        if self.closed or not ms or td.get("type") != "server_vad" or self._speech_item is not None:
+            return
+        if self.active is not None:
+            return    # re-armed when that response is done
+        self._idle_task = self._spawn(self._idle_wait(int(ms)))
+
+    def _disarm_idle(self) -> None:
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            self._idle_task = None
+
+    async def _idle_wait(self, ms: int) -> None:
+        while self.output.busy():          # "applied after the last model response's audio has finished playing"
+            await asyncio.sleep(0.05)
+        start = self._in_total
+        await asyncio.sleep(ms / 1000)
+        td = self.td or {}
+        if (self.closed or td.get("idle_timeout_ms") != ms or self._speech_item is not None
+                or (self.active is not None and not self.active.finalized)):
+            return
+        self._idle_task = None
+        item_id = E.new_id("item")
+        self._emit(E.server_event("input_audio_buffer.timeout_triggered", audio_start_ms=start * 1000 // IN_SR,
+                                  audio_end_ms=self._in_total * 1000 // IN_SR, item_id=item_id))
+        audio = self._buffer_slice(self._buf_start, self._buf_start + self._buf_len)
+        self._consume_buffer(self._buf_start + self._buf_len)
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result("")                 # the committed audio is the silence itself
+        item = self._commit_item(item_id, audio, transcript_future=fut)
+        item["_idle_ms"] = ms
+        if td.get("create_response", True):
+            self._start_response(self._response_from_session(auto=True))
+        else:
+            self._arm_idle()
+
     def _barge_in(self) -> None:
+        # Like OpenAI: only the default-conversation response is interrupted; out-of-band ones go on.
         r = self.active
         if r is not None and not r.finalized:
             self._cancel(r, "turn_detected")
         elif self.output.busy():
-            self._clear_output_and_truncate()
+            inband = {rid for rid, x in self.responses.items() if x.in_band}
+            self._clear_output_and_truncate(inband)
 
     # --- partial transcripts while talking
     def _start_partials(self) -> None:
@@ -784,16 +976,52 @@ class Session:
         while self._speech_item == item_id:
             await asyncio.sleep(0.1)
             try:
+                if hasattr(st, "due") and not st.due():
+                    continue
+                if SCHED.busy():              # someone waits for a final transcript / first audio
+                    SCHED.counters["partials_skipped"] += 1
+                    continue
+                SCHED.counters["partials_run"] += 1
                 d = await st.partial()
             except Exception:
                 log.exception("partial transcription failed")
                 return
             if d and self._speech_item == item_id:
+                if len(self._partial_emitted) > 32:
+                    self._partial_emitted.pop(next(iter(self._partial_emitted)))
                 self._partial_emitted[item_id] = self._partial_emitted.get(item_id, "") + d
                 self._emit(E.server_event("conversation.item.input_audio_transcription.delta", item_id=item_id,
                                           content_index=0, delta=d))
 
     # --- speculative start (likely end of turn)
+    def attach_output(self, out: "AudioOutput") -> None:
+        """Make `out` this session's speaker: playout events, event emission and echo gating."""
+        self.output = out
+        out.on_event = self._on_output_event
+        out.emit = self._emit
+        if getattr(self.cfg, "echo_gate", True):
+            out.on_sent = self._echo_sent
+            out.on_cleared = self._echo_cleared
+
+    # ------------------------------------------------------------- echo gating
+    def _echo_sent(self, pcm24k: np.ndarray, play_start: float) -> None:
+        """Feed what the speaker plays to the turn detector so its echo in the mic is not a barge-in."""
+        det = self._turn
+        if det is None or not hasattr(det, "push_playback"):
+            return
+        at_ms = int(det.position_ms + (play_start - time.monotonic()) * 1000)
+        det.push_playback(pcm24k, at_ms=at_ms, sr=OUT_SR)
+
+    def _stt_stream_kw(self) -> dict:
+        """stream= for the engine's STT so a final drops this utterance's queued partials."""
+        key = getattr(self._streamer, "stream_key", None)
+        return {"stream": key} if key is not None else {}
+
+    def _echo_cleared(self) -> None:
+        det = self._turn
+        if det is not None and hasattr(det, "clear_playback"):
+            det.clear_playback()
+
     def _maybe_speculate(self, audio: np.ndarray | None, speech_end: int) -> None:
         """Likely end of turn: start STT now (and the LLM in auto-response mode). Confirmed by a
         speech_stopped with the same speech end; discarded if the user keeps talking."""
@@ -805,7 +1033,13 @@ class Session:
         if audio.size < IN_SR // 5:
             return
         tcfg = self.config["audio"]["input"].get("transcription") or {}
-        stt = asyncio.ensure_future(self.engine.stt.transcribe(audio, language=tcfg.get("language"), prompt=tcfg.get("prompt")))
+        stt = asyncio.ensure_future(SCHED.urgent_transcribe(self.engine.stt, audio, language=tcfg.get("language"),
+                                                            prompt=tcfg.get("prompt"), **self._stt_stream_kw()))
+        det = self._turn
+        if det is not None and hasattr(det, "set_transcript_hint"):
+            # Lexical end-of-turn hint for semantic_vad ("I'd like to..." is not finished).
+            stt.add_done_callback(lambda f: (not f.cancelled() and f.exception() is None)
+                                  and det.set_transcript_hint(f.result()))
         spec = {"item": self._speech_item, "end": speech_end, "stt": stt, "version": self._conv_version, "llm": None,
                 "queue": None, "t": time.monotonic()}
         self._spec = spec
@@ -909,114 +1143,169 @@ class Session:
             self._emit(E.server_event("conversation.item.done", previous_item_id=prev, item=E.public_item(item)))
 
     def _h_item_create(self, ev: dict) -> None:
-        raw = ev.get("item")
+        if "item" not in ev:
+            raise E.SessionConfigError("Missing required parameter: 'item'.", "item", "missing_required_parameter")
+        raw = ev["item"]
         if not isinstance(raw, dict):
-            raise E.SessionConfigError("Missing 'item' object", "item", "missing_required_parameter")
+            raise E._bad_type("item", "an object", raw)
+        prev_id = _id_param(ev, "previous_item_id", required=False)
         item = self._normalize_item(raw)
         if item["id"] in self.index:
             raise E.SessionConfigError(f"Item with id '{item['id']}' already exists.", "item.id", "duplicate_item_id")
-        prev = self._insert(item, ev.get("previous_item_id"))
+        if item["type"] == "function_call_output" and item["call_id"] not in self._call_ids:
+            raise E.SessionConfigError(f"Tool call ID '{item['call_id']}' not found in conversation.", "item.call_id")
+        prev = self._insert(item, prev_id)
+        if item["type"] == "function_call":
+            self._remember_call(item["call_id"])
         self._announce_item(item, prev)
         if item.get("_audio16k") is not None:
             audio = item.pop("_audio16k")
             self._transcripts[item["id"]] = self._spawn(self._transcribe(item, audio))
 
+    def _remember_call(self, call_id: str) -> None:
+        self._call_ids[call_id] = None
+        if len(self._call_ids) > 4096:
+            for k in list(self._call_ids)[:1024]:
+                self._call_ids.pop(k, None)
+
     def _normalize_item(self, raw: dict) -> dict:
         typ = raw.get("type", "message")
-        item: dict = {"id": raw.get("id") or E.new_id("item"), "object": "realtime.item", "type": typ}
+        rid = raw.get("id")
+        if rid is not None:
+            if not isinstance(rid, str):
+                raise E._bad_type("item.id", "a string", rid)
+            if not rid or len(rid) > 32:
+                raise E.SessionConfigError("Invalid 'item.id': string too long. Expected a string with maximum length 32.",
+                                           "item.id")
+        item: dict = {"id": rid or E.new_id("item"), "object": "realtime.item", "type": typ}
+
+        def text_of(c: dict, key: str, param: str) -> str:
+            v = c.get(key, "")
+            if v is None:
+                return ""
+            if not isinstance(v, str):
+                raise E._bad_type(param, "a string", v)
+            return v
+
         if typ == "message":
             role = raw.get("role")
             if role not in ("user", "assistant", "system"):
-                raise E.SessionConfigError("message role must be 'user', 'assistant' or 'system'", "item.role")
+                raise E.SessionConfigError(f"Invalid value: '{role}'. Supported values are: 'user', 'assistant' and 'system'.",
+                                           "item.role")
             content = raw.get("content")
             if isinstance(content, str):
                 content = [{"type": "input_text" if role != "assistant" else "output_text", "text": content}]
+            if content is None:
+                content = []
             if not isinstance(content, list):
-                raise E.SessionConfigError("message content must be an array", "item.content")
+                raise E._bad_type("item.content", "an array", content)
             out = []
             for i, c in enumerate(content):
+                pp = f"item.content[{i}]"
                 if not isinstance(c, dict):
-                    raise E.SessionConfigError("content parts must be objects", f"item.content[{i}]")
+                    raise E._bad_type(pp, "an object", c)
                 ct = c.get("type")
                 if ct in ("input_text", "text", "output_text"):
-                    if role == "assistant":
-                        out.append({"type": "output_text", "text": c.get("text", "")})
-                    else:
-                        out.append({"type": "input_text", "text": c.get("text", "")})
+                    t = text_of(c, "text", f"{pp}.text")
+                    out.append({"type": "output_text" if role == "assistant" else "input_text", "text": t})
                 elif ct == "input_audio" and role == "user":
-                    part = {"type": "input_audio", "transcript": c.get("transcript")}
-                    if c.get("audio") and not c.get("transcript"):
-                        pcm = pcm16_bytes_to_float32(base64.b64decode(c["audio"]))
+                    tr = c.get("transcript")
+                    if tr is not None and not isinstance(tr, str):
+                        raise E._bad_type(f"{pp}.transcript", "a string", tr)
+                    part = {"type": "input_audio", "transcript": tr}
+                    if c.get("audio") is not None and not tr:
+                        pcm = pcm16_bytes_to_float32(_b64(c["audio"], f"{pp}.audio"))
                         item["_audio16k"] = Resampler(24000, IN_SR).process(pcm)
                     out.append(part)
                 elif ct in ("output_audio", "audio") and role == "assistant":
-                    out.append({"type": "output_audio", "transcript": c.get("transcript", "")})
-                elif ct == "input_image":
+                    out.append({"type": "output_audio", "transcript": text_of(c, "transcript", f"{pp}.transcript")})
+                elif ct == "input_image" and role == "user":
                     out.append({"type": "input_image", "image_url": c.get("image_url"), "detail": c.get("detail", "auto")})
                 else:
-                    raise E.SessionConfigError(f"Unsupported content type '{ct}' for role '{role}'", f"item.content[{i}].type")
-            item.update(status=raw.get("status") or "completed", role=role, content=out)
+                    raise E.SessionConfigError(f"Unsupported content type '{ct}' for role '{role}'", f"{pp}.type")
+            item.update(status=raw.get("status") if raw.get("status") in ("completed", "incomplete", "in_progress") else "completed",
+                        role=role, content=out)
         elif typ == "function_call":
-            if not raw.get("call_id") or not raw.get("name"):
-                raise E.SessionConfigError("function_call items need call_id and name", "item.call_id", "missing_required_parameter")
+            for k in ("call_id", "name"):
+                if not raw.get(k):
+                    raise E.SessionConfigError(f"Missing required parameter: 'item.{k}'.", f"item.{k}", "missing_required_parameter")
+                if not isinstance(raw[k], str):
+                    raise E._bad_type(f"item.{k}", "a string", raw[k])
             args = raw.get("arguments", "")
-            item.update(status=raw.get("status") or "completed", call_id=raw["call_id"], name=raw["name"],
+            item.update(status="completed", call_id=raw["call_id"], name=raw["name"],
                         arguments=args if isinstance(args, str) else json.dumps(args))
         elif typ == "function_call_output":
             if not raw.get("call_id"):
-                raise E.SessionConfigError("function_call_output items need call_id", "item.call_id", "missing_required_parameter")
+                raise E.SessionConfigError("Missing required parameter: 'item.call_id'.", "item.call_id", "missing_required_parameter")
+            if not isinstance(raw["call_id"], str):
+                raise E._bad_type("item.call_id", "a string", raw["call_id"])
             out = raw.get("output", "")
             item.update(status="completed", call_id=raw["call_id"], output=out if isinstance(out, str) else json.dumps(out))
         else:
-            raise E.SessionConfigError(f"Invalid item type '{typ}'", "item.type")
+            raise E.SessionConfigError(f"Invalid value: '{typ}'. Supported values are: 'message', 'function_call' and "
+                                       "'function_call_output'.", "item.type")
         return item
 
     def _h_item_delete(self, ev: dict) -> None:
-        iid = ev.get("item_id")
+        iid = _id_param(ev, "item_id")
         item = self.index.get(iid)
         if item is None:
             return self._error("item_not_found", f"Item with item_id '{iid}' not found.", param="item_id", event_id=ev.get("event_id"))
         self.items.remove(item)
         del self.index[iid]
         self._conv_version += 1
-        t = self._transcripts.pop(iid, None)
-        if t and not t.done():
-            pass  # let it finish; it no longer affects the conversation
+        self._transcripts.pop(iid, None)   # a running transcription finishes but no longer affects anything
         self._emit(E.server_event("conversation.item.deleted", item_id=iid))
 
     def _h_item_retrieve(self, ev: dict) -> None:
-        iid = ev.get("item_id")
+        iid = _id_param(ev, "item_id")
         item = self.index.get(iid)
         if item is None:
             return self._error("item_not_found", f"Item with item_id '{iid}' not found.", param="item_id", event_id=ev.get("event_id"))
         self._emit(E.server_event("conversation.item.retrieved", item=E.public_item(item)))
 
     def _h_item_truncate(self, ev: dict) -> None:
-        iid, eid = ev.get("item_id"), ev.get("event_id")
+        eid = ev.get("event_id")
+        iid = _id_param(ev, "item_id")
         item = self.index.get(iid)
         if item is None:
             return self._error("item_not_found", f"Item with item_id '{iid}' not found.", param="item_id", event_id=eid)
         if item.get("type") != "message" or item.get("role") != "assistant":
             return self._error("invalid_value", "Only assistant message items can be truncated.", param="item_id", event_id=eid)
-        ci = int(ev.get("content_index", 0) or 0)
+        ci = ev.get("content_index", 0)
+        if ci is None:
+            ci = 0
+        if not (isinstance(ci, int) and not isinstance(ci, bool)):
+            raise E._bad_type("content_index", "an integer", ci)
         content = item.get("content") or []
-        if ci >= len(content) or content[ci].get("type") != "output_audio":
+        if not 0 <= ci < len(content) or content[ci].get("type") != "output_audio":
             return self._error("invalid_value", f"Content index {ci} is not an audio part.", param="content_index", event_id=eid)
-        try:
-            ms = int(ev.get("audio_end_ms"))
-        except (TypeError, ValueError):
-            return self._error("invalid_value", "audio_end_ms must be an integer", param="audio_end_ms", event_id=eid)
+        if ev.get("audio_end_ms") is None:
+            raise E.SessionConfigError("Missing required parameter: 'audio_end_ms'.", "audio_end_ms", "missing_required_parameter")
+        ms = ev["audio_end_ms"]
+        if not E._is_num(ms):
+            raise E._bad_type("audio_end_ms", "an integer", ms)
+        ms = int(ms)
         if ms < 0:
             return self._error("invalid_value", "audio_end_ms must be >= 0", param="audio_end_ms", event_id=eid)
+        final = item.get("_audio_final", True)
         total_ms = int(item.get("_audio_samples", 0) * 1000 / OUT_SR)
-        if ms > total_ms + 50 and item.get("_audio_final", True):
+        if item.get("_truncated_ms") is not None:
+            total_ms = min(total_ms, int(item["_truncated_ms"]))   # already cut: that audio is gone
+            final = True
+        if ms > total_ms + 50 and final:
             return self._error("invalid_value", f"Audio content of {total_ms}ms is already shorter than {ms}ms",
                                param="audio_end_ms", event_id=eid)
-        self._truncate_item(item, min(ms, total_ms) if item.get("_audio_final", True) else ms)
+        self._truncate_item(item, min(ms, total_ms) if final else ms)
 
     def _truncate_item(self, item: dict, audio_end_ms: int, emit: bool = True) -> None:
-        marks = item.get("_marks") or []
-        heard = _heard_text(marks, int(audio_end_ms * OUT_SR / 1000)) if marks else ""
+        marks = item.get("_marks")
+        if marks:
+            heard = _heard_text(marks, int(audio_end_ms * OUT_SR / 1000))
+        else:   # marks compacted away (old item) or none: keep a proportional prefix of the words
+            words = (item["content"][0].get("transcript") or "").split()
+            total = max(1, int(item.get("_audio_samples", 0) * 1000 / OUT_SR))
+            heard = " ".join(words[: int(len(words) * min(1.0, audio_end_ms / total))])
         item["content"][0]["transcript"] = heard
         item["_truncated_ms"] = audio_end_ms
         self._conv_version += 1
@@ -1026,14 +1315,14 @@ class Session:
 
     # --- output audio buffer (WebRTC)
     def _h_output_clear(self, ev: dict) -> None:
-        r = self.active
-        if r is not None and not r.finalized and r.msg and r.msg.audio:
+        live = [r for r in self.responses.values() if not r.finalized and r.msg and r.msg.audio]
+        for r in live:
             self._cancel(r, "client_cancelled")
-        else:
+        if not live or self.output.busy():
             self._clear_output_and_truncate()
 
-    def _clear_output_and_truncate(self) -> None:
-        hit = self.output.clear()
+    def _clear_output_and_truncate(self, response_ids: set[str] | None = None) -> None:
+        hit = self.output.clear(response_ids)
         for it in hit:
             item = self.index.get(it.item_id)
             if item is not None and item.get("_marks") is not None:
@@ -1076,14 +1365,25 @@ class Session:
         )
 
     def _h_response_create(self, ev: dict) -> None:
-        spec = ev.get("response") or {}
-        if not isinstance(spec, dict):
-            raise E.SessionConfigError("'response' must be an object", "response")
-        tc = spec.get("tool_choice")
-        if tc is not None and not (tc in ("auto", "none", "required") or (isinstance(tc, dict) and tc.get("type") == "function" and tc.get("name"))):
-            raise E.SessionConfigError("Invalid tool_choice", "response.tool_choice")
-        if spec.get("input") is not None and not isinstance(spec["input"], list):
-            raise E.SessionConfigError("'response.input' must be an array", "response.input")
+        spec = ev.get("response")
+        if spec is None:
+            spec = {}
+        E.validate_response_spec(spec, self.config)
+        if spec.get("input") is not None:
+            resolved = []
+            for i, raw in enumerate(spec["input"]):
+                if raw.get("type") == "item_reference":
+                    it = self.index.get(raw.get("id")) if isinstance(raw.get("id"), str) else None
+                    if it is None:
+                        raise E.SessionConfigError(f"Item with id '{raw.get('id')}' not found.", f"response.input[{i}].id",
+                                                   "item_not_found")
+                    resolved.append(it)
+                else:
+                    try:
+                        resolved.append(self._normalize_item(raw))
+                    except E.SessionConfigError as e:
+                        raise E.SessionConfigError(str(e), f"response.input[{i}]" + (e.param or "")[4:], e.code)
+            spec = {**spec, "input": resolved}
         r = self._response_from_session(spec=spec)
         r.client_event_id = ev.get("event_id")
         if r.in_band and self.active is not None and not self.active.finalized:
@@ -1100,6 +1400,7 @@ class Session:
         if r.in_band:
             self.active = r
             self._pending_auto = False
+            self._disarm_idle()
         r.llm_source = llm_source
         self._emit(E.server_event("response.created", response=self._response_obj(r)))
         r.task = self._spawn(self._run_response(r))
@@ -1111,7 +1412,7 @@ class Session:
                                  usage=usage, status_details=details)
 
     def _h_response_cancel(self, ev: dict) -> None:
-        rid = ev.get("response_id")
+        rid = _id_param(ev, "response_id", required=False)
         r = self.responses.get(rid) if rid else self.active
         if r is None or r.finalized:
             if rid is None:
@@ -1134,25 +1435,20 @@ class Session:
 
     def _build_messages(self, r: Response, extra_user: str | None = None) -> list[dict]:
         instructions = r.instructions if r.instructions is not None else self.config.get("instructions") or ""
-        msgs: list[dict] = []
-        if instructions:
-            msgs.append({"role": "system", "content": instructions})
+        head: list[dict] = [{"role": "system", "content": instructions}] if instructions else []
         if r.input_items is not None:
-            source = []
-            for raw in r.input_items:
-                if isinstance(raw, dict) and raw.get("type") == "item_reference":
-                    it = self.index.get(raw.get("id"))
-                    if it is not None:
-                        source.append(it)
-                elif isinstance(raw, dict):
-                    try:
-                        source.append(self._normalize_item(raw))
-                    except E.SessionConfigError:
-                        pass
+            source = list(r.input_items)   # resolved + normalised in response.create
         else:
             source = list(self.items)
         outputs = {it["call_id"]: it for it in source if it.get("type") == "function_call_output"}
         used: set[str] = set()
+        msgs: list[dict] = []     # conversation part (after instructions)
+        srcs: list[str] = []      # item id each message came from (for sticky truncation)
+
+        def add(m: dict, src: str) -> None:
+            msgs.append(m)
+            srcs.append(src)
+
         i = 0
         while i < len(source):
             it = source[i]
@@ -1173,10 +1469,14 @@ class Session:
                         texts.append(tr or "")
                 text = " ".join(t for t in texts if t).strip()
                 if text:
-                    msgs.append({"role": role, "content": text})
+                    add({"role": role, "content": text}, it["id"])
+                elif it.get("_idle_ms"):
+                    add({"role": "system", "content": f"(The user has said nothing for {it['_idle_ms'] / 1000:g} seconds. "
+                                                      "Gently prompt them to continue.)"}, it["id"])
                 i += 1
             elif typ == "function_call":
                 calls = []
+                first = it["id"]
                 while i < len(source) and source[i].get("type") == "function_call":
                     fc = source[i]
                     calls.append({"id": fc["call_id"], "type": "function",
@@ -1185,22 +1485,73 @@ class Session:
                 if msgs and msgs[-1]["role"] == "assistant" and "tool_calls" not in msgs[-1]:
                     msgs[-1]["tool_calls"] = calls
                 else:
-                    msgs.append({"role": "assistant", "content": None, "tool_calls": calls})
+                    add({"role": "assistant", "content": None, "tool_calls": calls}, first)
                 for c in calls:
                     o = outputs.get(c["id"])
                     used.add(c["id"])
-                    msgs.append({"role": "tool", "tool_call_id": c["id"],
-                                 "content": o["output"] if o is not None else '{"error": "no result was returned for this call"}'})
+                    add({"role": "tool", "tool_call_id": c["id"],
+                         "content": o["output"] if o is not None else '{"error": "no result was returned for this call"}'},
+                        o["id"] if o is not None else first)
             elif typ == "function_call_output":
                 if it["call_id"] not in used:
-                    msgs.append({"role": "user", "content": f"[result of tool call {it['call_id']}]: {it.get('output', '')}"})
+                    add({"role": "user", "content": f"[result of tool call {it['call_id']}]: {it.get('output', '')}"}, it["id"])
                 i += 1
             else:
                 i += 1
         if extra_user:
-            msgs.append({"role": "user", "content": extra_user})
-        r.prompt_chars = sum(len(m.get("content") or "") for m in msgs)
-        return msgs
+            add({"role": "user", "content": extra_user}, "")
+        msgs = self._truncate_context(r, head, msgs, srcs, persist=r.input_items is None)
+        out = head + msgs
+        r.prompt_chars = sum(len(m.get("content") or "") for m in out)
+        return out
+
+    def _truncate_context(self, r: Response, head: list[dict], msgs: list[dict], srcs: list[str], *, persist: bool) -> list[dict]:
+        """OpenAI `truncation`: drop the oldest conversation messages from the LLM request when it would
+        not fit the context window. The realtime conversation itself is never touched.
+        'auto' drops just enough; retention_ratio drops down to ratio x budget so the cut point (and the
+        provider's prompt cache) stays put for many turns; 'disabled' fails the response instead.
+        Tool calls stay with their results (a kept window never starts with a tool message)."""
+        mode = self.config.get("truncation", "auto")
+        ctx = max(256, int(getattr(self.cfg, "context_tokens", 32768)))
+        mx = _max_tokens(r.max_output_tokens) or E.MAX_OUTPUT_TOKENS
+        reserve = min(mx, ctx // 8)
+        budget = ctx - reserve - E.estimate_tokens(head) - E.estimate_tokens(r.tools or [])
+        ratio = None
+        if isinstance(mode, dict):
+            ratio = float(mode.get("retention_ratio", 1.0))
+            pi = (mode.get("token_limits") or {}).get("post_instructions")
+            if pi:
+                budget = min(budget, int(pi))
+        budget = max(1, budget)
+        # groups: an assistant(+tool_calls) message and its tool results are dropped together
+        starts = [k for k, m in enumerate(msgs) if m["role"] != "tool"]
+        if not starts:
+            return msgs
+        if starts[0] != 0:
+            starts.insert(0, 0)
+        ends = starts[1:] + [len(msgs)]
+        gtok = [E.estimate_tokens(msgs[a:b]) for a, b in zip(starts, ends)]
+        total = sum(gtok)
+        if mode == "disabled":
+            if total > budget:
+                raise _ContextExceeded(f"The conversation ({total} tokens) exceeds the input token limit ({budget}) "
+                                       "and truncation is disabled.")
+            return msgs
+        g = 0
+        cut = getattr(self, "_trunc_cut", None) if persist else None
+        if cut:
+            g = next((k for k, a in enumerate(starts) if srcs[a] == cut), 0)
+        kept = sum(gtok[g:])
+        if kept > budget:
+            target = budget if ratio is None else max(1, int(budget * ratio))
+            while g < len(starts) - 1 and kept > target:
+                kept -= gtok[g]
+                g += 1
+        if persist:
+            self._trunc_cut = srcs[starts[g]] if g > 0 else None
+        if g:
+            self.stats["truncated_messages"] = starts[g]
+        return msgs[starts[g]:]
 
     async def _run_response(self, r: Response) -> None:
         agen = None
@@ -1221,7 +1572,7 @@ class Session:
                 elif et == "tool_call" and ev.tool_call is not None:
                     self._on_tool_call(r, ev.tool_call)
                 elif et == "error":
-                    raise _LLMFailure(ev.error or "LLM error")
+                    raise _LLMFailure(ev.error or "LLM error", ((getattr(ev, "meta", None) or {}).get("code")))
                 elif et == "done":
                     r.usage, r.meta = ev.usage, ev.meta
                     m = ev.meta or {}
@@ -1234,12 +1585,19 @@ class Session:
             agen = None
             if r.msg is not None:
                 await self._finish_message(r)
+                if r.msg.audio and self.output.was_cleared(r.msg.item["id"]):
+                    return self._finalize(r, "cancelled", reason="turn_detected")
             self._finalize(r, "completed")
         except asyncio.CancelledError:
             raise
+        except _ContextExceeded as e:
+            self._finalize(r, "failed", error={"type": "invalid_request_error", "code": "context_length_exceeded",
+                                               "message": str(e)})
         except _LLMFailure as e:
             log.warning("response %s failed: %s", r.id, e)
-            self._finalize(r, "failed", error={"type": "server_error", "code": "llm_error", "message": str(e)})
+            # meta.code from the LLM layer: insufficient_credits | rate_limited | context_length_exceeded | ...
+            typ = "invalid_request_error" if e.code == "context_length_exceeded" else "server_error"
+            self._finalize(r, "failed", error={"type": typ, "code": e.code, "message": str(e)})
         except Exception as e:
             log.exception("response %s crashed", r.id)
             self._finalize(r, "failed", error={"type": "server_error", "code": "server_error", "message": str(e)})
@@ -1308,11 +1666,19 @@ class Session:
         """LLM text → TTS (which does its own clause segmentation) → output queue + word marks."""
         item_id = m.item["id"]
         agen = self.engine.tts.stream(_queue_iter(m.tts_q), r.voice, r.speed, **self._tts_kwargs())
+        ahead = max(0.5, float(getattr(self.cfg, "tts_ahead_s", 2.0))) * OUT_SR
+        SCHED.first_tts += 1
+        first_pending, t0 = True, time.monotonic()
         try:
             async for chunk in agen:
                 a = np.asarray(chunk, np.float32).ravel()
                 if a.size == 0:
                     continue
+                if first_pending:
+                    first_pending = False
+                    SCHED.first_tts -= 1
+                    SCHED.counters["tts_first"] += 1
+                    SCHED.note("tts_first_ms", (time.monotonic() - t0) * 1000)
                 text = getattr(chunk, "text", None)
                 start = m.total_samples
                 if r.first_audio_at is None and self.transport != "webrtc":
@@ -1325,11 +1691,21 @@ class Session:
                     marks = _chunk_marks(text, getattr(chunk, "words", None), start, a.size, joiner)
                     m.marks.extend(marks)
                     m.spoken += "".join(w for _, w in marks)
+                # bounded read-ahead: the TTS stream (lookahead 2) pauses while plenty is queued
+                throttled = False
+                while (m.total_samples - self.output.played_samples(item_id) > ahead
+                       and not self.output.was_cleared(item_id)):
+                    throttled = True
+                    await asyncio.sleep(0.05)
+                if throttled:
+                    SCHED.counters["tts_throttled"] += 1
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("TTS failed")
         finally:
+            if first_pending:
+                SCHED.first_tts -= 1
             with contextlib.suppress(BaseException):
                 await asyncio.shield(_aclose(agen))
         if not m.marks and m.text.strip():
@@ -1351,6 +1727,8 @@ class Session:
                 m.mark_i += 1
             if buf:
                 self._emit_delta(r, m, "".join(buf))
+            if self.output.was_cleared(item_id):
+                return                      # audio cut (output_audio_buffer.clear / barge-in): nothing more plays
             if m.tts_task is not None and m.tts_task.done() and m.mark_i >= len(m.marks) and played >= m.total_samples:
                 return
             await asyncio.sleep(0.02)
@@ -1407,6 +1785,9 @@ class Session:
         if r.msg is not None and not r.msg.closed and not r.msg.audio:
             pass  # text part stays open; function call becomes the next output item
         call_id = getattr(tc, "call_id", None) or E.new_id("call")
+        if call_id in self._call_ids:          # providers sometimes reuse ids across turns: keep them unique
+            call_id = E.new_id("call")
+        self._remember_call(call_id)
         args = getattr(tc, "arguments", "") or "{}"
         if not isinstance(args, str):
             args = json.dumps(args)
@@ -1440,8 +1821,8 @@ class Session:
             for t in (m.tts_task, m.pacer_task):
                 if t is not None and not t.done():
                     t.cancel()
-            heard = min(self.output.played_samples(m.item["id"]), m.total_samples)
-            self.output.clear()   # flush now: the next outbound frame is silence
+            self.output.clear({r.id})   # flush now: the next outbound frame is silence (other responses keep theirs)
+            heard = min(self.output.sent_samples(m.item["id"]), m.total_samples)
             if emit and m.total_samples > 0 and r.in_band:
                 ms = int(heard * 1000 / OUT_SR)
                 m.item["_audio_samples"] = m.total_samples
@@ -1468,6 +1849,8 @@ class Session:
                     t.cancel()
             if m.audio:
                 self.output.forget(m.item["id"])
+                if r.in_band:
+                    self._compact_marks(m.item)
         details = None
         if status == "cancelled":
             details = {"type": "cancelled", "reason": reason or "client_cancelled"}
@@ -1486,10 +1869,23 @@ class Session:
             if self._pending_auto and not self.closed:
                 self._pending_auto = False
                 self._start_response(self._response_from_session(auto=True))
+            else:
+                self._arm_idle()
         # drop old finished responses (keep memory bounded)
         if len(self.responses) > 64:
             for rid in [k for k, v in self.responses.items() if v.finalized][:32]:
                 self.responses.pop(rid, None)
+
+    KEEP_MARKS = 16
+
+    def _compact_marks(self, item: dict) -> None:
+        """Word timings are only needed to truncate recent items; older ones fall back to a
+        proportional cut of the transcript (bounded memory in long sessions)."""
+        q = self.__dict__.setdefault("_marked", deque())
+        q.append(item)
+        while len(q) > self.KEEP_MARKS:
+            old = q.popleft()
+            old.pop("_marks", None)
 
     def _usage(self, r: Response) -> dict:
         u = r.usage or {}
@@ -1501,6 +1897,25 @@ class Session:
         return E.usage_object(in_text, 0, out_text, out_audio, cached)
 
     _HANDLERS: dict[str, Callable] = {}
+
+
+def _b64(v: Any, param: str) -> bytes:
+    if not isinstance(v, str):
+        raise E._bad_type(param, "a base64 string", v)
+    try:
+        return base64.b64decode(v, validate=True)
+    except (ValueError, TypeError):
+        raise E.SessionConfigError(f"Invalid value for '{param}': not valid base64.", param, "invalid_value")
+
+
+def _id_param(ev: dict, key: str, *, required: bool = True) -> str | None:
+    if key not in ev or ev[key] is None:
+        if required:
+            raise E.SessionConfigError(f"Missing required parameter: '{key}'.", key, "missing_required_parameter")
+        return None
+    if not isinstance(ev[key], str):
+        raise E._bad_type(key, "a string", ev[key])
+    return ev[key]
 
 
 def _max_tokens(v: Any) -> int | None:
@@ -1519,38 +1934,11 @@ async def _aclose(agen: Any) -> None:
 
 
 def _g711_decode(raw: bytes, ulaw: bool) -> np.ndarray:
-    x = np.frombuffer(raw, np.uint8)
-    if ulaw:
-        x = ~x
-        sign = x & 0x80
-        exp = (x >> 4) & 0x07
-        mant = x & 0x0F
-        mag = ((mant.astype(np.int32) << 3) + 0x84) << exp
-        y = np.where(sign != 0, 0x84 - mag, mag - 0x84)
-    else:
-        x = x ^ 0x55
-        sign = x & 0x80
-        exp = (x >> 4) & 0x07
-        mant = (x & 0x0F).astype(np.int32)
-        mag = np.where(exp == 0, (mant << 4) + 8, ((mant << 4) + 0x108) << np.maximum(exp - 1, 0))
-        y = np.where(sign != 0, mag, -mag)
-    return (y.astype(np.float32) / 32768.0)
+    return _audio.g711_decode(raw, ulaw)
 
 
 def _g711_encode(pcm: np.ndarray, ulaw: bool) -> bytes:
-    s = np.clip(np.rint(np.asarray(pcm, np.float32) * 32767), -32768, 32767).astype(np.int32)
-    if ulaw:
-        sign = np.where(s < 0, 0x80, 0)
-        mag = np.minimum(np.abs(s), 32635) + 0x84
-        exp = np.floor(np.log2(np.maximum(mag, 1))).astype(np.int32) - 7
-        exp = np.clip(exp, 0, 7)
-        mant = (mag >> (exp + 3)) & 0x0F
-        return (~(sign | (exp << 4) | mant) & 0xFF).astype(np.uint8).tobytes()
-    sign = np.where(s >= 0, 0x80, 0)
-    mag = np.minimum(np.abs(s), 32767)
-    exp = np.clip(np.floor(np.log2(np.maximum(mag, 1))).astype(np.int32) - 7, 0, 7)
-    mant = np.where(exp == 0, (mag >> 4) & 0x0F, (mag >> (exp + 3)) & 0x0F)
-    return (((sign | (exp << 4) | mant) ^ 0x55) & 0xFF).astype(np.uint8).tobytes()
+    return _audio.g711_encode(pcm, ulaw)
 
 
 Session._HANDLERS = {

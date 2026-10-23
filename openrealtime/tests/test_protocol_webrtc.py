@@ -88,7 +88,8 @@ class Peer:
         if isinstance(pred, str):
             t = pred
             pred = lambda e: e["type"] == t  # noqa: E731
-        end = time.monotonic() + timeout
+        from fakes import T
+        end = time.monotonic() + timeout * T
         while time.monotonic() < end:
             for e in self.events:
                 if pred(e):

@@ -10,6 +10,8 @@ Low level pieces (all unit-tested offline):
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -22,8 +24,8 @@ from typing import Any, AsyncIterator
 import httpx
 
 from . import LLMEvent
-from .harness import Harness, HarnessOptions
-from .providers import DEFAULT_ORDER, ProviderError, Scoreboard, hedged_stream
+from .harness import Harness, HarnessOptions, PrefixMemory, estimate_tokens
+from .providers import DEFAULT_ORDER, NO_CACHE, ProviderError, Scoreboard, hedged_stream
 
 log = logging.getLogger("ort.llm")
 
@@ -218,7 +220,7 @@ class OpenRouterClient:
 
     def __init__(self, api_key: str | None, base_url: str = BASE_URL, *,
                  keepalive_s: float = 20.0, connect_timeout: float = 5.0,
-                 first_byte_timeout: float = 10.0, http2: bool = True,
+                 first_byte_timeout: float = 30.0, http2: bool = True,
                  transport: httpx.AsyncBaseTransport | None = None,
                  referer: str = "https://github.com/openrealtime", title: str = "OpenRealtime"):
         self.api_key = api_key
@@ -301,40 +303,62 @@ class OpenRouterClient:
                 except Exception:
                     msg, j = raw.decode("utf-8", "replace"), None
                 ra = resp.headers.get("retry-after")
+                if resp.status_code == 402:
+                    msg = f"insufficient OpenRouter credits: {msg}"
+                elif resp.status_code == 401:
+                    msg = f"OpenRouter API key rejected: {msg}"
                 raise ProviderError(f"HTTP {resp.status_code}: {msg}", status=resp.status_code,
                                     provider=provider,
                                     retry_after=float(ra) if ra and ra.replace('.', '', 1).isdigit() else None,
                                     body=j)
             sse = SSEParser()
             got_token = False
-            async for line in resp.aiter_lines():
-                data = sse.feed(line)
-                if data is None:
-                    continue
-                if data.strip() == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data)
-                except json.JSONDecodeError:
-                    log.debug("bad SSE json: %.200s", data)
-                    continue
-                for r in parse_chunk(obj):
-                    if r.kind == "error":
-                        code = (r.data or {}).get("code")
-                        status = code if isinstance(code, int) else None
-                        if not got_token:
-                            raise ProviderError(f"stream error: {r.text}", status=status or 502,
+            parsed = bad = 0
+            lines = resp.aiter_lines()
+            async with contextlib.aclosing(lines):
+                async for line in lines:
+                    data = sse.feed(line)
+                    if data is None:
+                        if not got_token and not parsed and len(line) > 0 and \
+                                not line.startswith((":", "data", "event", "id", "retry")):
+                            bad += 1  # not SSE at all (e.g. an HTML error page with 200)
+                            if bad >= 3:
+                                raise ProviderError("malformed stream (not SSE)", status=502,
+                                                    provider=provider)
+                        continue
+                    if data.strip() == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        log.debug("bad SSE json: %.200s", data)
+                        bad += 1
+                        if not got_token and bad >= 3 and not parsed:
+                            raise ProviderError("malformed stream (bad SSE JSON)", status=502,
                                                 provider=provider)
-                    if r.is_token:
-                        got_token = True
-                    yield r
+                        continue
+                    parsed += 1
+                    for r in parse_chunk(obj):
+                        if r.kind == "error":
+                            code = (r.data or {}).get("code")
+                            status = code if isinstance(code, int) else None
+                            if not got_token:
+                                raise ProviderError(f"stream error: {r.text}", status=status or 502,
+                                                    provider=provider)
+                        if r.is_token:
+                            got_token = True
+                        yield r
             tail = sse.flush()
             if tail and tail.strip() != "[DONE]":
                 try:
                     for r in parse_chunk(json.loads(tail)):
+                        parsed += 1
                         yield r
                 except json.JSONDecodeError:
                     pass
+            if not parsed and not got_token:
+                raise ProviderError("empty or malformed stream (no SSE events)", status=502,
+                                    provider=provider)
         finally:
             await resp.aclose()
             self._last_use = time.monotonic()
@@ -343,6 +367,50 @@ class OpenRouterClient:
         if self._ka_task:
             self._ka_task.cancel()
         await self._client.aclose()
+
+
+# --------------------------------------------------------------------------- timeouts
+
+
+async def guard_stream(agen: AsyncIterator[Raw], *, idle_s: float | None, total_s: float | None,
+                       on_fail=None) -> AsyncIterator[Raw]:
+    """Inter-token (after the first token) and total deadlines for a raw stream.  On expiry
+    the inner generator is cancelled at its await point (its HTTP stream is reset) and a
+    ProviderError(504) is raised; ``on_fail(provider, kind)`` is called first."""
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    first = False
+    provider = None
+    try:
+        while True:
+            lim = None
+            if total_s is not None:
+                lim = total_s - (loop.time() - t0)
+                if lim <= 0:
+                    raise asyncio.TimeoutError
+            if first and idle_s is not None:
+                lim = idle_s if lim is None else min(lim, idle_s)
+            try:
+                async with asyncio.timeout(lim):
+                    r = await agen.__anext__()
+            except StopAsyncIteration:
+                return
+            except TimeoutError:
+                total = total_s is not None and loop.time() - t0 >= total_s - 1e-3
+                kind = "total timeout" if total else "stalled after first token"
+                if on_fail is not None and provider:
+                    with contextlib.suppress(Exception):
+                        on_fail(provider, kind)
+                raise ProviderError(f"stream {kind} ({(loop.time() - t0):.1f} s)", status=504,
+                                    provider=provider) from None
+            if r.kind == "meta" and r.data:
+                provider = r.data.get("provider_slug") or provider
+            if r.is_token:
+                first = True
+            yield r
+    finally:
+        with contextlib.suppress(BaseException):
+            await agen.aclose()
 
 
 # --------------------------------------------------------------------------- LLM
@@ -374,13 +442,22 @@ class OpenRouterLLM:
         self.default_temperature = c.get("temperature")
         self.default_max_tokens = c.get("max_tokens", 1024)
         self.extra_body: dict = dict(c.get("extra_body") or {})
+        self.prefix_memory = PrefixMemory()
         self.options = HarnessOptions(
-            preamble=os.environ.get("ORT_PREAMBLE") or c.get("preamble", "allow"),
+            preamble=os.environ.get("ORT_PREAMBLE") or c.get("preamble", "smart"),
             voice_prompt=c.get("voice_prompt", True),
             validate=c.get("validate", True),
             reask=c.get("reask", True),
             recover_leaks=c.get("recover_leaks", True),
+            instructions_layout=os.environ.get("ORT_LLM_LAYOUT") or c.get("instructions_layout", "tail"),
+            verbatim_guard=os.environ.get("ORT_VERBATIM_GUARD") or c.get("verbatim_guard", "repair"),
+            prefix_memory=self.prefix_memory,
         )
+        self.idle_timeout_s = float(os.environ.get("ORT_LLM_IDLE_TIMEOUT_S") or c.get("idle_timeout_s", 8.0))
+        self.total_timeout_s = float(os.environ.get("ORT_LLM_TOTAL_TIMEOUT_S") or c.get("total_timeout_s", 45.0))
+        self.sticky = _env_bool("ORT_LLM_STICKY", bool(c.get("sticky", True)))
+        self.sticky_ttl_s = float(c.get("sticky_ttl_s", 300.0))
+        self._sticky: dict[str, tuple[str, float, int]] = {}  # conv key -> (provider, t, tokens)
         self.client = client or OpenRouterClient(load_api_key(c.get("api_key")),
                                                  c.get("base_url") or BASE_URL)
         self.scoreboard = scoreboard or Scoreboard(
@@ -417,16 +494,66 @@ class OpenRouterLLM:
         body.update(self.extra_body)
         return body
 
-    def _raw_stream(self, body: dict) -> AsyncIterator[Raw]:
-        """Hedged raw stream (first meta event carries hedge info)."""
+    @staticmethod
+    def conv_key(messages: list[dict]) -> str:
+        """Conversation identity for cache stickiness (like OpenRouter's: first system
+        message + first non-system message)."""
+        sysm = next((m.get("content") for m in messages if m.get("role") == "system"), "") or ""
+        first = next((m.get("content") for m in messages if m.get("role") != "system"), "") or ""
+        h = hashlib.sha1()
+        h.update(str(sysm)[:4000].encode("utf-8", "replace"))
+        h.update(b"\x00")
+        h.update(str(first)[:1000].encode("utf-8", "replace"))
+        return h.hexdigest()[:16]
+
+    @staticmethod
+    def feature_of(tools, tool_choice) -> str | None:
+        if not tools:
+            return None
+        if isinstance(tool_choice, dict):
+            return "tool_choice:named"
+        if tool_choice in ("required", "none"):
+            return f"tool_choice:{tool_choice}"
+        return None
+
+    def _prefer(self, key: str | None, tokens: int) -> tuple[str | None, float, float]:
+        """(sticky provider, bonus ms, expected cached tokens)."""
+        if not self.sticky or not key:
+            return None, 0.0, 0.0
+        ent = self._sticky.get(key)
+        if not ent or time.monotonic() - ent[1] > self.sticky_ttl_s or ent[0] in NO_CACHE:
+            return None, 0.0, 0.0
+        prov, _, prev_tokens = ent
+        cached = float(min(prev_tokens, tokens))
+        bonus = min(1500.0, 250.0 + 0.9 * self.scoreboard.slope(prov) * cached / 1000.0)
+        return prov, bonus, cached
+
+    def note_provider(self, key: str | None, provider: str | None, tokens: int) -> None:
+        if key and provider:
+            self._sticky[key] = (provider, time.monotonic(), int(tokens))
+            if len(self._sticky) > 256:
+                for k in sorted(self._sticky, key=lambda k: self._sticky[k][1])[:64]:
+                    self._sticky.pop(k, None)
+
+    def _raw_stream(self, body: dict, key: str | None = None) -> AsyncIterator[Raw]:
+        """Hedged raw stream (first meta event carries hedge info), with idle/total
+        deadlines."""
         if not self.providers:
-            return self.client.stream_raw(body, None)
-        return hedged_stream(
-            lambda p: self.client.stream_raw(body, p),
-            self.scoreboard,
-            hedge=self.hedge,
-            hedge_delay_ms=self.hedge_delay_ms,
-        )
+            inner = self.client.stream_raw(body, None)
+        else:
+            tokens = estimate_tokens(body.get("messages") or [], body.get("tools"))
+            prefer, bonus, cached = self._prefer(key, tokens)
+            inner = hedged_stream(
+                lambda p: self.client.stream_raw(body, p),
+                self.scoreboard,
+                hedge=self.hedge,
+                hedge_delay_ms=self.hedge_delay_ms,
+                tokens=tokens,
+                feature=self.feature_of(body.get("tools"), body.get("tool_choice")),
+                prefer=prefer, prefer_bonus_ms=bonus, prefer_cached=cached,
+            )
+        return guard_stream(inner, idle_s=self.idle_timeout_s, total_s=self.total_timeout_s,
+                            on_fail=lambda p, kind: self.scoreboard.record_error(p, 504, message=kind))
 
     def stream(self, messages: list[dict], tools: list[dict], tool_choice: str | dict = "auto",
                temperature: float | None = None, max_tokens: int | None = None,
@@ -437,12 +564,28 @@ class OpenRouterLLM:
             return _error_stream("OPENROUTER_API_KEY is not configured (env or ~/.hermes/.env)")
         options = self.options.replace(**opts) if opts else self.options
         harness = Harness(tools or [], tool_choice, options)
+        key = self.conv_key(messages) if self.sticky else None
+        last: dict = {}
 
         def open_stream(msgs, chat_tools, chat_tool_choice, mt=None):
-            return self._raw_stream(self._body(msgs, chat_tools, chat_tool_choice,
-                                               temperature, mt if mt is not None else max_tokens))
+            body = self._body(msgs, chat_tools, chat_tool_choice, temperature,
+                              mt if mt is not None else max_tokens)
+            last["tokens"] = estimate_tokens(msgs, chat_tools)
+            return self._raw_stream(body, key)
 
-        return harness.run(messages, open_stream)
+        return self._track(harness.run(messages, open_stream), key, last)
+
+    async def _track(self, agen: AsyncIterator[LLMEvent], key, last) -> AsyncIterator[LLMEvent]:
+        """Pass events through; remember which provider served this conversation."""
+        try:
+            async for ev in agen:
+                if ev.type == "done" and ev.meta:
+                    pt = (ev.usage or {}).get("prompt_tokens") or last.get("tokens") or 0
+                    self.note_provider(key, ev.meta.get("provider_slug"), pt)
+                yield ev
+        finally:
+            with contextlib.suppress(BaseException):
+                await agen.aclose()
 
 
 async def _error_stream(msg: str) -> AsyncIterator[LLMEvent]:

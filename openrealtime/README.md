@@ -25,7 +25,9 @@ Speech recognition and synthesis run locally on the GPU. Only the text of the co
 | Kokoro time to first audio | 25–50 ms |
 | smart-turn v3 end-of-turn inference | 13 ms |
 | Silero VAD per 32 ms frame | 0.06 ms |
-| Barge-in: user starts talking → assistant audio stops | < 150 ms |
+| Barge-in: speech onset → audio stopped (WS client flush / WebRTC received audio) | 81 ms / 250 ms |
+| Barge-in: truncated assistant text vs what was actually heard (Whisper on the played audio) | ±1 word: WS 10/10, WebRTC 9/10 |
+| Voice to voice with 1 / 2 / 4 / 8 concurrent sessions (mock LLM, 250 ms TTFT), p50 | 679 / 750 / 1117 / 1082 ms |
 
 The biggest remaining cost is the LLM's time to first token. That depends far more on the OpenRouter provider than on the model: today Parasail answered in about 0.45 s and the default route in 6 s. The provider scoreboard and hedging below are there to absorb that variance.
 
@@ -94,6 +96,8 @@ The settings are listed at the top of [`ort/config.py`](ort/config.py). The ones
 .venv/bin/python bench/v2v_bench.py --vad semantic_vad            # voice to voice, mock LLM
 .venv/bin/python bench/v2v_bench.py --vad semantic_vad --llm openrouter --runs 10   # real DeepSeek (costs a few cents)
 ORT_LIVE_LLM=1 .venv/bin/python bench/llm_bench.py                # per-provider TTFT and tool-call precision
+.venv/bin/python bench/load_bench.py --n 1,2,4,8                  # concurrent sessions: v2v p50/p95 per N
+.venv/bin/python bench/v2v_bench.py --bargein ws,webrtc --runs 10 # barge-in latency and truncation accuracy
 ```
 
 The tests never call OpenAI or OpenRouter. Live LLM checks only run when you opt in.
@@ -104,8 +108,8 @@ The tests never call OpenAI or OpenRouter. Live LLM checks only run when you opt
 - **Languages.** Kokoro voices cover English, Spanish, French, Hindi, Italian and Portuguese. Other languages, German for example, use espeak pronunciation with a Spanish voice, which is intelligible but accented. Japanese and Chinese need `misaki[ja]` and `misaki[zh]`.
 - **Not implemented:**
   - image input
-  - `idle_timeout_ms`
   - `noise_reduction` (accepted and ignored)
   - the WebRTC sideband `/accept` and `/reject` endpoints
   - per-model LLM routing (every model name maps to the configured LLM)
+- **Context window.** `truncation` (`auto` | `disabled` | `retention_ratio` with `token_limits.post_instructions`) trims the oldest items from the LLM request only; the realtime conversation keeps every item. The window is `ORT_CONTEXT_TOKENS` (default 32768).
 - **Event timing.** `response.done` arrives when playback ends, not when generation ends, because captions are paced to the audio.

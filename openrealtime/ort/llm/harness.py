@@ -1016,7 +1016,7 @@ class SpeechFilter:
 
 # =========================================================================== prompt
 
-VOICE_PROMPT = (
+VOICE_PROMPT_V1 = (
     "You are talking out loud in a live, real-time voice conversation; everything you "
     "write is spoken by a text-to-speech voice.\n"
     "- Speak naturally and briefly, like a person on a call: usually one to three short "
@@ -1027,6 +1027,27 @@ VOICE_PROMPT = (
     "function syntax out loud.\n"
     "- If a tool's result decides what you should say, call the tool first and speak "
     "after you have the result.\n"
+    "- Follow the instructions below; they take priority over these style notes."
+)
+VOICE_PROMPT = (
+    "You are talking out loud in a live, real-time voice conversation; everything you "
+    "write is spoken by a text-to-speech voice.\n"
+    "- Speak naturally and briefly, like a person on a call: usually one or two short "
+    "sentences.\n"
+    "- Plain spoken words only: no markdown, lists, headings, emoji, code, or URLs. Say "
+    "numbers, dates and symbols the way a person would say them.\n"
+    "- Speak the language the instructions ask for; otherwise the user's language.\n"
+    "- When you are given a text to say verbatim (word for word, exactly), say exactly that "
+    "text, completely, and add nothing except an allowed short transition before it.\n"
+    "- Use tools only through the tool-calling interface. Never say tool names, JSON or "
+    "function syntax out loud.\n"
+    "- When the situation calls for a tool, call it right away; do not ask the user to "
+    "confirm something they already told you. No filler before a tool call ('Got it.', "
+    "'Let me check.', 'One moment.').\n"
+    "- If a tool's result decides what you should say, call the tool first and speak "
+    "after you have the result. If a tool result tells you what to say, say that.\n"
+    "- If the user stopped mid-sentence ('um, so I think...'), they are not finished: reply "
+    "only 'Mm-hm.' and wait. Never speak for the user or continue their sentence.\n"
     "- Follow the instructions below; they take priority over these style notes."
 )
 SUPPRESS_PROMPT = (
@@ -1042,7 +1063,10 @@ def apply_voice_prompt(messages: list[dict], voice_prompt: Any, preamble: str,
             voice_prompt = SUPPRESS_PROMPT.lstrip("- ")
         else:
             return messages
-    text = voice_prompt if isinstance(voice_prompt, str) else VOICE_PROMPT
+    if voice_prompt == "v1":
+        text = VOICE_PROMPT_V1
+    else:
+        text = voice_prompt if isinstance(voice_prompt, str) else VOICE_PROMPT
     if voice_prompt is True and preamble == "suppress" and has_tools:
         text = text.replace("\n- Follow the instructions below",
                             "\n" + SUPPRESS_PROMPT + "\n- Follow the instructions below")
@@ -1177,17 +1201,495 @@ def flatten_tool_history(messages: list[dict]) -> list[dict]:
     return merged
 
 
+# =========================================================================== cache layout
+
+# Per-response instructions in realtime clients are usually the session instructions plus
+# a short "what to do now" section (ThinkAloud: "...\n\n# NOW\n...").  Sent as one leading
+# system message, that suffix sits *before* the whole history and breaks the provider's
+# prompt-cache prefix on every turn.  The 'tail' layout keeps the stable part first and moves
+# the suffix next to the end of the conversation.
+_NOW_RE = re.compile(r"\n[ \t]*#{1,3}[ \t]*(?:NOW|Now|CURRENT TURN|This turn|Right now)\b[^\n]*\n")
+
+
+class PrefixMemory:
+    """Recently seen stable system prompts (by the same LLM object, across sessions), used to
+    split ``stable + per-response suffix`` when there is no explicit '# NOW' marker."""
+
+    def __init__(self, size: int = 8, min_chars: int = 800):
+        self.size, self.min_chars = size, min_chars
+        self.items: list[str] = []
+
+    def remember(self, text: str) -> None:
+        if not isinstance(text, str) or len(text) < self.min_chars:
+            return
+        if text in self.items:
+            self.items.remove(text)
+        self.items.insert(0, text)
+        del self.items[self.size:]
+
+    def longest_prefix_of(self, text: str) -> str | None:
+        best = None
+        for p in self.items:
+            if len(p) < len(text) and text.startswith(p) and (best is None or len(p) > len(best)):
+                best = p
+        return best
+
+
+def split_instructions(text: str, memory: PrefixMemory | None = None) -> tuple[str, str | None]:
+    """(stable, per_response_suffix|None)."""
+    if not isinstance(text, str):
+        return text, None
+    m = None
+    for m in _NOW_RE.finditer(text):
+        pass
+    if m is not None and m.start() >= 200:
+        return text[:m.start()].rstrip(), text[m.start():].strip()
+    if memory is not None:
+        p = memory.longest_prefix_of(text)
+        if p is not None and len(text) - len(p) >= 1:
+            return p, text[len(p):].strip() or None
+    return text, None
+
+
+def place_tail_instructions(msgs: list[dict], suffix: str) -> list[dict]:
+    """Append the per-response suffix as a system message after the whole history
+    (ensure_turn then adds a short user nudge, since DeepSeek continues a trailing system
+    message instead of answering it).  Everything before it stays byte-identical across
+    turns, and the instruction is the last thing the model reads (measured: placing it
+    before the trailing user turn made the model answer the user and ignore a dictation)."""
+    return msgs + [{"role": "system", "content": suffix}]
+
+
+def apply_layout(msgs: list[dict], layout: str, memory: PrefixMemory | None) -> tuple[list[dict], bool]:
+    """Returns (messages, split_done)."""
+    if layout != "tail" or not msgs or msgs[0].get("role") != "system":
+        return msgs, False
+    stable, suffix = split_instructions(msgs[0].get("content"), memory)
+    if memory is not None:
+        memory.remember(stable)
+    if not suffix:
+        return msgs, False
+    first = dict(msgs[0])
+    first["content"] = stable
+    return place_tail_instructions([first] + msgs[1:], suffix), True
+
+
+def estimate_tokens(messages: list[dict], tools: list[dict] | None = None) -> int:
+    n = 0
+    for m in messages or []:
+        c = m.get("content")
+        n += len(c) if isinstance(c, str) else len(json.dumps(c or "", ensure_ascii=False))
+        if m.get("tool_calls"):
+            n += len(json.dumps(m["tool_calls"], ensure_ascii=False))
+        n += 12
+    if tools:
+        n += len(json.dumps(tools, ensure_ascii=False))
+    return int(n / 3.6)
+
+
+def trim_history(msgs: list[dict], frac: float = 0.35, keep_last: int = 4) -> list[dict] | None:
+    """Drop the oldest ~frac of the non-system conversation (never the leading system
+    prompt, never the last ``keep_last`` messages, never orphaning tool results).
+    Returns None when nothing can be dropped."""
+    lead = 0
+    while lead < len(msgs) and msgs[lead].get("role") == "system":
+        lead += 1
+    body = msgs[lead:]
+    droppable = len(body) - keep_last
+    if droppable <= 0:
+        return None
+    k = max(1, int(len(body) * frac))
+    k = min(k, droppable)
+    while k < len(body) and body[k].get("role") == "tool":
+        k += 1
+    if k >= len(body) - 1:
+        return None
+    rest = body[k:]
+    note = {"role": "system", "content": OMITTED_NOTE}
+    head = msgs[:lead]
+    return head + ([] if any(m.get("content") == OMITTED_NOTE for m in head) else [note]) + rest
+
+
+OMITTED_NOTE = "(Earlier parts of the conversation were omitted.)"
+
+
+# =========================================================================== latest instruction
+
+_STRONG = r"(?:verbatim|exactly|word for word|word-for-word|wörtlich|genau so|genau)"
+_Q_OPEN, _Q_CLOSE = "\"“„«'", "\"”“»'"
+_VERBATIM_RES = [
+    # Say exactly: "X"  /  Read the following verbatim: "X"  /  Sag wörtlich: „X“
+    re.compile(r"\b(?:say|read|ask|repeat|sag|sage|lies|frag)\b[^\"“„«\n]{0,80}?\b" + _STRONG
+               + r"\b[^\"“„«\n]{0,40}?[:,]?\s*[\"“„«]([^\"”“»]{2,}?)[\"”“»]", re.I),
+    # Say "X" verbatim / exactly
+    re.compile(r"\b(?:say|read|ask|repeat|sag|sage)\b\s*[:,]?\s*[\"“„«]([^\"”“»]{2,}?)[\"”“»]\s*,?\s*"
+               + _STRONG + r"\b", re.I),
+    # Repeat after me: "X"
+    re.compile(r"\brepeat after me\b\s*[:,]?\s*[\"“„«]?([^\"”“»\n]{2,}?)[\"”“»]?\s*$", re.I),
+]
+_COND_RE = re.compile(r"\b(?:if|unless|when|wenn|falls|otherwise)\b[^.!?\n]*$", re.I)
+_SILENT_RE = re.compile(r"(?:without saying anything|do not say anything|don't say anything|"
+                        r"say nothing|ohne etwas zu sagen|sag nichts)", re.I)
+
+
+def _find_key(obj: Any, key: str, depth: int = 0) -> Any:
+    if depth > 4:
+        return None
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj
+        for v in obj.values():
+            r = _find_key(v, key, depth + 1)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, key, depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
+def _json_in(text: str) -> Any:
+    if not isinstance(text, str):
+        return None
+    j = text.find("{")
+    if j < 0:
+        return None
+    with contextlib.suppress(Exception):
+        return json.loads(text[j:])
+    end = _balanced_end(text, j)
+    if end:
+        with contextlib.suppress(Exception):
+            return json.loads(text[j:end])
+    return None
+
+
+@dataclass
+class VerbatimTarget:
+    text: str
+    strict: bool = True
+    allow_transition: bool = True
+    source: str = ""
+
+
+def latest_region(msgs: list[dict]) -> list[dict]:
+    """Messages after the model's last spoken (text) turn: what this reply responds to.
+    The leading system prompt (session instructions) is never part of it."""
+    j = len(msgs)
+    while j > 0:
+        m = msgs[j - 1]
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str) and \
+                m["content"].strip() and not m.get("tool_calls"):
+            break
+        j -= 1
+    lead = 1 if len(msgs) > 1 and msgs[0].get("role") == "system" else 0
+    if lead and len(msgs) > lead:
+        # with the 'inline' layout the per-response part lives in the first system message
+        first = msgs[0].get("content")
+        lead = 0 if isinstance(first, str) and _NOW_RE.search(first) else lead
+    return msgs[max(j, lead):]
+
+
+def find_verbatim_target(msgs: list[dict]) -> VerbatimTarget | None:
+    for m in reversed(latest_region(msgs)):
+        role, c = m.get("role"), m.get("content")
+        if not isinstance(c, str) or not c.strip():
+            continue
+        if role in ("tool", "system"):
+            obj = _json_in(c)
+            hit = _find_key(obj, "say_verbatim") if obj is not None else None
+            if hit is not None and isinstance(hit.get("say_verbatim"), str) and hit["say_verbatim"].strip():
+                if hit.get("translate_to"):
+                    return None
+                return VerbatimTarget(hit["say_verbatim"].strip(), True, True, role + ":say_verbatim")
+            if obj is not None:
+                for key in ("say", "say_exactly", "speak"):
+                    hit = _find_key(obj, key)
+                    if hit is not None and isinstance(hit.get(key), str) and hit[key].strip():
+                        return VerbatimTarget(hit[key].strip(), True, True, role + ":" + key)
+        if role in ("system", "user", "tool"):
+            for rx in _VERBATIM_RES:
+                mm = None
+                for mm in rx.finditer(c):
+                    pass
+                if mm is None:
+                    continue
+                before = c[max(0, mm.start() - 80):mm.start()]
+                if _COND_RE.search(before):
+                    continue
+                t = mm.group(1).strip()
+                if len(t) >= 2:
+                    return VerbatimTarget(t, True, role != "user", role + ":quoted")
+    return None
+
+
+_CALL_NOW_RE = re.compile(r"\bcall\s+(?:the\s+tool\s+)?`?([A-Za-z_][\w\-]*)`?\b[^.\n]{0,120}?"
+                          r"\b(?:now|right away|immediately|at once)\b", re.I)
+
+
+def instructed_tool(msgs: list[dict], names: Iterable[str]) -> str | None:
+    """Tool that the latest system instruction tells the model to call now, unconditionally
+    ("Call set_task_outcome now ..."); None for conditional phrasing ("If ..., call X now")."""
+    names = set(names)
+    for m in reversed(latest_region(msgs)):
+        if m.get("role") != "system" or not isinstance(m.get("content"), str):
+            continue
+        c = m["content"]
+        for mm in _CALL_NOW_RE.finditer(c):
+            if mm.group(1) not in names:
+                continue
+            sent_start = max(c.rfind(".", 0, mm.start()), c.rfind("\n", 0, mm.start())) + 1
+            if _COND_RE.search(c[sent_start:mm.start()]) or \
+                    re.search(r"\b(?:never|don't|do not|only)\b", c[sent_start:mm.start()], re.I):
+                continue
+            return mm.group(1)
+    return None
+
+
+def wants_silent_tool(msgs: list[dict]) -> bool:
+    """The latest instruction says to call a tool without speaking first."""
+    for m in latest_region(msgs):
+        if m.get("role") == "system" and isinstance(m.get("content"), str) and \
+                _SILENT_RE.search(m["content"]):
+            return True
+    return False
+
+
+# =========================================================================== verbatim guard
+
+
+def _norm_map(s: str) -> tuple[str, list[int]]:
+    out, idx = [], []
+    for i, ch in enumerate(s):
+        if ch.isalnum():
+            out.append(ch.casefold())
+            idx.append(i)
+    return "".join(out), idx
+
+
+_TRANSITION_WORDS = {"okay", "ok", "thanks", "thank", "you", "alright", "all", "right", "so",
+                     "now", "let's", "lets", "continue", "next", "great", "got", "it", "sure",
+                     "mm-hm", "mhm", "good", "danke", "gut", "alles", "klar", "weiter", "also",
+                     "jetzt", "vielen", "dank", "machen", "wir", "and", "then", "here's",
+                     "the", "question", "first", "well"}
+
+
+class VerbatimGuard:
+    """Makes the spoken text match a dictated target exactly, while streaming.
+
+    seek  : hold the (few) first characters until the model's text starts the target
+            (optionally after a short transition like "Okay.") or clearly does something else
+            (then pass everything through untouched: the model chose not to say it).
+    track : while the model follows the target, emit the *target's* characters (exact
+            punctuation); on deviation, or if the model stops early, emit the rest of the
+            target and drop the model's divergent text (``repaired``).
+    after : target complete; further model text is dropped when ``strict``."""
+
+    SEEK_EXTRA = 40  # normalised chars of non-matching text after which we give up
+
+    def __init__(self, target: VerbatimTarget, enforce: bool = False):
+        self.t = target
+        self.enforce = enforce  # replace a reply that never attempts the target
+        self.T = target.text
+        self.nT, self.mapT = _norm_map(self.T)
+        self.raw = ""
+        self.state = "seek" if self.nT else "off"
+        self.off = 0  # normalised index in model text where the target starts
+        self.emitted_T = 0
+        self.emitted_raw = 0
+        self.repaired = False
+        self.dropped = 0
+        self.transition = ""
+
+    def feed(self, s: str) -> str:
+        if not s:
+            return ""
+        self.raw += s
+        return self._step(False)
+
+    def finish(self) -> str:
+        return self._step(True)
+
+    def meta(self) -> dict:
+        return {"source": self.t.source, "state": self.state, "repaired": self.repaired,
+                "dropped_chars": self.dropped, "transition": self.transition or None}
+
+    def _step(self, final: bool) -> str:
+        nM, mapM = _norm_map(self.raw)
+        out = ""
+        if self.state == "off":
+            out = self.raw[self.emitted_raw:]
+            self.emitted_raw = len(self.raw)
+            return out
+        if self.state == "seek":
+            K = min(len(self.nT), 12)
+            pos = nM.find(self.nT[:K]) if len(nM) >= K else -1
+            if pos < 0 and final and nM and self.nT.startswith(nM):
+                pos = 0  # the model began the target and stopped early
+            if pos < 0:
+                # began the target but diverged early ("Question three" vs "Question 3"):
+                # a shared prefix of >= 8 normalised chars, possibly after a transition
+                P = min(8, len(self.nT))
+                j = nM.find(self.nT[:P])
+                if j >= 0 and (j == 0 or self._transition_ok(self.raw[:mapM[j]])):
+                    pos = j
+            if pos < 0:
+                if not final and self._may_still_start(nM, mapM):
+                    return ""
+                if self.enforce:
+                    self.repaired = True
+                    self.dropped += len(self.raw)
+                    self.emitted_raw = len(self.raw)
+                    self.emitted_T = len(self.T)
+                    self.state = "after"
+                    return self.T
+                self.state = "off"
+                return self._step(final)
+            self.off = pos
+            if pos > 0:
+                prefix = self.raw[:mapM[pos]].strip()
+                words = re.findall(r"[\w'\-]+", prefix.lower())
+                if self.t.allow_transition and len(words) <= 5 and \
+                        all(w in _TRANSITION_WORDS for w in words):
+                    self.transition = prefix
+                    out = prefix
+                else:
+                    self.dropped += len(prefix)
+                    self.repaired = True
+            self.state = "track"
+        if self.state == "track":
+            seg = nM[self.off:]
+            n = 0
+            L = min(len(seg), len(self.nT))
+            while n < L and seg[n] == self.nT[n]:
+                n += 1
+            if n == len(self.nT):
+                out += self._sp(out) + self.T[self.emitted_T:]
+                self.emitted_T = len(self.T)
+                self.state = "after"
+                end_raw = mapM[self.off + n - 1] + 1
+                self.emitted_raw = end_raw
+                return out + self._after(final)
+            if n == len(seg) and not final:
+                upto = self.mapT[n - 1] + 1 if n else 0
+                piece = self.T[self.emitted_T:upto]
+                if piece:
+                    out += self._sp(out) + piece
+                    self.emitted_T = upto
+                return out
+            # deviation, or the model stopped early: finish the target exactly
+            self.repaired = True
+            out += self._sp(out) + self.T[self.emitted_T:]
+            self.emitted_T = len(self.T)
+            self.state = "after"
+            self.dropped += len(self.raw) - (mapM[self.off + n - 1] + 1 if n else 0)
+            self.emitted_raw = len(self.raw)
+            return out
+        return self._after(final)
+
+    def _sp(self, out: str) -> str:
+        # space between an emitted transition and the first target characters
+        return " " if self.emitted_T == 0 and self.transition else ""
+
+    def _transition_ok(self, prefix: str) -> bool:
+        words = re.findall(r"[\w'\-]+", prefix.lower())
+        return len(words) <= 5 and all(w in _TRANSITION_WORDS for w in words)
+
+    def _may_still_start(self, nM: str, mapM: list[int]) -> bool:
+        """True while the model text so far can still turn into (transition +) target."""
+        if self.nT.startswith(nM):
+            return True
+        # split off a possible partial start of the target at the end
+        for L in range(min(len(nM), len(self.nT)), 0, -1):
+            if nM.endswith(self.nT[:L]):
+                head = self.raw[:mapM[len(nM) - L]]
+                break
+        else:
+            head = self.raw
+        words = re.findall(r"[\w'\-]+", head.lower())
+        return len(words) <= 5 and all(w in _TRANSITION_WORDS for w in words)
+
+    def _after(self, final: bool) -> str:
+        rest = self.raw[self.emitted_raw:]
+        self.emitted_raw = len(self.raw)
+        if self.t.strict:
+            if rest.strip(" \t\n.,!?"):
+                self.dropped += len(rest.strip())
+            return ""
+        # the target's closing punctuation was already emitted
+        return re.sub(r"^[^\w\s]+", "", rest) if self.T and not self.T[-1].isalnum() else rest
+
+
+# =========================================================================== preamble gate
+
+_FILLER_WORDS = {"okay", "ok", "alright", "all", "right", "got", "it", "sure", "great", "thanks",
+                 "thank", "you", "perfect", "mm-hm", "mhm", "hmm", "let", "me", "check", "that",
+                 "this", "one", "moment", "just", "a", "second", "sec", "so", "now", "i'll", "i",
+                 "will", "note", "record", "noted", "understood", "of", "course", "certainly",
+                 "gut", "danke", "alles", "klar", "verstanden", "einen", "augenblick", "moment",
+                 "kurz", "ich", "schaue", "nach", "notiere", "das", "and", "well", "yes", "yeah",
+                 "good", "nice", "cool", "fine", "awesome", "wonderful", "excellent",
+                 "for", "look", "up", "see", "quick", "quickly", "give", "minute", "hold", "on",
+                 "hang", "there", "check", "checking", "looking", "pull", "get", "right", "away",
+                 "schnell", "mal", "sekunde", "gleich"}
+
+
+class PreambleGate:
+    """'smart' preamble policy: speech streams live, except that a reply which so far
+    consists only of filler words ("Got it.", "Okay, let me check.") is held until either
+    a real word follows (released immediately) or a tool call starts (dropped)."""
+
+    MAX_WORDS = 6
+
+    def __init__(self):
+        self.buf = ""
+        self.decided = False
+        self.dropped = ""
+
+    def _fillerish(self) -> bool:
+        words = re.findall(r"[\w'\-]+", self.buf.lower())
+        return len(words) <= self.MAX_WORDS and all(w in _FILLER_WORDS for w in words)
+
+    def feed(self, s: str) -> str:
+        if self.decided:
+            return s
+        self.buf += s
+        if self._fillerish():
+            return ""
+        self.decided = True
+        out, self.buf = self.buf, ""
+        return out
+
+    def on_tool(self) -> None:
+        if not self.decided:
+            self.dropped += self.buf
+            self.buf = ""
+            self.decided = True
+
+    def finish(self) -> str:
+        out, self.buf = self.buf, ""
+        self.decided = True
+        return out
+
+
 # =========================================================================== harness
 
 
 @dataclass
 class HarnessOptions:
-    preamble: str = "allow"  # 'allow' | 'suppress'
-    voice_prompt: Any = True  # True | False | custom str
+    preamble: str = "smart"  # 'allow' | 'smart' | 'suppress'
+    voice_prompt: Any = True  # True | False | 'v1' | custom str
     validate: bool = True
     reask: bool = True
     recover_leaks: bool = True
     reask_max_tokens: int = 200
+    instructions_layout: str = "tail"  # 'tail' (cache-friendly) | 'inline'
+    verbatim_guard: str = "repair"  # 'repair' | 'enforce' | 'off'
+    prefix_memory: Any = None  # PrefixMemory shared by one LLM object
+    midstream_retry: bool = True  # retry once if a stream dies before anything was spoken
+    instructed_tool_reask: bool = True  # "Call X now" ignored -> re-ask once with X forced
+    max_trims: int = 3  # context-length errors: drop oldest history and retry
 
     def replace(self, **kw) -> "HarnessOptions":
         known = {f.name for f in dataclasses.fields(self)}
@@ -1235,34 +1737,44 @@ class Harness:
         return repair_arguments(raw, schema)
 
     # ------------------------------------------------------------------ run
+    def prepare(self, messages: list[dict]) -> tuple[list[dict], dict]:
+        """Message pipeline (sanitise, cache-friendly layout, voice prompt, ensure a turn).
+        Returns (messages, info)."""
+        opt = self.opt
+        msgs = sanitize_messages(messages)
+        msgs, split = apply_layout(msgs, opt.instructions_layout, opt.prefix_memory)
+        msgs = apply_voice_prompt(msgs, opt.voice_prompt, opt.preamble, bool(self.chat_tools)
+                                  and self.mode != "none")
+        if self.mode == "none" and self.chat_tools:
+            msgs = flatten_tool_history(msgs)
+        msgs = ensure_turn(msgs)
+        return msgs, {"layout_split": split}
+
     async def run(self, messages: list[dict], open_stream: OpenStream) -> AsyncIterator[LLMEvent]:
         t0 = time.perf_counter()
         opt = self.opt
-        msgs = sanitize_messages(messages)
-        msgs = apply_voice_prompt(msgs, opt.voice_prompt, opt.preamble, bool(self.chat_tools)
-                                  and self.mode != "none")
-        msgs = ensure_turn(msgs)
-        hold = bool(self.chat_tools) and self.mode != "none" and (
-            opt.preamble == "suppress" or self.mode in ("required", "named"))
-        filt = SpeechFilter(self.names, recover=opt.recover_leaks)
-        acc = _Acc()
-        held: list[str] = []
-        spoken: list[str] = []
-        meta: dict = {}
-        usage_total: dict = {}
-        finish = None
-        stream_error = None
-        text_ttft = None
-        first_text = True
+        msgs, info = self.prepare(messages)
+        has_tools = bool(self.chat_tools) and self.mode != "none"
+        preamble = opt.preamble
+        if has_tools and preamble != "allow" and wants_silent_tool(msgs):
+            preamble = "suppress"
+        hold = has_tools and (preamble == "suppress" or self.mode in ("required", "named"))
+        target = find_verbatim_target(msgs) if opt.verbatim_guard != "off" else None
         tools, tc = self.chat_tools or None, self.chat_tool_choice
         if self.mode == "none" and tools:
             # Several OpenRouter endpoints 404 on tool_choice:"none", and with tools attached DeepSeek
-            # calls one anyway instead of speaking. Send no tools; tool history becomes plain text.
+            # calls one anyway instead of speaking. Send no tools; tool history became plain text.
             tools, tc = None, None
-            msgs = ensure_turn(flatten_tool_history(msgs))
+        meta: dict = {}
+        usage_total: dict = {}
+        spoken: list[str] = []
+        first_text = True
+        text_ttft = None
         downgraded = False
         empty_retried = False
-        got_text = False
+        midstream_retried = False
+        trims = 0
+        interrupted = None
 
         def text_event(s: str) -> LLMEvent:
             nonlocal first_text, text_ttft
@@ -1275,20 +1787,47 @@ class Harness:
             spoken.append(s)
             return ev
 
-        while True:
+        while True:  # one iteration per request attempt
+            filt = SpeechFilter(self.names, recover=opt.recover_leaks)
+            guard = VerbatimGuard(target, enforce=opt.verbatim_guard == "enforce" and
+                                  target.source.startswith("system")) if target else None
+            gate = PreambleGate() if (has_tools and preamble == "smart" and not hold) else None
+            acc = _Acc()
+            held: list[str] = []
+            finish = None
+            stream_error = None
+            got_text = False
+            n_calls_seen = 0
+
+            def pipe(out: str, final: bool = False):
+                """filter output -> verbatim guard -> preamble gate -> (held | spoken)."""
+                if guard is not None:
+                    out = guard.feed(out) + (guard.finish() if final else "")
+                if gate is not None:
+                    if len(filt.calls) > n_calls_seen:
+                        gate.on_tool()
+                    out = gate.feed(out) if out else ""
+                    if final:
+                        out += gate.finish()
+                return out
+
+            evs: list[LLMEvent] = []
             try:
                 async with contextlib.aclosing(open_stream(msgs, tools, tc)) as raw:
                     async for r in raw:
                         k = r.kind
                         if k == "text":
                             got_text = got_text or bool(r.text and r.text.strip())
-                            out = filt.feed(r.text)
+                            out = pipe(filt.feed(r.text))
+                            n_calls_seen = len(filt.calls)
                             if out:
                                 if hold:
                                     held.append(out)
                                 else:
                                     yield text_event(out)
                         elif k == "tool":
+                            if gate is not None:
+                                gate.on_tool()
                             acc.add(r)
                         elif k == "meta":
                             meta.update(r.data or {})
@@ -1299,49 +1838,71 @@ class Harness:
                         elif k == "error":
                             stream_error = r.text
                             break
-                if (not empty_retried and stream_error is None and not got_text
-                        and not acc.calls):
-                    # 200 OK but no content and no tool call at all (seen with DeepSeek V4 via
-                    # OpenRouter): such a response would leave a voice client waiting for audio
-                    # that never comes, so ask once more.
-                    empty_retried = True
-                    log.warning("empty completion from %s (finish=%s); retrying once",
-                                meta.get("provider_slug") or meta.get("provider"), finish)
-                    finish = None
-                    continue
-                break
-            except Exception as e:  # ProviderError or transport errors before any token
+            except Exception as e:  # ProviderError / transport errors / timeouts
                 status = getattr(e, "status", None)
-                if (not downgraded and self.mode in ("required", "named") and
-                        status in (400, 404, 422)):
-                    # endpoint does not support forced tool_choice: emulate it
-                    downgraded = True
-                    if self.forced:
-                        tools = [t for t in self.chat_tools
-                                 if t["function"]["name"] == self.forced]
-                    tc = "auto"
-                    msgs = msgs + [{"role": "system", "content":
-                                    f"Call the tool {self.forced or 'that fits best'} now."}]
+                started = bool(got_text or acc.calls)
+                if not started:
+                    if (not downgraded and self.mode in ("required", "named") and
+                            status in (400, 404, 422) and not getattr(e, "context_length", False)):
+                        # no endpoint supports the forced tool_choice: emulate it
+                        downgraded = True
+                        if self.forced:
+                            tools = [t for t in self.chat_tools
+                                     if t["function"]["name"] == self.forced]
+                        tc = "auto"
+                        msgs = msgs + [{"role": "system", "content":
+                                        f"Call the tool {self.forced or 'that fits best'} now."}]
+                        msgs = ensure_turn(msgs)
+                        continue
+                    if getattr(e, "context_length", False) and trims < opt.max_trims:
+                        t2 = trim_history(msgs, frac=(0.35, 0.6, 0.85)[min(trims, 2)])
+                        if t2 is not None:
+                            trims += 1
+                            log.warning("context length exceeded; dropped oldest history (%d)", trims)
+                            msgs = t2
+                            continue
+                    yield LLMEvent("error", error=_error_text(e),
+                                   meta={"status": status, "code": _error_code(e), **_pub_meta(meta)})
+                    return
+                # failed after the first token
+                if not spoken and not midstream_retried and opt.midstream_retry and \
+                        not getattr(e, "account_level", False):
+                    midstream_retried = True  # nothing reached the listener: start over
+                    log.warning("stream died before anything was spoken (%s); retrying", e)
                     continue
-                yield LLMEvent("error", error=f"{type(e).__name__}: {e}",
-                               meta={"status": status, **_pub_meta(meta)})
-                return
+                stream_error = f"{type(e).__name__}: {e}"
+                interrupted = stream_error
+            if (not empty_retried and stream_error is None and not got_text
+                    and not acc.calls):
+                # 200 OK but no content and no tool call at all (seen with DeepSeek V4 via
+                # OpenRouter): such a response would leave a voice client waiting for audio
+                # that never comes, so ask once more.
+                empty_retried = True
+                log.warning("empty completion from %s (finish=%s); retrying once",
+                            meta.get("provider_slug") or meta.get("provider"), finish)
+                continue
+            break
 
-        tail = filt.finish()
+        tail = pipe(filt.finish(), final=True)
         if tail:
             if hold:
                 held.append(tail)
             else:
                 yield text_event(tail)
 
-        if stream_error is not None and not acc.calls:
+        if stream_error is not None and not acc.calls and not spoken and not held and \
+                not filt.calls:
             yield LLMEvent("error", error=f"stream error: {stream_error}",
                            meta=_pub_meta(meta))
             return
 
         # ---------------------------------------------------------- tool calls
+        native = acc.result()
+        if interrupted:
+            # a call cut off mid-arguments is not trustworthy: keep only complete JSON
+            native = [c for c in native if not parse_arguments(c["args"])[1]]
         raw_calls = [{"id": c["id"], "name": c["name"], "arguments": c["args"], "src": "native"}
-                     for c in acc.result()]
+                     for c in native]
         seen = {(c["name"], _canon(c["arguments"])) for c in raw_calls}
         for c in filt.calls:
             key = (c["name"], _canon(c["arguments"]))
@@ -1361,7 +1922,7 @@ class Harness:
         raw_calls = [c for c in raw_calls if c["name"] in self.schemas]
 
         reasked = 0
-        if not raw_calls and self.mode in ("required", "named") and opt.reask:
+        if not raw_calls and self.mode in ("required", "named") and opt.reask and not interrupted:
             reasked += 1
             nudge_tools = [t for t in self.chat_tools
                            if not self.forced or t["function"]["name"] == self.forced]
@@ -1379,6 +1940,30 @@ class Harness:
                               "src": "reask"} for c in calls2 if c["name"] in self.schemas]
             except Exception as e:
                 log.info("tool re-ask failed: %s", e)
+
+        # "Call X now" in the latest instruction, but the model called something else (or
+        # nothing) and has not spoken: re-ask once with X forced; X replaces the other calls.
+        must = instructed_tool(msgs, self.names) if (
+            opt.instructed_tool_reask and has_tools and self.mode == "auto" and not interrupted
+            and not spoken) else None
+        if must and must not in [c["name"] for c in raw_calls]:
+            reasked += 1
+            try:
+                _, calls3, u3, _m = await self._collect(
+                    open_stream, msgs, [t for t in self.chat_tools if t["function"]["name"] == must],
+                    {"type": "function", "function": {"name": must}}, opt.reask_max_tokens)
+                _add_usage(usage_total, u3)
+                got = [{"id": c["id"], "name": c["name"], "arguments": c["args"], "src": "instructed"}
+                       for c in calls3 if c["name"] == must]
+                if got:
+                    dropped += [c["name"] for c in raw_calls]
+                    raw_calls = got
+                    if held or (gate is not None and gate.buf):
+                        meta["suppressed_text"] = "".join(held)
+                        held = []
+                    meta["instructed_tool"] = must
+            except Exception as e:
+                log.info("instructed-tool re-ask failed: %s", e)
 
         final_calls: list[ToolCall] = []
         repaired = 0
@@ -1413,7 +1998,7 @@ class Harness:
             final_calls.append(ToolCall(cid, c["name"], args))
 
         if held:
-            if final_calls and (opt.preamble == "suppress" or self.mode in ("required", "named")):
+            if final_calls and (preamble == "suppress" or self.mode in ("required", "named")):
                 meta["suppressed_text"] = "".join(held)
             else:
                 for s in held:
@@ -1423,17 +2008,32 @@ class Harness:
 
         done_meta = _pub_meta(meta)
         done_meta.update({
-            "finish_reason": "tool_calls" if final_calls else (finish or "stop"),
+            "finish_reason": "tool_calls" if final_calls else
+            ("interrupted" if interrupted else (finish or "stop")),
             "text_ttft_ms": None if text_ttft is None else round(text_ttft, 1),
             "total_ms": round((time.perf_counter() - t0) * 1000, 1),
             "leaks_recovered": len([c for c in raw_calls if c.get("src") == "leak"]),
             "repaired": repaired, "reasked": reasked, "synthesized": synthesized,
             "dropped_tool_calls": dropped, "text": "".join(spoken),
+            "layout_split": info["layout_split"], "preamble_policy": preamble,
         })
+        if gate is not None and gate.dropped:
+            done_meta["suppressed_text"] = gate.dropped
         if "suppressed_text" in meta:
             done_meta["suppressed_text"] = meta["suppressed_text"]
+        if guard is not None:
+            done_meta["verbatim"] = guard.meta()
+        if trims:
+            done_meta["history_trims"] = trims
+        if meta.get("instructed_tool"):
+            done_meta["instructed_tool"] = meta["instructed_tool"]
+        if midstream_retried:
+            done_meta["midstream_retried"] = True
         if stream_error is not None:
             done_meta["stream_error"] = stream_error
+        cached = (usage_total.get("prompt_tokens_details") or {}).get("cached_tokens")
+        if cached is not None:
+            done_meta["cached_tokens"] = cached
         yield LLMEvent("done", usage=usage_total or None, meta=done_meta)
 
     async def _reask_args(self, open_stream, msgs, call, args_json, errs):
@@ -1496,7 +2096,34 @@ def _add_usage(total: dict, u: dict | None) -> None:
                 _add_usage(sub, v)
 
 
+def _error_code(e: BaseException) -> str:
+    st = getattr(e, "status", None)
+    if st == 402:
+        return "insufficient_credits"
+    if st == 401:
+        return "invalid_api_key"
+    if getattr(e, "context_length", False):
+        return "context_length_exceeded"
+    if st == 429:
+        return "rate_limited"
+    return "llm_error"
+
+
+def _error_text(e: BaseException) -> str:
+    st = getattr(e, "status", None)
+    if st == 402:
+        return ("OpenRouter: insufficient credits (HTTP 402). Add credits at "
+                f"https://openrouter.ai/settings/credits or lower max_tokens. ({e})")
+    if st == 401:
+        return f"OpenRouter rejected the API key (HTTP 401): check OPENROUTER_API_KEY. ({e})"
+    if st == 429:
+        return f"All LLM providers are rate-limited right now (HTTP 429). ({e})"
+    if getattr(e, "context_length", False):
+        return f"The conversation is too long for the model's context window. ({e})"
+    return f"{type(e).__name__}: {e}"
+
+
 def _pub_meta(meta: dict) -> dict:
-    keys = ("provider", "provider_slug", "model", "ttft_ms", "hedged", "hedge_won", "failovers",
-            "attempts")
+    keys = ("provider", "provider_slug", "model", "ttft_ms", "own_ttft_ms", "hedged", "hedge_won",
+            "failovers", "attempts", "sticky", "prompt_tokens_est")
     return {k: meta[k] for k in keys if k in meta}

@@ -68,3 +68,80 @@ def test_ring_buffer():
     assert rb.read(35, 42).tolist() == list(range(35, 42))
     rb.clear()
     assert rb.total == 0 and len(rb.read(0)) == 0
+
+
+# ---------------------------------------------------------------- robustness (hardening pass)
+@pytest.mark.parametrize("a,b", [(24000, 16000), (48000, 16000), (44100, 16000), (8000, 16000),
+                                 (16000, 8000), (16000, 24000), (22050, 16000), (96000, 16000)])
+@pytest.mark.parametrize("chunk", [1, 7, 13, 441, 1023])
+def test_resampler_tiny_and_odd_chunks_match_oneshot(a, b, chunk):
+    # regression: chunks smaller than the filter delay (e.g. 1-13 samples) produced extra
+    # samples and misaligned output (errors up to 0.5 full scale)
+    x = (np.random.default_rng(0).standard_normal(int(0.3 * a)) * 0.1).astype(np.float32)
+    ref = resample(x, a, b)
+    r = Resampler(a, b)
+    y = np.concatenate([r.process(x[i:i + chunk]) for i in range(0, len(x), chunk)] + [r.flush()])
+    assert len(y) == len(ref)
+    assert np.abs(y - ref).max() < 1e-4
+    # reusable after flush
+    y2 = np.concatenate([r.process(x), r.flush()])
+    assert np.abs(y2 - ref).max() < 1e-4
+
+
+def test_resampler_44k1_tone_and_length():
+    x = (0.5 * np.sin(2 * np.pi * 1000 * np.arange(44100) / 44100)).astype(np.float32)
+    r = Resampler(44100, 16000)
+    y = np.concatenate([r.process(x[i:i + 441]) for i in range(0, len(x), 441)] + [r.flush()])
+    assert len(y) == 16000
+    spec = np.abs(np.fft.rfft(y))
+    assert abs(np.argmax(spec) - 1000) <= 1
+
+
+def test_nan_inf_are_sanitised():
+    bad = np.array([0.1, np.nan, np.inf, -np.inf, 0.2], np.float32)
+    assert np.array_equal(float32_to_int16(bad), np.array([3277, 0, 0, 0, 6553], np.int16))
+    r = Resampler(24000, 16000)
+    y = np.concatenate([r.process(np.concatenate([bad, np.zeros(2000, np.float32)])), r.flush()])
+    assert np.isfinite(y).all()
+    assert np.isfinite(resample(bad, 48000, 16000)).all()
+
+
+def test_int16_clipping_saturates():
+    x = np.array([1.5, -1.5, 1.0, -1.0, 0.99999], np.float32)
+    assert list(float32_to_int16(x)) == [32767, -32768, 32767, -32767, 32767]
+
+
+def test_g711_bit_exact_and_roundtrip():
+    from ort.audio import g711_decode, g711_encode
+    allc = bytes(range(256))
+    # all 256 codes decode and re-encode to themselves (except the duplicate zero codes)
+    for ulaw in (True, False):
+        dec = g711_decode(allc, ulaw)
+        assert dec.dtype == np.float32 and np.abs(dec).max() <= 1.0
+        re = g711_encode(dec, ulaw)
+        same = sum(a == b for a, b in zip(allc, re))
+        assert same >= 254, (ulaw, same)
+    try:
+        import audioop  # stdlib until 3.13: bit-exact reference
+    except ImportError:
+        return
+    pcm = np.arange(-32768, 32768, dtype=np.int32).astype("<i2")
+    assert g711_encode(pcm, True) == audioop.lin2ulaw(pcm.tobytes(), 2)
+    assert g711_encode(pcm, False) == audioop.lin2alaw(pcm.tobytes(), 2)
+    assert np.array_equal(float32_to_int16(g711_decode(allc, True)) // 1,
+                          float32_to_int16(int16_to_float32(audioop.ulaw2lin(allc, 2))))
+
+
+def test_g711_8k_speechlike_roundtrip_snr():
+    from ort.audio import g711_decode, g711_encode
+    t = np.arange(8000) / 8000
+    x = (0.3 * np.sin(2 * np.pi * 300 * t) * (0.5 + 0.5 * np.sin(2 * np.pi * 3 * t))).astype(np.float32)
+    for ulaw in (True, False):
+        y = g711_decode(g711_encode(x, ulaw), ulaw)
+        snr = 10 * np.log10(np.sum(x * x) / np.sum((x - y) ** 2))
+        assert snr > 30, (ulaw, snr)
+    # 8 kHz G.711 -> 16 kHz engine rate in odd chunks keeps the length exact
+    r = Resampler(8000, 16000)
+    raw = g711_encode(x, True)
+    y = np.concatenate([r.process(g711_decode(raw[i:i + 161], True)) for i in range(0, len(raw), 161)] + [r.flush()])
+    assert len(y) == 16000

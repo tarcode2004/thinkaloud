@@ -9,8 +9,12 @@ Public contract (see DESIGN.md):
     text_delta*  (spoken text, already cleaned: no leaked tool-call syntax, no leading
                   whitespace / markdown emphasis; safe to feed straight to TTS)
     tool_call*   (arguments are a JSON string that validates against the tool schema)
-    done         (exactly once on success; usage + meta {provider, ttft_ms, ...})
-  | error        (terminal; nothing follows)
+    done         (exactly once on success; usage + meta {provider, ttft_ms, cached_tokens,
+                  finish_reason ('stop'|'tool_calls'|'length'|'interrupted'), ...}).
+                  'interrupted' = the stream died / stalled / timed out after speech had
+                  started: what was spoken is final and is never repeated (meta.stream_error).
+  | error        (terminal; nothing follows; meta.code in llm_error | rate_limited |
+                  insufficient_credits | invalid_api_key | context_length_exceeded)
 
 Cancellation: close the generator (``await agen.aclose()``) or cancel the task that is
 iterating it.  Either aborts the underlying HTTP/2 stream(s) immediately (RST_STREAM).
@@ -70,10 +74,16 @@ def make_llm(cfg: Any = None) -> LLM:
 
     ``cfg`` may be None, a string ('openrouter' | 'mock') or a dict with optional keys:
       llm, model, providers (list or comma str), hedge (bool), hedge_delay_ms,
-      preamble ('allow'|'suppress'), voice_prompt (bool|str), reasoning (bool),
+      preamble ('allow'|'smart'|'suppress', default 'smart'), voice_prompt (bool|'v1'|str),
+      instructions_layout ('tail'|'inline', default 'tail': per-response '# NOW' sections
+      go after the history so the prompt-cache prefix stays stable),
+      verbatim_guard ('repair'|'enforce'|'off', default 'repair'), sticky (bool, prefer the
+      provider that served the conversation's previous turn: its prompt cache is warm),
+      idle_timeout_s (8), total_timeout_s (45), reasoning (bool),
       api_key, base_url, cache_path, temperature, max_tokens, mock_* (see mock.py).
     Env overrides: OPENREALTIME_LLM, ORT_LLM_MODEL, ORT_LLM_PROVIDERS, ORT_HEDGE,
-      ORT_HEDGE_DELAY_MS, ORT_PREAMBLE.
+      ORT_HEDGE_DELAY_MS, ORT_PREAMBLE, ORT_LLM_LAYOUT, ORT_VERBATIM_GUARD, ORT_LLM_STICKY,
+      ORT_LLM_IDLE_TIMEOUT_S, ORT_LLM_TOTAL_TIMEOUT_S.
     """
     c = _as_dict(cfg)
     kind = (os.environ.get("OPENREALTIME_LLM") or c.get("llm") or "openrouter").lower()

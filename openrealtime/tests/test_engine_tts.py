@@ -182,3 +182,115 @@ def test_tts_stt_roundtrip_languages(lang, text, max_wer):
     assert len(a) > 24000 * 0.5
     out = asyncio.run(s.transcribe(resample(a, 24000, 16000), language=lang))
     assert wer(text, out) <= max_wer, (lang, out)
+
+
+# ---------------------------------------------------------------- hardening
+def test_segmenter_numbered_list_markers_stay_with_item():
+    # '1.' used to become its own segment, spoken as "one." before each list item
+    assert _segments("1. First item\n2. Second item\n3. Third") == ["1. First item\n", "2. Second item\n", "3. Third"]
+    assert _segments("I have 3. You have 4.") == ["I have 3.", " You have 4."]
+
+
+def test_segmenter_huge_unpunctuated_sentence_is_cut_not_lost():
+    words = ("we keep talking about the plan for the new office and the people who will move there " * 20).split()[:300]
+    segs = _segments(" ".join(words), step=5)
+    assert " ".join(segs).split() == words
+    assert max(len(s.split()) for s in segs) <= 41
+
+
+def test_phoneme_safe_chunks():
+    from ort.tts import _phoneme_safe_chunks
+    text = " ".join(["Donaudampfschifffahrtsgesellschaftskapitän"] * 30)
+    parts = _phoneme_safe_chunks(text)
+    assert " ".join(parts).split() == text.split()
+    assert all(len(p) <= 200 for p in parts)
+    assert _phoneme_safe_chunks("") == [] and _phoneme_safe_chunks("Kurz.") == ["Kurz."]
+    assert all(len(p) <= 200 for p in _phoneme_safe_chunks("x" * 1000))
+
+
+@requires_gpu
+@pytest.mark.parametrize("lang", ["de", "es", "en"])
+def test_long_text_is_not_truncated_at_510_phonemes(lang):
+    """Kokoro's espeak path truncated anything over 510 phonemes: 300 German words came out as
+    23 s of audio (13 words/s) instead of ~100 s."""
+    t = tts()
+    base = {"de": "der schnelle braune Fuchs springt über den faulen Hund während der Bauer zuschaut",
+            "es": "el rápido zorro marrón salta sobre el perro perezoso mientras el granjero mira",
+            "en": "the quick brown fox jumps over the lazy dog while the farmer watches from his porch"}[lang]
+    text = " ".join((base.split() * 30)[:300])
+    kv, key = t.resolve("alloy", lang)
+    a, _ = t._executor.submit(t._synth, text, kv, key, 1.0, None).result()
+    wps = 300 / (len(a) / 24000)
+    assert 1.8 < wps < 4.5, wps
+
+
+async def _deltas(parts, delay=0.0):
+    for p in parts:
+        if delay:
+            await asyncio.sleep(delay)
+        yield p
+
+
+@requires_gpu
+@pytest.mark.parametrize("parts", [[], [""], ["", "  ", "\n", " \t "], ["**", "", "🎉", "```", "\n```"]])
+def test_empty_and_unspeakable_deltas_yield_nothing(parts):
+    t = tts()
+
+    async def go():
+        return [c async for c in t.stream(_deltas(parts), "alloy")]
+    t0 = time.perf_counter()
+    assert asyncio.run(go()) == []
+    assert time.perf_counter() - t0 < 0.5
+
+
+@requires_gpu
+def test_tokens_split_across_deltas():
+    t = tts()
+    parts = ["Th", "ank", " you", " for", " wait", "ing", ",", " Dr", ".", " Sm", "ith", ". It", "'s 3", ".", "5", "%", " now", "."]
+
+    async def go():
+        return [c async for c in t.stream(_deltas(parts, 0.005), "alloy")]
+    chunks = asyncio.run(go())
+    assert "".join(c.text for c in chunks).split() == "".join(parts).split()
+    spoken = " ".join(c.spoken for c in chunks)
+    assert "Thank you" in spoken and "Doctor Smith" in spoken and "three point five percent" in spoken
+    out = asyncio.run(stt().transcribe(resample(np.concatenate([c.plain() for c in chunks]), 24000, 16000), "en"))
+    assert wer("Thank you for waiting, Doctor Smith. It's 3.5% now.", out) <= 0.3, out
+
+
+@requires_gpu
+def test_edge_text_battery_speaks_cleanly():
+    t = tts()
+    text = ("Here's the summary:\n\n| Item | Cost |\n|---|---|\n| Coffee | €3.50 |\n| Cake | £4 |\n\n"
+            "- Call **555-123-4567** or email help@example.com\n- Visit https://example.com/menu\n"
+            "```python\nprint('never spoken')\n```\n"
+            "Prices rose 12% on 2024-03-15 at 9:30 a.m., e.g. from -5 to v2.1 levels. 🎉")
+
+    async def go():
+        return [c async for c in t.stream(_deltas([text[i:i + 4] for i in range(0, len(text), 4)]), "alloy")]
+    chunks = asyncio.run(go())
+    spoken = " ".join(c.spoken for c in chunks)
+    for bad in ("never spoken", "print", "|", "**", "https", "🎉", "```"):
+        assert bad not in spoken, (bad, spoken)
+    for good in ("three euros and fifty cents", "four pounds", "twelve percent", "March fifteenth",
+                 "nine thirty", "for example", "minus five", "version two point one", "example dot com"):
+        assert good in spoken, (good, spoken)
+    assert all(len(c) > 0 and np.isfinite(c).all() for c in chunks)
+
+
+@requires_gpu
+def test_cancel_mid_synthesis_frees_the_gpu_quickly():
+    t = tts()
+    long_de = " ".join(("der schnelle braune Fuchs springt über den faulen Hund, " * 40).split())
+
+    async def go():
+        agen = t.stream(_deltas([long_de]), "alloy", language="de")
+        async for _ in agen:
+            break
+        await agen.aclose()
+        t0 = time.perf_counter()
+        a = await t.synthesize("Hello again.", "alloy")
+        return time.perf_counter() - t0, a
+    dt, a = asyncio.run(go())
+    assert len(a) > 0
+    assert dt < 0.4, dt          # did not wait for the abandoned 400-word stream

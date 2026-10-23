@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ["OPENREALTIME_LLM"] = "mock"
 
-from fakes import RT, FakeLLM, FakeSTT, FakeTTS, make_engine, running_app, silence, tone, tool_call  # noqa: E402
+from fakes import RT, T, FakeLLM, FakeSTT, FakeTTS, make_engine, running_app, silence, tone, tool_call  # noqa: E402
 from ort.llm import LLMEvent  # noqa: E402
 from ort.server import STATE  # noqa: E402
 
@@ -342,7 +342,7 @@ async def test_barge_in_cancels_and_truncates_to_heard_audio():
         t_barge = asyncio.get_running_loop().time()
         done = await rt.wait_for("response.done", timeout=2)
         t_done = asyncio.get_running_loop().time()
-        assert t_done - t_barge < 0.15, "cancel must be immediate"
+        assert t_done - t_barge < 0.15 * min(T, 2), "cancel must be immediate"
         r = done["response"]
         assert r["status"] == "cancelled" and r["status_details"]["reason"] == "turn_detected"
         heard = r["output"][0]["content"][0]["transcript"]
@@ -572,3 +572,49 @@ async def test_cors_preflight_and_headers():
         assert r.status == 200 and r.headers["Access-Control-Allow-Origin"] == "*"
         r = await client.post("/v1/realtime/client_secrets", json={"session": {"type": "realtime", "tool_choice": "bogus"}})
         assert r.status == 400 and (await r.json())["error"]["param"] == "session.tool_choice"
+
+
+@pytest.mark.parametrize("code,etype", [("insufficient_credits", "server_error"), ("rate_limited", "server_error"),
+                                        ("context_length_exceeded", "invalid_request_error"), (None, "server_error")])
+async def test_llm_error_code_passed_through(code, etype):
+    llm = FakeLLM([[LLMEvent("error", error="nope", meta={"code": code} if code else None)]])
+    async with running_app(make_engine(llm=llm)) as client:
+        rt, _ = await _connect(client)
+        await rt.send(MANUAL)
+        await rt.send({"type": "response.create"})
+        rd = await rt.wait_for("response.done")
+        err = rd["response"]["status_details"]["error"]
+        assert rd["response"]["status"] == "failed" and err["code"] == (code or "llm_error") and err["type"] == etype
+        await rt.close()
+
+
+async def test_interrupted_llm_stream_completes_with_spoken_text():
+    """A provider disconnect after some speech ends as `done` with finish_reason 'interrupted'."""
+    llm = FakeLLM([["Here is part of", LLMEvent("done", meta={"finish_reason": "interrupted"})]])
+    async with running_app(make_engine(llm=llm, tts=FakeTTS(ms_per_char=2))) as client:
+        rt, _ = await _connect(client)
+        await rt.send(MANUAL)
+        await rt.send({"type": "response.create"})
+        rd = await rt.wait_for("response.done", timeout=5)
+        assert rd["response"]["status"] == "completed"
+        assert rd["response"]["output"][0]["content"][0]["transcript"] == "Here is part of"
+        await rt.close()
+
+
+def test_chunk_marks_ignore_punctuation_tokens_in_word_timings():
+    """Kokoro reports ', ' and '.' as separate 'words': they must not shift the display words."""
+    from ort.session import OUT_SR, _chunk_marks
+    text = "Let me walk you through the whole checkout flow, step by step."
+    toks = ["Let ", "me ", "walk ", "you ", "through ", "the ", "whole ", "checkout ", "flow", ", ", "step ", "by ", "step", "."]
+    words, t = [], 0.0
+    for w in toks:
+        d = 0.02 if not any(ch.isalnum() for ch in w) else 0.25
+        words.append((w, t, t + d))
+        t += d
+    marks = _chunk_marks(text, words, 0, int(t * OUT_SR), "")
+    mids = {w.strip(): (a + b) / 2 for w, a, b in words if any(ch.isalnum() for ch in w)}
+    for pos, w in marks:
+        key = w.strip().rstrip(",.")
+        if key in ("step",):
+            continue   # appears twice
+        assert abs(pos / OUT_SR - mids[key]) < 0.01, (w, pos / OUT_SR, mids[key])

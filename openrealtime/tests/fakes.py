@@ -14,6 +14,22 @@ from ort.session import Engine
 
 SR16 = 16000
 
+# Event waits get this much slack when the machine is busy (GPU tests of other suites running):
+# waits are event-driven, so a larger timeout never slows a passing test.
+import os as _os
+T = float(_os.environ.get("ORT_TEST_TIMEOUT_SCALE", "3"))
+
+
+async def wait_until(pred, timeout: float = 5.0, step: float = 0.02) -> bool:
+    """Poll a condition (state that has no event) until true or timeout x T."""
+    import time as _t
+    end = _t.monotonic() + timeout * T
+    while _t.monotonic() < end:
+        if pred():
+            return True
+        await asyncio.sleep(step)
+    return bool(pred())
+
 
 # ----------------------------------------------------------------- LLM
 
@@ -128,7 +144,7 @@ class FakeSTT:
     def warmup(self):
         pass
 
-    async def transcribe(self, pcm16k: np.ndarray, language: str | None = None, prompt: str | None = None) -> str:
+    async def transcribe(self, pcm16k: np.ndarray, language: str | None = None, prompt: str | None = None, **_kw) -> str:
         self.calls.append({"samples": int(pcm16k.size), "language": language, "prompt": prompt})
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -283,7 +299,7 @@ class RT:
         if isinstance(pred, str):
             t = pred
             pred = lambda e: e["type"] == t  # noqa: E731
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout * T
         i = 0 if from_start else self._cursor
         while True:
             while i < len(self.events):
