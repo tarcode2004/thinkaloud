@@ -128,6 +128,19 @@ npm start              # http://localhost:4000 (app host on :4001)
 
 Supported project types and their status are listed in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
+## Run without OpenAI: OpenRealtime
+
+[`openrealtime/`](openrealtime/) is a self-hosted voice server that speaks the OpenAI Realtime protocol: ephemeral tokens, WebRTC and the same events. It uses local Whisper for speech recognition, Kokoro for speech and Silero plus smart-turn for turn-taking, all on your GPU. DeepSeek V4 provides the reasoning, via OpenRouter. ThinkAloud's moderator runs on it unchanged:
+
+```bash
+cd openrealtime && .venv/bin/python -m ort            # setup: openrealtime/README.md
+# then in ThinkAloud's .env
+REALTIME_BASE_URL=http://localhost:8787/v1
+REALTIME_PUBLIC_URL=https://<public URL of :8787>/v1  # what participants' browsers reach
+```
+
+Measured on an NVIDIA GB10, voice-to-voice latency is about 0.8 s median. A full participant session (consent, intro, task, outcome, interview, closing) passes end to end over WebRTC. With these variables unset, ThinkAloud uses OpenAI as before.
+
 ## Example: the CrossWeave (Stacky Social) study
 
 [`examples/stacky/protocol.json`](examples/stacky/protocol.json) turns a real formative study plan into a runnable protocol: warm-up, 8 tasks on related-post comprehension and AI-edit provenance, trust and speed ratings, UMUX-Lite, and a preference interview.
@@ -140,12 +153,12 @@ npx tsx scripts/setup-stacky-study.ts    # build from git, create A/B variants, 
 
 ```bash
 npm test                                                    # unit + security tests
-npx playwright test tests/e2e/participant.spec.ts           # real voice sessions with synthetic speech
-npx playwright test tests/e2e/participant-hardening.spec.ts # crashes, probes, timeouts, reconnects, eye tracking, German
-npx playwright test tests/e2e/fullloop.spec.ts              # researcher → build → voice participants → results → A/B
+npx playwright test tests/e2e/participant-mock.spec.ts      # participant runtime against a local realtime mock
+npx playwright test tests/e2e/openrealtime.spec.ts          # full voice session over WebRTC against OpenRealtime (no OpenAI)
+npm run harness -- --scenario all                           # synthetic participants (novice, chatty, silent, German, …)
 ```
 
-The e2e suites drive real gpt-realtime-2 sessions through Chromium with a fake microphone fed by generated speech.
+Tests never call OpenAI. Playwright blanks `OPENAI_API_KEY` unless `ALLOW_OPENAI_IN_TESTS=1`. The suites that drive real gpt-realtime sessions (`participant.spec.ts`, `participant-hardening.spec.ts`, `fullloop.spec.ts`) only run with that opt-in.
 
 ## Layout
 
@@ -158,4 +171,9 @@ The e2e suites drive real gpt-realtime-2 sessions through Chromium with a fake m
 | `probe/` | Script injected into tested apps (rrweb, interaction capture, postMessage bridge) |
 | `web/src/researcher`, `web/src/participant`, `web/src/analytics` | Dashboard, participant runtime, results |
 | `examples/` | Demo shop app, the CrossWeave study protocol |
+| `openrealtime/` | Self-hosted OpenAI-Realtime-compatible voice server (Python) |
 | `docs/` | API contract, research brief, design language, compatibility, realtime notes |
+
+## License
+
+MIT, for both ThinkAloud and OpenRealtime. The models OpenRealtime downloads have their own licenses, listed in [`openrealtime/THIRD_PARTY.md`](openrealtime/THIRD_PARTY.md).
