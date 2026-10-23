@@ -3,6 +3,7 @@ import { Link, NavLink, Outlet, useLocation, useNavigate, useParams } from 'reac
 import { AlertTriangle, ChevronDown, ChevronRight, Eye, MoreHorizontal, Pause, Play, Rocket, Square, Trash2 } from 'lucide-react';
 import type { StudyStatus } from '@thinkaloud/shared';
 import { useAsync } from '../../lib/hooks.ts';
+import { ApiError } from '../../lib/api.ts';
 import { Button, cn, FullPageSpinner, Modal } from '../../ui/index.tsx';
 import { useToast } from '../../ui/toast.tsx';
 import { Callout, InlineEdit, Menu, MenuItem, StatusBadge } from '../components/index.tsx';
@@ -42,6 +43,7 @@ export default function StudyLayout() {
 const TABS = [
   { to: '', label: 'Overview', end: true },
   { to: 'protocols', label: 'Protocol' },
+  { to: 'consent', label: 'Consent' },
   { to: 'apps', label: 'App builds' },
   { to: 'variants', label: 'Variants' },
   { to: 'recruit', label: 'Recruit' },
@@ -68,6 +70,12 @@ function StudyHeader() {
       notifyStudiesChanged();
       toast(status === 'live' ? 'Study is live. Share your link from Recruit.' : status === 'paused' ? 'Study paused. New participants cannot join.' : status === 'closed' ? 'Study closed' : 'Status updated');
     } catch (e) {
+      // SaaS billing: publishing needs a plan. Building and previewing stay free.
+      if (e instanceof ApiError && e.status === 402) {
+        toast('Choose a plan to publish this study. Your work is saved.');
+        nav('/billing');
+        return;
+      }
       const items = errorDetails(e);
       setIssues({ title: status === 'live' ? 'Your study is not ready to go live' : 'Could not change status', items: items.length ? items : [errorMessage(e)] });
     } finally {

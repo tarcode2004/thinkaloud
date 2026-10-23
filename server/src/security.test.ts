@@ -159,6 +159,13 @@ test('a second account gets 403/404 on every researcher endpoint of another acco
     ['POST', `/api/studies/${studyId}/synthesis`],
     ['GET', `/api/studies/${studyId}/export?format=csv&table=sessions`],
     ['GET', `/api/studies/${studyId}/export?format=json&table=events`],
+    ['GET', `/api/studies/${studyId}/consent`],
+    ['PUT', `/api/studies/${studyId}/consent`, { text: 'pwned' }],
+    ['GET', `/api/studies/${studyId}/consent/document`],
+    ['DELETE', `/api/studies/${studyId}/consent/document`],
+    ['POST', `/api/studies/${studyId}/consent/check`, {}],
+    ['POST', `/api/studies/${studyId}/consent/rewrite`, { text: 'x'.repeat(40) }],
+    ['GET', `/api/studies/${studyId}/demographics`],
     ['GET', `/api/sessions/${sessionId}`],
     ['GET', `/api/sessions/${sessionId}/replay`],
     ['GET', `/api/sessions/${sessionId}/audio?track=mixed`],
@@ -282,4 +289,88 @@ test('CSRF guard refuses cross-origin state-changing researcher requests', async
   assert.equal(await run('GET', '/studies', 'http://evil.example'), undefined);
   assert.equal(await run('POST', '/p/sessions/x/events', 'http://app-x.localhost:4001'), undefined);
   assert.equal(await run('POST', '/studies'), undefined);
+});
+
+// ── Billing (SaaS mode) ──────────────────────────────────────────────────────
+
+/** Run fn with billing switched on (config is read from env at call time). */
+async function withBilling(fn: () => Promise<void>) {
+  const saved = { ...process.env };
+  process.env.STRIPE_SECRET_KEY = 'sk_test_security_never_sent';
+  process.env.STRIPE_WEBHOOK_SECRET = 'whsec_security';
+  process.env.BILLING_PLANS = JSON.stringify({
+    plans: [{ id: 'pro', name: 'Pro', monthlyPriceCents: 100, includedMinutes: 1, overageCentsPerMinute: 1, stripeBasePriceId: 'price_secret_base', stripeMeteredPriceId: 'price_secret_meter' }],
+  });
+  try {
+    await fn();
+  } finally {
+    for (const k of ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'BILLING_PLANS']) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+}
+
+test('billing endpoints require sign-in and refuse cross-origin writes', async () => {
+  const anon = client();
+  for (const [m, u, b] of [['GET', '/api/billing'], ['POST', '/api/billing/checkout', { planId: 'pro' }], ['POST', '/api/billing/portal'], ['POST', '/api/billing/end-trial'], ['PATCH', '/api/billing/settings', { spendCapCents: null }]] as [string, string, unknown?][]) {
+    assert.equal((await anon(m, u, b)).status, 401, `${m} ${u}`);
+  }
+  await withBilling(async () => {
+    for (const [m, u, b] of [['POST', '/api/billing/checkout', { planId: 'pro' }], ['POST', '/api/billing/portal'], ['PATCH', '/api/billing/settings', { spendCapCents: 500 }]] as [string, string, unknown?][]) {
+      const r = await owner(m, u, b, { Origin: 'http://app-x.localhost:4001' });
+      assert.equal(r.status, 403, `cross-origin ${m} ${u} → ${r.status}`);
+    }
+    const ov = await owner('GET', '/api/billing');
+    assert.equal(ov.status, 200);
+    assert.equal(ov.json.spendCapCents, null, 'the cross-origin write did not apply');
+  });
+});
+
+test('the Stripe webhook is exempt from the origin guard but needs a valid signature', async () => {
+  const { sameOriginGuard } = await import('./lib/guards.ts');
+  const err = await new Promise<unknown>((resolve) =>
+    sameOriginGuard({ method: 'POST', path: '/billing/webhook', headers: { origin: 'https://evil.example' }, protocol: 'http', get: () => 'localhost:4000' } as never, {} as never, (e?: unknown) => resolve(e)),
+  );
+  assert.equal(err, undefined);
+  const post = (headers: Record<string, string>, body: string) => fetch(`${base}/api/billing/webhook`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body });
+  // Billing off: the endpoint doesn't exist.
+  assert.equal((await post({}, '{}')).status, 404);
+  await withBilling(async () => {
+    const evt = JSON.stringify({ id: 'evt_forged', type: 'customer.subscription.updated', created: 1, data: { object: { id: 'sub_x', customer: 'cus_x', status: 'active', metadata: { user_id: 'x' }, items: { data: [] } } } });
+    for (const sig of [undefined, 't=1,v1=00', `t=${Math.floor(Date.now() / 1000)},v1=${'a'.repeat(64)}`]) {
+      const r = await post(sig ? { 'Stripe-Signature': sig, Origin: 'https://evil.example' } : {}, evt);
+      assert.equal(r.status, 400, `signature ${sig}`);
+    }
+    // Signed with the wrong secret.
+    const { default: Stripe } = await import('stripe');
+    const wrong = Stripe.webhooks.generateTestHeaderString({ payload: evt, secret: 'whsec_attacker' });
+    assert.equal((await post({ 'Stripe-Signature': wrong }, evt)).status, 400);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM stripe_events").get()!.n, 0);
+  });
+});
+
+test('public billing data never includes secrets or Stripe price IDs', async () => {
+  await withBilling(async () => {
+    const r = await client()('GET', '/api/billing/plans');
+    assert.equal(r.status, 200);
+    assert.equal(r.json.enabled, true);
+    const text = JSON.stringify(r.json);
+    assert.doesNotMatch(text, /sk_test|whsec|price_secret/);
+    const mine = JSON.stringify((await owner('GET', '/api/billing')).json);
+    assert.doesNotMatch(mine, /sk_test|whsec|price_secret|cus_/);
+  });
+  // The web client never references the secret key.
+  const webSrc = path.resolve(import.meta.dirname, '../../web/src');
+  const files = fs.readdirSync(webSrc, { recursive: true, withFileTypes: true }).filter((f) => f.isFile() && /\.(tsx?|css)$/.test(f.name));
+  for (const f of files) {
+    const body = fs.readFileSync(path.join(f.parentPath, f.name), 'utf8');
+    assert.doesNotMatch(body, /STRIPE_SECRET_KEY|STRIPE_WEBHOOK_SECRET|sk_live_|sk_test_/, f.name);
+  }
+});
+
+test('billing off (self-hosted): publishing and sessions are unlimited', async () => {
+  const { entitlement } = await import('./billing/account.ts');
+  assert.deepEqual(entitlement('anyone'), { canRunSessions: true, blockReason: null });
+  assert.equal((await client()('GET', `/api/p/links/${detail.links[0].token}`)).json.unavailableReason, undefined);
 });

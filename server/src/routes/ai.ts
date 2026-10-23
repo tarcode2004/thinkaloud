@@ -28,7 +28,7 @@ const supportsReasoning = (model: string) => /^(gpt-5|o\d)/i.test(model);
  * Call the model with a JSON schema and validate the result. Retries once,
  * feeding the validation error back, when the output does not validate.
  */
-async function structured<T>(opts: {
+export async function structured<T>(opts: {
   name: string;
   schema: Record<string, unknown>;
   instructions: string;
@@ -72,9 +72,9 @@ async function structured<T>(opts: {
 
 // ── JSON schemas for model output ────────────────────────────────────────────
 
-const str = (description?: string) => ({ type: 'string', ...(description ? { description } : {}) });
-const strArr = (description?: string) => ({ type: 'array', items: { type: 'string' }, ...(description ? { description } : {}) });
-const obj = (properties: Record<string, unknown>, required: string[], description?: string) => ({
+export const str = (description?: string) => ({ type: 'string', ...(description ? { description } : {}) });
+export const strArr = (description?: string) => ({ type: 'array', items: { type: 'string' }, ...(description ? { description } : {}) });
+export const obj = (properties: Record<string, unknown>, required: string[], description?: string) => ({
   type: 'object',
   properties,
   required,

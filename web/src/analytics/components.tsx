@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ChevronDown, Download } from 'lucide-react';
 import type { Interval, TaskOutcome } from '@thinkaloud/shared';
 import { cn } from '../ui/index.tsx';
+import { apiDownload, apiIsCrossOrigin, apiUrl } from '../lib/api.ts';
 import { OUTCOME_META } from './format.ts';
 
 export function Segmented<T extends string | number>({
@@ -135,7 +136,15 @@ export function ExportMenu({ studyId, includePreview }: { studyId: string; inclu
     ['answers', 'Answers', 'Every questionnaire and open answer'],
     ['events', 'Event log', 'Clicks, navigation, transcript, errors'],
   ] as const;
-  const href = (t: string, f: string) => `/api/studies/${studyId}/export?table=${t}&format=${f}${includePreview ? '&includePreview=1' : ''}`;
+  const [excludePii, setExcludePii] = useState(false);
+  const path = (t: string, f: string) => `/api/studies/${studyId}/export?table=${t}&format=${f}${includePreview ? '&includePreview=1' : ''}${excludePii ? '&excludePii=1' : ''}`;
+  const href = (t: string, f: string) => apiUrl(path(t, f));
+  // Cross-origin API: a plain link can't carry the bearer token, so fetch and save the file instead.
+  const onDownload = (t: string, f: string) => (e: React.MouseEvent) => {
+    if (!apiIsCrossOrigin()) return;
+    e.preventDefault();
+    void apiDownload(path(t, f), `${t}.${f}`).catch(() => {});
+  };
   return (
     <Popover
       trigger={(toggle) => (
@@ -145,7 +154,7 @@ export function ExportMenu({ studyId, includePreview }: { studyId: string; inclu
       )}
     >
       {() => (
-        <div className="py-1">
+        <div className="w-[320px] py-1">
           {tables.map(([t, label, desc]) => (
             <div key={t} className="flex items-center justify-between gap-4 rounded-[10px] px-3 py-2 hover:bg-black/[0.04]">
               <div>
@@ -153,15 +162,19 @@ export function ExportMenu({ studyId, includePreview }: { studyId: string; inclu
                 <div className="text-[12px] text-tertiary">{desc}</div>
               </div>
               <div className="flex gap-1 text-[12px] font-medium">
-                <a className="rounded-full px-2 py-0.5 text-brand-500 hover:bg-brand-500/10" href={href(t, 'csv')} download>
+                <a className="rounded-full px-2 py-0.5 text-brand-500 hover:bg-brand-500/10" href={href(t, 'csv')} onClick={onDownload(t, 'csv')} download>
                   CSV
                 </a>
-                <a className="rounded-full px-2 py-0.5 text-brand-500 hover:bg-brand-500/10" href={href(t, 'json')} download>
+                <a className="rounded-full px-2 py-0.5 text-brand-500 hover:bg-brand-500/10" href={href(t, 'json')} onClick={onDownload(t, 'json')} download>
                   JSON
                 </a>
               </div>
             </div>
           ))}
+          <div className="mx-3 mt-1.5 border-t border-separator pb-1 pt-3">
+            <Switch checked={excludePii} onChange={setExcludePii} label={<span className="text-label">Exclude personal information</span>} />
+            <p className="mt-1.5 text-[12px] leading-snug text-tertiary">Leaves out names, emails, typed signatures and other fields marked personal.</p>
+          </div>
         </div>
       )}
     </Popover>

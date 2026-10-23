@@ -10,9 +10,10 @@ import { SessionRunner } from './runner.ts';
 import { SessionView } from './SessionView.tsx';
 import { Calibration, type CalibrationResult } from './Calibration.tsx';
 import type { EyeTracker } from './eyetracking.ts';
+import { ConsentFormScreen, Declined, UnderAge, type ConsentSubmission } from './ConsentForm.tsx';
 import { Consent, DeviceCheck, Done, ErrorScreen, Landing, Loading, Shell, Unavailable, Withdrawn, type ConsentChoice, type DeviceResult } from './screens.tsx';
 
-type Phase = 'loading' | 'landing' | 'unavailable' | 'consent' | 'device' | 'calibrate' | 'session' | 'done' | 'withdrawn' | 'error';
+type Phase = 'loading' | 'landing' | 'unavailable' | 'consent' | 'declined' | 'underage' | 'device' | 'calibrate' | 'session' | 'done' | 'withdrawn' | 'error';
 
 function deviceInfo(): DeviceInfo {
   return {
@@ -37,6 +38,7 @@ export default function ParticipantApp() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [consentErr, setConsentErr] = useState<string | null>(null);
+  const [fieldErrs, setFieldErrs] = useState<Record<string, string> | null>(null);
   const [start, setStart] = useState<StartSessionResponse | null>(null);
   const [consent, setConsent] = useState<ConsentRecord | null>(null);
   const [runner, setRunner] = useState<SessionRunner | null>(null);
@@ -74,29 +76,34 @@ export default function ParticipantApp() {
     return () => window.removeEventListener('beforeunload', h);
   }, [phase]);
 
-  const accept = async (c: ConsentChoice) => {
+  const accept = async (c: ConsentChoice, form?: ConsentSubmission) => {
     if (!info) return;
     setBusy(true);
     setConsentErr(null);
+    setFieldErrs(null);
     audioContext(); // unlock audio on this user gesture
     const rec: ConsentRecord = {
-      version: info.consent.version,
+      version: info.consentForm ? String(info.consentForm.version) : info.consent.version,
       acceptedAt: Date.now(),
       audio: c.voice,
       screen: c.screen && info.consent.recordScreen,
       eyeTracking: c.eyeTracking && info.consent.offerEyeTracking,
       ageConfirmed: c.ageConfirmed,
+      ...(form ? { signature: form.signature } : {}),
     };
     const urlParams: Record<string, string> = {};
     params.forEach((v, k) => {
       if (k !== 'preview' && k !== 'variant') urlParams[k] = v;
     });
     try {
-      const res = await pApi.start(token, { urlParams, device: deviceInfo(), consent: rec, ...(preview ? { preview: true, variantId } : {}) });
+      const res = await pApi.start(token, { urlParams, device: deviceInfo(), consent: rec, ...(form ? { participantInfo: form.info } : {}), ...(preview ? { preview: true, variantId } : {}) });
       setStart(res);
       setConsent(rec);
       setPhase('device');
     } catch (e) {
+      const details = e instanceof ApiError ? (e.details as { fields?: Record<string, string>; reason?: string } | undefined) : undefined;
+      if (details?.reason === 'under_age') return setPhase('underage');
+      if (details?.fields) setFieldErrs(details.fields);
       setConsentErr(e instanceof ApiError ? e.message : 'Could not start the session. Please try again.');
     } finally {
       setBusy(false);
@@ -162,7 +169,24 @@ export default function ParticipantApp() {
       case 'landing':
         return <Landing info={info!} onStart={() => setPhase('consent')} />;
       case 'consent':
-        return <Consent info={info!} onAccept={accept} busy={busy} error={consentErr} />;
+        return info!.consentForm ? (
+          <ConsentFormScreen
+            info={info!}
+            form={info!.consentForm}
+            busy={busy}
+            error={consentErr}
+            serverErrors={fieldErrs}
+            onAccept={(s) => void accept(s.choice, s)}
+            onDecline={() => setPhase('declined')}
+            onUnderAge={() => setPhase('underage')}
+          />
+        ) : (
+          <Consent info={info!} onAccept={accept} busy={busy} error={consentErr} />
+        );
+      case 'declined':
+        return <Declined />;
+      case 'underage':
+        return <UnderAge minAge={info?.consentForm?.minAge ?? 18} />;
       case 'device':
         return <DeviceCheck wantVoice={Boolean(consent?.audio)} allowTextFallback={start?.protocol.moderation.allowTextFallback ?? true} onDone={afterDevice} />;
       case 'calibrate':

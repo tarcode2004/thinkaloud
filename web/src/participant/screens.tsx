@@ -60,6 +60,7 @@ const REASONS: Record<string, string> = {
   expired: 'This link has expired.',
   draft: 'This study hasn’t started yet.',
   inactive: 'This link is no longer active.',
+  unavailable: 'This study isn’t accepting participants right now.',
 };
 
 export function Unavailable({ info }: { info: PublicLinkInfo | null }) {
@@ -114,7 +115,7 @@ export function Consent({ info, onAccept, busy, error }: { info: PublicLinkInfo;
   );
 }
 
-function SwitchRow({ checked, onChange, label, detail, testId }: { checked: boolean; onChange: (v: boolean) => void; label: string; detail?: string; testId?: string }) {
+export function SwitchRow({ checked, onChange, label, detail, testId }: { checked: boolean; onChange: (v: boolean) => void; label: string; detail?: string; testId?: string }) {
   return (
     <label className="flex cursor-pointer items-center gap-4 border-b border-separator px-5 py-3.5 last:border-0">
       <span className="min-w-0 flex-1">

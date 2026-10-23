@@ -8,6 +8,7 @@ import { HttpError, parse } from '../lib/http.ts';
 import { assertChildAccess, assertStudyAccess, requireUser } from '../lib/auth.ts';
 import { paths } from '../lib/paths.ts';
 import { normalizeProtocol } from '../lib/protocolSchema.ts';
+import { entitlement } from '../billing/account.ts';
 import {
   appFromRow,
   linkFromRow,
@@ -166,6 +167,9 @@ studiesRouter.patch('/studies/:id', (req, res) => {
   const row = assertStudyAccess(req, sid(req));
   const body = parse(PatchStudy, req.body);
   if (body.status === 'live' && row.status !== 'live') {
+    // SaaS billing: building and previewing are free; publishing needs an active plan or trial.
+    const ent = entitlement(req.user!.id);
+    if (!ent.canRunSessions) throw new HttpError(402, 'Choose a plan to publish this study', { billing: true, reason: ent.blockReason });
     const problems = goLiveProblems(String(row.id));
     if (problems.length) throw new HttpError(400, 'Study is not ready to go live', problems);
   }
@@ -181,6 +185,11 @@ studiesRouter.delete('/studies/:id', (req, res) => {
   const appIds = (db.prepare('SELECT id FROM apps WHERE study_id = ?').all(row.id as string) as { id: string }[]).map((r) => r.id);
   db.prepare('DELETE FROM studies WHERE id = ?').run(row.id as string);
   removeSessionFiles(sessionIds);
+  try {
+    fs.rmSync(paths.consentDir(row.id as string), { recursive: true, force: true }); // uploaded consent originals
+  } catch {
+    /* nothing stored */
+  }
   for (const a of appIds) fs.rmSync(paths.app(a), { recursive: true, force: true });
   res.json({ ok: true });
 });

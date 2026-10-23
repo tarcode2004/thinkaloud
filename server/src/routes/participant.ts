@@ -21,6 +21,9 @@ import { assertParticipant } from '../lib/auth.ts';
 import { config } from '../lib/config.ts';
 import { paths } from '../lib/paths.ts';
 import { parseProtocol, sessionFromRow, sessionProtocolFromRow, variantFromRow, type Row } from '../lib/repo.ts';
+import { checkConsentSubmission, loadConsentForm, publicConsentForm, sendConsentDocument } from './consent.ts';
+import { entitlement } from '../billing/account.ts';
+import { markVoiceStarted, recordSessionUsage, touchVoice } from '../billing/usage.ts';
 
 export const participantRouter = Router();
 
@@ -97,6 +100,8 @@ function unavailableReason(link: Row, study: Row): Unavailable | null {
     const v = db.prepare('SELECT active FROM variants WHERE id = ?').get(link.variant_id as string) as { active: number } | undefined;
     if (!v?.active) return 'inactive';
   } else if (!activeVariants(study.id as string).length) return 'inactive';
+  // SaaS billing: the owner's plan doesn't allow sessions. Deliberately vague to participants.
+  if (!entitlement(String(study.owner_id)).canRunSessions) return 'unavailable';
   return null;
 }
 
@@ -107,6 +112,7 @@ const UNAVAILABLE_MESSAGES: Record<Unavailable, string> = {
   expired: 'This study link has expired.',
   draft: 'This study has not started yet.',
   inactive: 'This study link is no longer active.',
+  unavailable: 'This study isn’t accepting participants right now.',
 };
 
 const isOwner = (req: Request, study: Row) => Boolean(req.user && req.user.id === study.owner_id);
@@ -135,11 +141,20 @@ participantRouter.get('/links/:token', (req, res) => {
     estimatedMinutes: protocol?.estimatedMinutes ?? 15,
     consent: protocol?.consent ?? parseProtocol(null).consent,
     language: protocol?.moderation.language ?? 'en',
+    consentForm: publicConsentForm(study.id as string, link.token as string),
     available: !reason && Boolean(protocol),
   };
   if (reason) info.unavailableReason = reason;
   else if (!protocol) info.unavailableReason = 'inactive';
   res.json(info);
+});
+
+// The original consent document (PDF / DOCX / …) the researcher uploaded, for participants to download.
+participantRouter.get('/links/:token/consent-document', (req, res) => {
+  const { study } = getLink(String(req.params.token));
+  const form = loadConsentForm(study.id as string);
+  if (!form.enabled) throw new HttpError(404, 'No consent document');
+  sendConsentDocument(res, study.id as string, form);
 });
 
 // ── POST /links/:token/sessions ──────────────────────────────────────────────
@@ -167,7 +182,14 @@ const StartSession = z.object({
     screen: z.boolean(),
     eyeTracking: z.boolean(),
     ageConfirmed: z.boolean(),
+    // Study consent form: the server fills version/hash/fields itself; only the signature is taken from the client.
+    signature: z.object({ mode: z.enum(['checkbox', 'typed_name']), name: shortStr(200).optional(), date: shortStr(20).optional(), agreed: z.literal(true) }).optional(),
   }),
+  /** Participant info for the consent form's fields (validated against the form in checkConsentSubmission). */
+  participantInfo: z
+    .record(shortStr(64), z.union([z.string().max(5000), z.number(), z.boolean(), z.array(shortStr(200)).max(100)]))
+    .optional()
+    .refine((r) => !r || Object.keys(r).length <= 60, 'Too many fields'),
   preview: z.boolean().optional(),
   variantId: shortStr(100).optional(),
 });
@@ -206,6 +228,9 @@ participantRouter.post('/links/:token/sessions', (req, res) => {
     const pr = db.prepare('SELECT protocol FROM protocols WHERE id = ?').get(variant.protocol_id as string) as Row | undefined;
     if (!pr) throw new HttpError(409, 'This study has no protocol');
     const protocol = parseProtocol(pr.protocol);
+    // Consent form: validate participant info (age gate included) before anything is stored.
+    const form = checkConsentSubmission(studyId, body.consent, body.participantInfo, { ageGate: protocol.consent.ageGate });
+    const consentRecord = { ...body.consent, ...form.record, acceptedAt: body.consent.acceptedAt || Date.now() };
     const steps = resolveStepOrder(protocol.steps, protocol.randomizeTasks);
 
     const app = variant.app_id ? (db.prepare('SELECT * FROM apps WHERE id = ?').get(variant.app_id as string) as Row | undefined) : undefined;
@@ -219,13 +244,13 @@ participantRouter.post('/links/:token/sessions', (req, res) => {
     const secret = crypto.randomBytes(24).toString('base64url');
     db.prepare(
       `INSERT INTO sessions (id, study_id, variant_id, link_id, secret, participant_code, status, consent, device, url_params,
-         step_order, steps, protocol_snapshot, preview, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'consented', ?, ?, ?, ?, ?, ?, ?, ?)`,
+         step_order, steps, protocol_snapshot, preview, created_at, participant_info)
+       VALUES (?, ?, ?, ?, ?, ?, 'consented', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id, studyId, variant.id as string, link.id as string, secret, code,
-      json.str({ ...body.consent, acceptedAt: body.consent.acceptedAt || Date.now() }),
+      json.str(consentRecord),
       json.str(body.device), json.str(body.urlParams), json.str(steps.map((s) => s.id)), json.str(steps), json.str(protocol),
-      preview ? 1 : 0, Date.now(),
+      preview ? 1 : 0, Date.now(), form.info ? json.str(form.info) : null,
     );
     const response: StartSessionResponse = {
       session: sessionFromRow(db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as Row),
@@ -364,6 +389,7 @@ participantRouter.post('/sessions/:sid/events', (req, res) => {
   const row = sessionFor(req, { allowEnded: true });
   const body = parse(EventsBody, req.body);
   const { accepted, rejected } = ingestEvents(row.id as string, body.events);
+  touchVoice(row.id as string);
   res.json({ ok: true, accepted, rejected });
 });
 
@@ -435,6 +461,12 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
   const selfHosted = !config.realtimeBaseUrl.startsWith('https://api.openai.com');
   if (!config.realtimeKey && !selfHosted) throw new HttpError(503, 'Voice moderation is not configured on this server (missing OPENAI_API_KEY)');
   const sessionId = row.id as string;
+  // Billing: a real session may only start voice while the owner's plan allows it. Reconnects of a
+  // session whose voice already started are never cut off.
+  if (!row.preview && row.voice_started_at == null) {
+    const owner = db.prepare('SELECT owner_id FROM studies WHERE id = ?').get(row.study_id as string) as Row | undefined;
+    if (owner && !entitlement(String(owner.owner_id)).canRunSessions) throw new HttpError(409, UNAVAILABLE_MESSAGES.unavailable, { reason: 'unavailable' });
+  }
   const used = tokenCounts.get(sessionId) ?? 0;
   if (used >= MAX_TOKENS_PER_SESSION) throw new HttpError(429, 'Too many voice connections for this session');
   tokenCounts.set(sessionId, used + 1);
@@ -496,6 +528,7 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
     transcription,
     callsUrl: `${config.realtimePublicUrl}/realtime/calls`,
   };
+  markVoiceStarted(sessionId);
   res.json(out);
 });
 
@@ -509,6 +542,7 @@ participantRouter.post('/sessions/:sid/complete', (req, res) => {
     db.prepare("UPDATE sessions SET status = 'completed' WHERE id = ?").run(row.id as string);
   }
   tokenCounts.delete(row.id as string);
+  recordSessionUsage(row.id as string); // billing: once per session (idempotent)
   const link = row.link_id ? (db.prepare('SELECT redirect_url FROM links WHERE id = ?').get(row.link_id as string) as Row | undefined) : undefined;
   res.json({ ok: true, redirectUrl: row.preview ? null : ((link?.redirect_url as string | null) ?? null) });
 });
@@ -517,9 +551,13 @@ participantRouter.post('/sessions/:sid/complete', (req, res) => {
 export function withdrawSession(sessionId: string) {
   tx(() => {
     for (const t of ['events', 'answers', 'task_results', 'notes']) db.prepare(`DELETE FROM ${t} WHERE session_id = ?`).run(sessionId);
-    db.prepare("UPDATE sessions SET status = 'withdrawn', ended_at = COALESCE(ended_at, ?), device = NULL, gaze_error_px = NULL WHERE id = ?").run(
-      Date.now(), sessionId,
-    );
+    // Participant info and a typed signature name are personal data too: delete them with everything else.
+    const row = db.prepare('SELECT consent FROM sessions WHERE id = ?').get(sessionId) as Row | undefined;
+    const consent = json.parse<Record<string, unknown> | null>(row?.consent, null);
+    if (consent?.signature && typeof consent.signature === 'object') delete (consent.signature as Record<string, unknown>).name;
+    db.prepare(
+      "UPDATE sessions SET status = 'withdrawn', ended_at = COALESCE(ended_at, ?), device = NULL, gaze_error_px = NULL, participant_info = NULL, consent = ? WHERE id = ?",
+    ).run(Date.now(), consent ? json.str(consent) : null, sessionId);
   });
   fs.rmSync(paths.session(sessionId), { recursive: true, force: true });
   tokenCounts.delete(sessionId);
@@ -528,6 +566,7 @@ export function withdrawSession(sessionId: string) {
 participantRouter.post('/sessions/:sid/withdraw', (req, res) => {
   const row = assertParticipant(req, String(req.params.sid));
   withdrawSession(row.id as string);
+  recordSessionUsage(row.id as string); // voice already used is billed; the usage row holds no participant data
   const link = row.link_id ? (db.prepare('SELECT redirect_url FROM links WHERE id = ?').get(row.link_id as string) as Row | undefined) : undefined;
   res.json({ ok: true, redirectUrl: row.preview ? null : ((link?.redirect_url as string | null) ?? null) });
 });

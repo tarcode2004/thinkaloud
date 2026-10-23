@@ -5,6 +5,8 @@ import { db } from '../db.ts';
 import { eventFromRow, type Row } from '../lib/repo.ts';
 import { loadAnswers, loadSessions, loadTaskResults, loadVariants } from './data.ts';
 import { scoreSession, sessionDurationMs } from './metrics.ts';
+import { loadConsentForm } from '../routes/consent.ts';
+import type { ParticipantFieldSnapshot, ParticipantValue } from '@thinkaloud/shared';
 
 export type ExportTable = 'sessions' | 'tasks' | 'answers' | 'events';
 
@@ -41,7 +43,27 @@ function stepTitles(steps: Step[]) {
   return { titles, prompts };
 }
 
-export function exportRows(studyId: string, table: ExportTable, opts: { includePreview?: boolean; includePoints?: boolean } = {}) {
+const slug = (s: string) => s.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'field';
+
+/** Participant-info columns: the current form's fields plus fields only present in older consent records. */
+export function participantColumns(studyId: string, snapshots: (ParticipantFieldSnapshot[] | undefined)[]) {
+  const cols = new Map<string, ParticipantFieldSnapshot & { column: string }>();
+  const used = new Set<string>();
+  const add = (f: ParticipantFieldSnapshot) => {
+    if (cols.has(f.id)) return;
+    let column = `info.${f.id.startsWith('cf_') ? slug(f.label) : f.id}`;
+    while (used.has(column)) column += '_2';
+    used.add(column);
+    cols.set(f.id, { ...f, column });
+  };
+  for (const f of loadConsentForm(studyId).fields) if (f.enabled) add(f);
+  for (const snap of snapshots) for (const f of snap ?? []) add(f);
+  return [...cols.values()];
+}
+
+const cellOf = (v: ParticipantValue | undefined): Cell => (v === undefined ? null : Array.isArray(v) ? v.join('; ') : v);
+
+export function exportRows(studyId: string, table: ExportTable, opts: { includePreview?: boolean; includePoints?: boolean; excludePii?: boolean } = {}) {
   const sessions = loadSessions(studyId, { includePreview: opts.includePreview });
   const variants = new Map(loadVariants(studyId).map((v) => [v.id, v.name]));
   const results = loadTaskResults(studyId);
@@ -49,6 +71,7 @@ export function exportRows(studyId: string, table: ExportTable, opts: { includeP
   const rows: Record<string, Cell>[] = [];
 
   if (table === 'sessions') {
+    const infoCols = participantColumns(studyId, sessions.map((s) => s.session.consent?.fields)).filter((c) => !(opts.excludePii && c.pii));
     for (const s of sessions) {
       const tr = results.get(s.session.id) ?? [];
       const sc = scoreSession(answers.get(s.session.id) ?? []);
@@ -75,6 +98,12 @@ export function exportRows(studyId: string, table: ExportTable, opts: { includeP
         consentAudio: s.session.consent?.audio ?? null,
         consentScreen: s.session.consent?.screen ?? null,
         consentEyeTracking: s.session.consent?.eyeTracking ?? null,
+        consentFormVersion: s.session.consent?.formVersion ?? null,
+        consentFormHash: s.session.consent?.formHash ?? null,
+        consentSignature: s.session.consent?.signature?.mode ?? null,
+        ...(opts.excludePii ? {} : { consentSignedName: s.session.consent?.signature?.name ?? null }),
+        consentSignedDate: s.session.consent?.signature?.date ?? null,
+        ...Object.fromEntries(infoCols.map((c) => [c.column, cellOf(s.session.participantInfo?.[c.id])])),
         gazeErrorPx: s.session.gazeErrorPx ?? null,
         viewport: s.session.device ? `${s.session.device.viewportW}x${s.session.device.viewportH}` : null,
         userAgent: s.session.device?.userAgent ?? null,

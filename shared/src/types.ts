@@ -302,6 +302,13 @@ export interface ConsentRecord {
   screen: boolean;
   eyeTracking: boolean;
   ageConfirmed: boolean;
+  /** Study consent form (see "Consent" below): the version and content hash the participant agreed to. */
+  formVersion?: number;
+  formHash?: string;
+  /** How the participant signed (typed name or "I agree"). */
+  signature?: ConsentSignature;
+  /** Snapshot of the participant-info fields shown, so labels survive later edits. */
+  fields?: ParticipantFieldSnapshot[];
 }
 
 export interface DeviceInfo {
@@ -336,6 +343,8 @@ export interface Session {
   gazeErrorPx?: number | null;
   /** Researcher preview session (excluded from analytics by default). */
   preview?: boolean;
+  /** Participant info collected at consent (field id → value). Deleted on withdrawal. */
+  participantInfo?: ParticipantInfo | null;
 }
 
 export type TaskOutcome = 'success' | 'partial' | 'failure' | 'abandoned' | 'timeout';
@@ -580,14 +589,19 @@ export interface PublicLinkInfo {
   estimatedMinutes: number;
   consent: ConsentSettings;
   language: string;
+  /** The study's consent form, when the researcher has turned it on (replaces `consent.text`). */
+  consentForm?: PublicConsentForm | null;
   available: boolean;
-  unavailableReason?: 'closed' | 'paused' | 'full' | 'expired' | 'draft' | 'inactive';
+  /** 'unavailable' is deliberately vague (e.g. the owner's plan lapsed): participants never see billing details. */
+  unavailableReason?: 'closed' | 'paused' | 'full' | 'expired' | 'draft' | 'inactive' | 'unavailable';
 }
 
 export interface StartSessionRequest {
   urlParams: Record<string, string>;
   device: DeviceInfo;
   consent: ConsentRecord;
+  /** Values for the consent form's participant-info fields (validated server-side). */
+  participantInfo?: ParticipantInfo;
   /** Preview mode for researchers — sessions flagged and excluded from analytics by default. */
   preview?: boolean;
   /** Force a variant (honoured only when the caller is the signed-in study owner, for previews). */
@@ -618,4 +632,259 @@ export interface RealtimeTokenResponse {
   transcription?: { model: string; language: string; prompt?: string };
   /** Where the browser posts its SDP offer (OpenAI or a self-hosted OpenRealtime server). */
   callsUrl?: string;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Billing (SaaS mode only: enabled when the server has STRIPE_SECRET_KEY)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** Mirrors Stripe subscription statuses we act on ('none' = never subscribed). */
+export type BillingStatus = 'none' | 'trialing' | 'active' | 'past_due' | 'canceled' | 'incomplete' | 'unpaid' | 'paused';
+
+/** A plan as shown publicly (pricing page). Amounts are in the smallest currency unit (cents). */
+export interface BillingPlan {
+  id: string;
+  name: string;
+  description: string;
+  currency: string;
+  monthlyPriceCents: number;
+  /** Voice minutes included every billing period. */
+  includedMinutes: number;
+  /** Price per extra voice minute, in cents (may be fractional, e.g. 12.5). */
+  overageCentsPerMinute: number;
+  /** Free trial length in days (0 = no trial). */
+  trialDays: number;
+  /** Voice minutes available during the trial (null = only limited by days). */
+  trialMinutes: number | null;
+  features: string[];
+}
+
+export interface BillingPlansResponse {
+  enabled: boolean;
+  plans: BillingPlan[];
+}
+
+/** Why a researcher can't run real participant sessions right now (null = they can). */
+export type BillingBlockReason = 'no_subscription' | 'canceled' | 'incomplete' | 'payment_failed' | 'trial_minutes_used' | 'spend_cap' | null;
+
+export interface BillingUsage {
+  periodStart: number;
+  periodEnd: number | null;
+  minutesUsed: number;
+  includedMinutes: number;
+  overageMinutes: number;
+  estimatedOverageCents: number;
+  /** Plan price + overage for this period (0 during a trial). */
+  estimatedTotalCents: number;
+  /** During a trial: minutes used against the trial allowance. */
+  trialMinutesUsed: number | null;
+  trialMinutes: number | null;
+  /** Ended sessions counted this period. */
+  sessionCount: number;
+}
+
+export interface BillingOverview {
+  enabled: boolean;
+  plan: BillingPlan | null;
+  status: BillingStatus;
+  hasCustomer: boolean;
+  currentPeriodEnd: number | null;
+  trialEnd: number | null;
+  cancelAtPeriodEnd: boolean;
+  /** When status is past_due: sessions keep working until this time. */
+  graceEndsAt: number | null;
+  spendCapCents: number | null;
+  /** Whether a new checkout would include the free trial. */
+  trialAvailable: boolean;
+  usage: BillingUsage | null;
+  canRunSessions: boolean;
+  blockReason: BillingBlockReason;
+}
+
+// ── Consent ──────────────────────────────────────────────────────────────────
+// A study-level consent form (studies.consent_form): the participant-facing document,
+// participant-info fields collected at consent, signature mode and the last check result.
+// Capture opt-ins (audio, screen, eye tracking, 18+) stay in each protocol's ConsentSettings.
+
+export type ParticipantFieldKind = 'short_text' | 'long_text' | 'number' | 'single_select' | 'multi_select' | 'date' | 'yes_no' | 'likert';
+export type BuiltinFieldId = 'full_name' | 'age' | 'sex' | 'gender' | 'email' | 'country' | 'occupation';
+
+export interface ParticipantField {
+  /** Built-in id, or "cf_…" for custom fields. Used as the key in ParticipantInfo. */
+  id: string;
+  builtin?: BuiltinFieldId;
+  kind: ParticipantFieldKind;
+  label: string;
+  help?: string;
+  required: boolean;
+  /** Personally identifying: dropped from "exclude PII" exports. */
+  pii: boolean;
+  /** Built-ins can be switched off; custom fields are always on. */
+  enabled: boolean;
+  /** single_select / multi_select options. */
+  options?: string[];
+  /** Offer a free-text "self-describe" choice (stored as the typed text). */
+  allowOther?: boolean;
+  otherLabel?: string;
+  /** number: inclusive bounds. */
+  min?: number;
+  max?: number;
+  /** likert: number of points and end labels. */
+  likert?: { points: 5 | 7; minLabel: string; maxLabel: string };
+  /** Built-in age only: ask for age in years or for the date of birth. */
+  ageFormat?: 'years' | 'date_of_birth';
+}
+
+export type ParticipantFieldSnapshot = Pick<ParticipantField, 'id' | 'label' | 'kind' | 'pii'>;
+export type ParticipantValue = string | number | boolean | string[];
+export type ParticipantInfo = Record<string, ParticipantValue>;
+
+export type SignatureMode = 'checkbox' | 'typed_name';
+export interface ConsentSignature {
+  mode: SignatureMode;
+  /** Typed full name (typed_name mode). PII: removed on withdrawal and from "exclude PII" exports. */
+  name?: string;
+  /** YYYY-MM-DD as shown to the participant. */
+  date?: string;
+  agreed: true;
+}
+
+export interface ConsentDocument {
+  id: ID;
+  studyId: ID;
+  filename: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  createdAt: Millis;
+}
+
+/** Required elements of informed consent checked by the consent lint. */
+export type ConsentElementId =
+  | 'purpose' | 'procedures' | 'recording' | 'duration' | 'risks' | 'benefits' | 'compensation' | 'confidentiality'
+  | 'storage' | 'access' | 'voluntary' | 'withdrawal' | 'ai_disclosure' | 'contact' | 'ethics_contact' | 'age';
+
+export type ConsentSeverity = 'high' | 'medium' | 'low';
+export interface ConsentIssue {
+  /** Stable key, e.g. "missing:risks", "capture:eye_tracking", "long_sentence:3". */
+  key: string;
+  source: 'lint' | 'ai';
+  category: 'missing' | 'consistency' | 'readability' | 'language' | 'other';
+  element?: ConsentElementId;
+  severity: ConsentSeverity;
+  message: string;
+  explanation?: string;
+  /** Offending text, verbatim from the document. */
+  quote?: string;
+  /** Suggested rewrite (or text to add). */
+  suggestion?: string;
+}
+
+export interface ConsentReadability {
+  /** Flesch-Kincaid grade level (aim for 8 or lower). */
+  grade: number;
+  /** Flesch reading ease 0-100 (higher = easier). */
+  ease: number;
+  words: number;
+  sentences: number;
+  avgSentenceWords: number;
+  /** Estimated reading time in minutes (~200 wpm). */
+  minutes: number;
+}
+
+export interface ConsentElementStatus {
+  id: ConsentElementId;
+  label: string;
+  status: 'ok' | 'missing' | 'inconsistent';
+}
+
+/** What the study actually collects (union across its protocols and the form's fields). */
+export interface ConsentCapture {
+  voice: boolean;
+  storeAudio: boolean;
+  screen: boolean;
+  eyeTracking: boolean;
+  ageGate: boolean;
+  minAge: number;
+  fields: ParticipantFieldSnapshot[];
+}
+
+export interface ConsentCheckResult {
+  checkedAt: Millis;
+  version: number;
+  hash: string;
+  readability: ConsentReadability;
+  elements: ConsentElementStatus[];
+  issues: ConsentIssue[];
+  /** ok = AI review ran; skipped = no API key; failed = the AI call failed (lint is still complete). */
+  ai: 'ok' | 'skipped' | 'failed';
+  aiError?: string;
+}
+
+export interface ConsentVersion {
+  version: number;
+  hash: string;
+  savedAt: Millis;
+  text: string;
+}
+
+export interface ConsentForm {
+  /** Use this form instead of the protocol consent text. */
+  enabled: boolean;
+  title: string;
+  /** Participant-facing document, Markdown. */
+  text: string;
+  /** Uploaded original (downloadable by participants). */
+  documentId: ID | null;
+  /** Bumped every time the participant-facing content (hash) changes. */
+  version: number;
+  /** sha256 of the participant-facing content (title, text, fields, signature, age). */
+  hash: string;
+  updatedAt: Millis;
+  fields: ParticipantField[];
+  signature: { mode: SignatureMode; agreeLabel: string };
+  /** Minimum age; enforced from the age field when collected, else by an "I am N or older" confirmation. */
+  minAge: number;
+  /** Participants must scroll to the end of the document before agreeing. */
+  requireScroll: boolean;
+  lastCheck?: ConsentCheckResult | null;
+  /** Previous versions (newest first, capped), for audit. */
+  history?: ConsentVersion[];
+}
+
+/** What participants receive (no check results or history). */
+export interface PublicConsentForm {
+  title: string;
+  text: string;
+  version: number;
+  hash: string;
+  fields: ParticipantField[];
+  signature: ConsentForm['signature'];
+  minAge: number;
+  requireScroll: boolean;
+  document: { filename: string; size: number; url: string } | null;
+}
+
+/** GET /api/studies/:id/consent */
+export interface ConsentFormResponse {
+  form: ConsentForm;
+  document: ConsentDocument | null;
+  capture: ConsentCapture;
+}
+
+export interface DemographicsBreakdown {
+  fieldId: string;
+  label: string;
+  kind: ParticipantFieldKind;
+  n: number;
+  /** Category counts (selects, yes/no, Likert, age bins). */
+  counts: { label: string; n: number }[];
+  /** Numeric summary (number fields, age). */
+  stats?: { mean: number; median: number; min: number; max: number; sd: number } | null;
+}
+
+export interface DemographicsResponse {
+  sessions: number;
+  withInfo: number;
+  breakdowns: DemographicsBreakdown[];
 }

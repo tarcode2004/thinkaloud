@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { RotateCcw } from 'lucide-react';
+import { Link } from 'react-router';
 import { DEFAULT_CLOSING, DEFAULT_CONSENT, DEFAULT_INTRO, REALTIME_VOICES, type ModerationStyle, type ProbingLevel, type Protocol } from '@thinkaloud/shared';
 import { Field, Input, Select, Textarea, cn } from '../../ui/index.tsx';
 import { FormSection, Group, Markdown, NumberInput, Row, Segmented, StringListEditor, Switch, FieldGroup } from '../components/index.tsx';
@@ -165,7 +166,12 @@ export function ConsentSettingsEditor({ p, onChange }: P) {
     <div className="space-y-5">
       <FormSection
         title="Consent text"
-        description="Shown before anything is captured. Markdown supported. Cover purpose, procedure, duration, data collected, retention, voluntary participation and withdrawal."
+        description={
+          <>
+            Used when the study’s consent form is off. For an uploaded document, participant questions and consent checks, use{' '}
+            <Link to="../../consent" relative="path" className="text-brand-500 hover:underline">Consent</Link>.
+          </>
+        }
         actions={
           <div className="flex items-center gap-2">
             <button type="button" onClick={() => set({ text: DEFAULT_CONSENT.text })} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs text-secondary hover:bg-black/[0.05]"><RotateCcw className="size-3" /> Default</button>

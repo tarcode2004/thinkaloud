@@ -4,3 +4,4 @@ export * from './defaults.ts';
 export * from './moderator.ts';
 export * from './turns.ts';
 export * from './answers.ts';
+export * from './consent.ts';

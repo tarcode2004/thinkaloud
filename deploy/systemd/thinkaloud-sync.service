@@ -1,0 +1,19 @@
+[Unit]
+Description=ThinkAloud tunnel → server env + Firebase /config.json sync
+Documentation=file://@REPO@/docs/DEPLOY.md
+After=thinkaloud-tunnel-api.service thinkaloud-tunnel-apps.service thinkaloud.service
+Wants=thinkaloud-tunnel-api.service thinkaloud-tunnel-apps.service
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+Environment=PATH=@NODE_DIR@:@GCLOUD_DIR@:/usr/local/bin:/usr/bin:/bin
+# Optional overrides (WEB_URL, API_URL/APPS_URL for a named tunnel, EXTRA_CORS_ORIGINS, ...).
+EnvironmentFile=-@REPO@/data/deploy/deploy.env
+ExecStart=@NODE@ @REPO@/scripts/deploy/tunnel-sync.mjs
+Restart=always
+RestartSec=5
+SyslogIdentifier=thinkaloud-sync
+
+[Install]
+WantedBy=default.target

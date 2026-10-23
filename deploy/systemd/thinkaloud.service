@@ -1,0 +1,23 @@
+[Unit]
+Description=ThinkAloud production server (API :4000, app host :4001)
+Documentation=file://@REPO@/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+Environment=NODE_ENV=production
+Environment=DATA_DIR=./data
+Environment=PATH=@NODE_DIR@:/usr/local/bin:/usr/bin:/bin
+# Tunnel URLs, written by thinkaloud-sync.service. Values here override .env (secrets stay in .env).
+EnvironmentFile=-@REPO@/data/deploy/runtime.env
+ExecStart=@NODE@ @REPO@/node_modules/tsx/dist/cli.mjs --env-file-if-exists=.env server/src/index.ts
+Restart=always
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=15
+SyslogIdentifier=thinkaloud
+
+[Install]
+WantedBy=default.target

@@ -4,13 +4,17 @@ import { BrowserRouter } from 'react-router';
 import './index.css';
 import { App } from './App.tsx';
 import { ToastProvider } from './ui/toast.tsx';
+import { loadRuntimeConfig } from './lib/api.ts';
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <BrowserRouter>
-      <ToastProvider>
-        <App />
-      </ToastProvider>
-    </BrowserRouter>
-  </StrictMode>,
+// Runtime config (/config.json) tells a statically hosted build where the API is; no-op self-hosted.
+void loadRuntimeConfig().then(() =>
+  createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+      <BrowserRouter>
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      </BrowserRouter>
+    </StrictMode>,
+  ),
 );

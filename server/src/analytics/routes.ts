@@ -12,7 +12,7 @@ import { computeAnalytics, scoreSession, sessionDurationMs } from './metrics.ts'
 import { audioTracks, deleteSessionFiles, hasReplay, readPoints, readReplay, sendAudio } from './media.ts';
 import { computeHeatmap, type HeatKind } from './heatmap.ts';
 import { latestSynthesis, runSynthesis } from './synthesis.ts';
-import { exportRows, toCsv, type ExportTable } from './export.ts';
+import { exportRows, participantColumns, toCsv, type ExportTable } from './export.ts';
 
 export const analyticsRouter = Router();
 
@@ -75,7 +75,7 @@ analyticsRouter.get('/studies/:id/sessions', requireUser, (req, res) => {
       };
     })
     .sort((a, b) => (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt));
-  res.json({ sessions: list });
+  res.json({ sessions: list, participantFields: participantColumns(studyId, sessions.map((s) => s.session.consent?.fields)) });
 });
 
 analyticsRouter.get('/studies/:id/heatmap', requireUser, (req, res) => {
@@ -109,8 +109,9 @@ analyticsRouter.get('/studies/:id/export', requireUser, (req, res) => {
   const table = String(req.query.table ?? 'sessions') as ExportTable;
   if (!['sessions', 'tasks', 'answers', 'events'].includes(table)) throw new HttpError(400, 'table must be sessions|tasks|answers|events');
   const format = req.query.format === 'json' ? 'json' : 'csv';
-  const rows = exportRows(studyId, table, { includePreview: flag(req.query.includePreview), includePoints: flag(req.query.includePoints) });
-  const base = `${String(study.name ?? 'study').replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'study'}-${table}`;
+  const rows = exportRows(studyId, table, { includePreview: flag(req.query.includePreview), includePoints: flag(req.query.includePoints), excludePii: flag(req.query.excludePii) });
+  const piiSuffix = flag(req.query.excludePii) ? '-no-pii' : '';
+  const base = `${String(study.name ?? 'study').replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'study'}-${table}${piiSuffix}`;
   if (format === 'json') {
     res.setHeader('Content-Disposition', `attachment; filename="${base}.json"`);
     res.type('application/json').send(JSON.stringify(rows, null, 2));
@@ -155,6 +156,7 @@ analyticsRouter.get('/sessions/:sid', requireUser, (req, res) => {
     hasReplay: hasReplay(sid(req)),
     audioTracks: audioTracks(sid(req)),
     pointBatches: { mouse: pointCounts.mouse ?? 0, gaze: pointCounts.gaze ?? 0 },
+    participantFields: participantColumns(String(row.study_id), [s.session.consent?.fields]),
     prevSessionId: i > 0 ? ordered[i - 1] : null,
     nextSessionId: i >= 0 && i < ordered.length - 1 ? ordered[i + 1] : null,
   });

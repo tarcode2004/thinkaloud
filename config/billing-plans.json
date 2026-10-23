@@ -1,0 +1,29 @@
+{
+  "_comment": "PLACEHOLDER PRICES. The owner must set real values before launch. Amounts are in cents. Stripe price IDs come from env (STRIPE_PRICE_<PLAN>_BASE / STRIPE_PRICE_<PLAN>_METERED) or from stripeBasePriceId / stripeMeteredPriceId here. See docs/BILLING.md.",
+  "placeholder": true,
+  "currency": "usd",
+  "plans": [
+    {
+      "id": "starter",
+      "name": "Starter",
+      "description": "For a researcher running a few studies a month.",
+      "monthlyPriceCents": 4900,
+      "includedMinutes": 300,
+      "overageCentsPerMinute": 25,
+      "trialDays": 14,
+      "trialMinutes": 30,
+      "features": ["Unlimited studies and previews", "A/B variants and exports"]
+    },
+    {
+      "id": "team",
+      "name": "Team",
+      "description": "For teams that test every release.",
+      "monthlyPriceCents": 19900,
+      "includedMinutes": 1500,
+      "overageCentsPerMinute": 18,
+      "trialDays": 14,
+      "trialMinutes": 30,
+      "features": ["Unlimited studies and previews", "A/B variants and exports"]
+    }
+  ]
+}

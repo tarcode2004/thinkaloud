@@ -1,0 +1,12 @@
+{
+  "projects": {
+    "default": "testrepoapp-d6122"
+  },
+  "targets": {
+    "testrepoapp-d6122": {
+      "hosting": {
+        "web": ["thinkaloud-app"]
+      }
+    }
+  }
+}

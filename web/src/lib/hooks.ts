@@ -1,4 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { apiBlobUrl, apiIsCrossOrigin, apiUrl } from './api.ts';
+
+/**
+ * URL for an authenticated API media file (e.g. <audio src>). Same-origin it is the plain path (the cookie
+ * authenticates, streaming and range requests work); cross-origin it is fetched with the bearer token
+ * into a blob URL. Returns undefined while loading or on error.
+ */
+export function useApiMediaUrl(path: string | null): string | undefined {
+  const cross = apiIsCrossOrigin();
+  const [blob, setBlob] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    setBlob(undefined);
+    if (!path || !cross) return;
+    let url: string | undefined;
+    let alive = true;
+    apiBlobUrl(path).then(
+      (u) => (alive ? setBlob((url = u)) : URL.revokeObjectURL(u)),
+      () => {},
+    );
+    return () => {
+      alive = false;
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [path, cross]);
+  if (!path) return undefined;
+  return cross ? blob : apiUrl(path);
+}
 
 /** Fetch-on-mount helper with reload. */
 export function useAsync<T>(fn: () => Promise<T>, deps: unknown[] = []) {

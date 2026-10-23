@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, ExternalLink, FileArchive, MoreHorizontal, RefreshCw, ScrollText, SlidersHorizontal, Trash2, Upload } from 'lucide-react';
 import type { AppBuild, AppBuildSettings } from '@thinkaloud/shared';
-import { api } from '../../lib/api.ts';
+import { api, apiCredentials, apiIsCrossOrigin, apiUrl, authHeaders } from '../../lib/api.ts';
 import { timeAgo, useInterval } from '../../lib/hooks.ts';
 import { Button, cn, Field, Input, Modal, Spinner, Textarea } from '../../ui/index.tsx';
 import { useToast } from '../../ui/toast.tsx';
@@ -251,8 +251,9 @@ function AddApp({ onAdded }: { onAdded: (a: App) => void }) {
     if (Object.keys(parsed.env).length) fd.append('env', JSON.stringify(parsed.env));
     fd.append('file', file);
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/studies/${studyId}/apps`);
-    xhr.withCredentials = true;
+    xhr.open('POST', apiUrl(`/api/studies/${studyId}/apps`));
+    xhr.withCredentials = !apiIsCrossOrigin();
+    for (const [k, v] of Object.entries(authHeaders())) xhr.setRequestHeader(k, v);
     xhr.upload.onprogress = (e) => e.lengthComputable && setProgress(e.loaded / e.total);
     xhr.onload = () => {
       setProgress(null);
@@ -390,7 +391,7 @@ function LogModal({ app, onClose }: { app: App | null; onClose: () => void }) {
   const load = async () => {
     if (!app) return;
     try {
-      const res = await fetch(`/api/apps/${app.id}/log`, { credentials: 'include' });
+      const res = await fetch(apiUrl(`/api/apps/${app.id}/log`), { credentials: apiCredentials(), headers: authHeaders() });
       setLog(res.ok ? await res.text() : `Log unavailable (${res.status})`);
       const { app: a } = await api.get<{ app: App }>(`/api/apps/${app.id}`);
       setStatus(a.status);

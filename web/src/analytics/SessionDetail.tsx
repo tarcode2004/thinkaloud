@@ -1,15 +1,15 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router';
-import { ChevronLeft, ChevronRight, Trash2, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Lock, Trash2, X } from 'lucide-react';
 import type { SessionEvent, Step, TaskOutcome, TaskStep } from '@thinkaloud/shared';
 import { seqQuestion, stepQuestions } from '@thinkaloud/shared';
 import { api } from '../lib/api.ts';
-import { useAsync } from '../lib/hooks.ts';
+import { useApiMediaUrl, useAsync } from '../lib/hooks.ts';
 import { Button, FullPageSpinner, Modal, cn } from '../ui/index.tsx';
 import { useToast } from '../ui/toast.tsx';
 import { ResultsNav, useResults } from './ResultsRoutes.tsx';
 import { Dot, Empty, Panel, Segmented } from './components.tsx';
-import { clock, OUTCOME_META, secs, susGrade } from './format.ts';
+import { clock, infoText, OUTCOME_META, secs, susGrade } from './format.ts';
 import { Controls, Stage, Timeline, usePlayerClock, type PlayerClock } from './Player.tsx';
 import type { FlatPoint, Note, SessionDetail as Detail } from './types.ts';
 
@@ -50,6 +50,7 @@ function Loaded({ d, reload, setData }: { d: Detail; reload: () => void; setData
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const audioTrack = d.audioTracks[0];
+  const audioSrc = useApiMediaUrl(audioTrack ? `/api/sessions/${sid}/audio?track=${audioTrack}` : null);
   const audioStart = useMemo(() => {
     const e = d.events.find((x) => x.kind === 'media.audio_start' && (!(x.data as { track?: string }).track || (x.data as { track?: string }).track === audioTrack));
     return e ? Number((e.data as { t?: number }).t ?? e.t) : 0;
@@ -156,7 +157,7 @@ function Loaded({ d, reload, setData }: { d: Detail; reload: () => void; setData
               <audio
                 ref={audioRef}
                 preload="auto"
-                src={`/api/sessions/${sid}/audio?track=${audioTrack}`}
+                src={audioSrc}
                 onCanPlay={() => setAudioState(audioTrack === 'mixed' ? 'Audio: participant + moderator' : 'Audio: participant')}
                 onError={() => setAudioState('Audio unavailable')}
               />
@@ -164,6 +165,7 @@ function Loaded({ d, reload, setData }: { d: Detail; reload: () => void; setData
           </div>
 
           <StepsPanel d={d} c={c} onChanged={reload} />
+          <ParticipantPanel d={d} />
           <AnswersPanel d={d} />
         </div>
 
@@ -583,6 +585,96 @@ function StepsPanel({ d, c, onChanged }: { d: Detail; c: PlayerClock; onChanged:
 
 function stepKind(s: Step) {
   return s.type === 'questionnaire' ? (s.instrument === 'custom' ? 'Questionnaire' : s.instrument.replace('_', '-')) : s.type.charAt(0).toUpperCase() + s.type.slice(1);
+}
+
+// ── Participant ─────────────────────────────────────────────────────────────
+
+function InfoRow({ label, children, pii }: { label: ReactNode; children: ReactNode; pii?: boolean }) {
+  return (
+    <div className="ml-6 flex items-baseline justify-between gap-6 border-t border-separator py-2.5 pr-6 text-[14px] first:border-t-0">
+      <span className="inline-flex shrink-0 items-center gap-1.5 text-secondary">
+        {label}
+        {pii && (
+          <span title="Personal information — left out of exports that exclude personal information">
+            <Lock className="size-3 text-tertiary" strokeWidth={1.75} aria-hidden />
+            <span className="sr-only">(personal information)</span>
+          </span>
+        )}
+      </span>
+      <span className="min-w-0 text-right text-label tabular-nums [overflow-wrap:anywhere]">{children}</span>
+    </div>
+  );
+}
+
+function fmtDay(v: string | number | undefined): string {
+  if (v == null || v === '') return '';
+  const dt = typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? new Date(`${v}T00:00:00`) : new Date(v);
+  return isNaN(dt.getTime()) ? String(v) : dt.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+}
+
+function ParticipantPanel({ d }: { d: Detail }) {
+  const consent = d.session.consent;
+  const info = d.session.participantInfo ?? null;
+  const fields = d.participantFields?.length ? d.participantFields : (consent?.fields ?? []);
+  const hasInfo = fields.length > 0 || (info != null && Object.keys(info).length > 0);
+  const hasForm = consent != null && (consent.formVersion != null || consent.signature != null);
+  if (!hasInfo && !hasForm) return null;
+  // Values for fields that are no longer listed (e.g. removed later) still show, by id.
+  const known = new Set(fields.map((f) => f.id));
+  const extra = Object.keys(info ?? {}).filter((k) => !known.has(k));
+  const sig = consent?.signature;
+  const sigDate = fmtDay(sig?.date) || (consent ? fmtDay(consent.acceptedAt) : '');
+  const yesNo = (v: boolean) => (v ? 'Yes' : <span className="text-tertiary">No</span>);
+  return (
+    <Panel>
+      <div className="px-6 pb-2 pt-5">
+        <h2 className="text-[17px] font-semibold tracking-[-0.015em] text-label">Participant</h2>
+        {d.effectiveStatus === 'withdrawn' && <p className="mt-0.5 text-[13px] text-secondary">Withdrew from the study. Their personal information was deleted.</p>}
+      </div>
+      {hasInfo && (
+        <div className="pb-2">
+          {fields.map((f) => {
+            const v = infoText(info?.[f.id], f.kind);
+            return (
+              <InfoRow key={f.id} label={f.label} pii={f.pii}>
+                {v || <span className="text-tertiary">—</span>}
+              </InfoRow>
+            );
+          })}
+          {extra.map((k) => (
+            <InfoRow key={k} label={k}>
+              {infoText(info?.[k]) || <span className="text-tertiary">—</span>}
+            </InfoRow>
+          ))}
+        </div>
+      )}
+      {consent && (
+        <>
+          <div className="border-t border-separator px-6 pb-1 pt-4 text-[12px] font-semibold text-secondary">Consent</div>
+          <div className="pb-3">
+            {consent.formVersion != null && (
+              <InfoRow label="Consent form">
+                Version {consent.formVersion}
+                {consent.formHash && (
+                  <span className="ml-2 font-mono text-[12px] text-tertiary" title={`Content hash ${consent.formHash}`}>
+                    {consent.formHash.slice(0, 8)}
+                  </span>
+                )}
+              </InfoRow>
+            )}
+            <InfoRow label="Signed" pii={sig?.mode === 'typed_name' && !!sig.name}>
+              {sig?.mode === 'typed_name' && sig.name ? <span className="italic">{sig.name}</span> : 'Agreed by checkbox'}
+              {sigDate && <span className="text-secondary"> · {sigDate}</span>}
+            </InfoRow>
+            <InfoRow label="Voice audio">{yesNo(consent.audio)}</InfoRow>
+            <InfoRow label="Screen recording">{yesNo(consent.screen)}</InfoRow>
+            <InfoRow label="Eye tracking">{yesNo(consent.eyeTracking)}</InfoRow>
+            {consent.ageConfirmed && <InfoRow label="Confirmed 18 or older">Yes</InfoRow>}
+          </div>
+        </>
+      )}
+    </Panel>
+  );
 }
 
 // ── Answers ─────────────────────────────────────────────────────────────────

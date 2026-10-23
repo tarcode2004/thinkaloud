@@ -1,0 +1,17 @@
+[Unit]
+Description=ThinkAloud Cloudflare quick tunnel (api → 127.0.0.1:4000)
+Documentation=file://@REPO@/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The public https://<random>.trycloudflare.com hostname is served at http://127.0.0.1:20251/quicktunnel,
+# where thinkaloud-sync.service picks it up. It changes every time this unit restarts.
+ExecStart=@CLOUDFLARED@ tunnel --no-autoupdate --metrics 127.0.0.1:20251 --url http://127.0.0.1:4000
+Restart=always
+RestartSec=5
+SyslogIdentifier=thinkaloud-tunnel-api
+
+[Install]
+WantedBy=default.target

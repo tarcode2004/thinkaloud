@@ -6,6 +6,7 @@ import type {
   Insight,
   InstrumentId,
   Interval,
+  ParticipantFieldSnapshot,
   Protocol,
   Session,
   SessionEvent,
@@ -97,6 +98,14 @@ export interface SessionRow extends Session {
   hasAudio: boolean;
 }
 
+/** A participant-info field as listed by the sessions API (column = export column name). */
+export type ParticipantFieldCol = ParticipantFieldSnapshot & { column: string };
+
+export interface SessionsResponse {
+  sessions: SessionRow[];
+  participantFields: ParticipantFieldCol[];
+}
+
 export interface Note {
   id: string;
   sessionId: string;
@@ -125,6 +134,7 @@ export interface SessionDetail {
   pointBatches: { mouse: number; gaze: number };
   prevSessionId: string | null;
   nextSessionId: string | null;
+  participantFields?: ParticipantFieldCol[];
 }
 
 export interface FlatPoint {

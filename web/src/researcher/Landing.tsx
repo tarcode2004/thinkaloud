@@ -1,10 +1,14 @@
 import { Link } from 'react-router';
 import { ChevronRight } from 'lucide-react';
 import { Logo } from './components/index.tsx';
+import Pricing from './billing/Pricing.tsx';
+import { usePlans } from './billing/api.ts';
 
 const card = 'rounded-[22px] bg-white shadow-[0_1px_2px_rgba(0,0,0,.04),0_12px_40px_rgba(0,0,0,.06)] ring-1 ring-black/[0.04]';
 
 export default function Landing() {
+  const plans = usePlans();
+  const hasPricing = Boolean(plans?.enabled && plans.plans.length);
   return (
     <div className="min-h-full bg-white text-label">
       <header className="material sticky top-0 z-30 border-b">
@@ -14,6 +18,7 @@ export default function Landing() {
             <a href="#moderator" className="hidden hover:text-label sm:inline">Moderator</a>
             <a href="#protocol" className="hidden hover:text-label sm:inline">Protocols</a>
             <a href="#results" className="hidden hover:text-label sm:inline">Results</a>
+            {hasPricing && <a href="#pricing" className="hidden hover:text-label sm:inline">Pricing</a>}
             <Link to="/login" className="hover:text-label">Sign in</Link>
             <Link to="/signup" className="rounded-full bg-brand-500 px-3 py-1 text-[12px] font-medium text-white hover:bg-brand-600">Get started</Link>
           </nav>
@@ -131,6 +136,9 @@ export default function Landing() {
           </div>
         </div>
       </section>
+
+      {/* Pricing (SaaS installs only) */}
+      <Pricing data={plans} />
 
       {/* CTA */}
       <section className="bg-canvas px-6 py-28 text-center">

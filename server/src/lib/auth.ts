@@ -40,15 +40,16 @@ export function createAuthSession(res: Response, userId: string): string {
 }
 
 export function destroyAuthSession(req: Request, res: Response) {
-  const token = req.cookies?.[AUTH_COOKIE];
+  const token = bearerToken(req) || req.cookies?.[AUTH_COOKIE];
   if (token) db.prepare('DELETE FROM auth_sessions WHERE token = ?').run(token);
   res.clearCookie(AUTH_COOKIE, { path: '/' });
 }
 
 /** Populates req.user if a valid auth cookie (or `Authorization: Bearer <token>`) is present. */
 export function loadUser(req: Request, _res: Response, next: NextFunction) {
-  const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;
-  const token = req.cookies?.[AUTH_COOKIE] || bearer;
+  // Bearer wins when present: the CSRF guard exempts bearer requests, so they must never ride on the cookie.
+  const bearer = bearerToken(req);
+  const token = bearer || req.cookies?.[AUTH_COOKIE];
   if (token) {
     const row = db
       .prepare(
@@ -59,6 +60,11 @@ export function loadUser(req: Request, _res: Response, next: NextFunction) {
     if (row) req.user = { id: row.id, email: row.email, name: row.name, createdAt: row.created_at };
   }
   next();
+}
+
+function bearerToken(req: Request): string | undefined {
+  const h = req.headers.authorization;
+  return h?.startsWith('Bearer ') ? h.slice(7).trim() || undefined : undefined;
 }
 
 export function requireUser(req: Request, _res: Response, next: NextFunction) {

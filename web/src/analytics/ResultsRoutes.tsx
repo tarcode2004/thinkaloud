@@ -8,6 +8,7 @@ const SessionsList = lazy(() => import('./SessionsList.tsx'));
 const SessionDetail = lazy(() => import('./SessionDetail.tsx'));
 const Heatmaps = lazy(() => import('./Heatmaps.tsx'));
 const Insights = lazy(() => import('./Insights.tsx'));
+const Participants = lazy(() => import('./Participants.tsx'));
 
 interface ResultsCtx {
   studyId: string;
@@ -43,6 +44,7 @@ function writePref(key: string, v: unknown) {
 const NAV = [
   { to: '', label: 'Overview', end: true },
   { to: 'sessions', label: 'Sessions' },
+  { to: 'participants', label: 'Participants' },
   { to: 'heatmaps', label: 'Heatmaps' },
   { to: 'insights', label: 'Insights' },
 ];
@@ -117,6 +119,7 @@ export default function ResultsRoutes() {
           <Route index element={<Overview />} />
           <Route path="sessions" element={<SessionsList />} />
           <Route path="sessions/:sessionId" element={<SessionDetail />} />
+          <Route path="participants" element={<Participants />} />
           <Route path="heatmaps" element={<Heatmaps />} />
           <Route path="insights" element={<Insights />} />
           <Route path="*" element={<Overview />} />

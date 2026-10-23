@@ -152,6 +152,58 @@ const MIGRATIONS: string[] = [
   /* 2 */ `ALTER TABLE variants ADD COLUMN app_params TEXT NOT NULL DEFAULT '';`,
   /* 3 */ `ALTER TABLE answers ADD COLUMN declined INTEGER NOT NULL DEFAULT 0;`,
   /* 4 */ `ALTER TABLE answers ADD COLUMN wording TEXT;`,
+  /* 5 consent forms + participant info */ `
+  ALTER TABLE studies ADD COLUMN consent_form TEXT;      -- JSON ConsentForm (document text, version, fields, checks)
+  CREATE TABLE consent_documents (
+    id TEXT PRIMARY KEY,
+    study_id TEXT NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+    filename TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    text TEXT NOT NULL,                                  -- extracted plain text
+    path TEXT NOT NULL,                                  -- original file on disk (DATA_DIR)
+    created_at INTEGER NOT NULL
+  );
+  ALTER TABLE sessions ADD COLUMN participant_info TEXT; -- JSON Record<fieldId, value> collected at consent
+  `,
+  /* 6 billing */ `
+  CREATE TABLE billing_accounts (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    stripe_customer_id TEXT UNIQUE,
+    subscription_id TEXT,
+    plan TEXT NOT NULL DEFAULT 'free',
+    status TEXT NOT NULL DEFAULT 'none',                 -- none | trialing | active | past_due | canceled | incomplete
+    current_period_end INTEGER,
+    updated_at INTEGER NOT NULL,
+    current_period_start INTEGER,
+    trial_end INTEGER,
+    cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
+    past_due_since INTEGER,                              -- start of the payment grace period
+    spend_cap_cents INTEGER,                             -- optional hard monthly limit set by the researcher
+    had_subscription INTEGER NOT NULL DEFAULT 0,         -- free trial is offered once
+    last_event_at INTEGER                                -- Stripe event.created of the last subscription sync (stale-event guard)
+  );
+  CREATE TABLE usage_events (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id TEXT,
+    kind TEXT NOT NULL,                                  -- e.g. voice_minutes
+    quantity REAL NOT NULL,
+    at INTEGER NOT NULL,
+    reported_at INTEGER,                                 -- when sent to Stripe meter events
+    skipped TEXT,                                        -- not billable: trial | no_customer | expired
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER,
+    last_error TEXT,
+    UNIQUE (session_id, kind)
+  );
+  CREATE INDEX usage_events_pending ON usage_events(reported_at, skipped);
+  CREATE INDEX usage_events_user ON usage_events(user_id, at);
+  CREATE TABLE stripe_events (id TEXT PRIMARY KEY, type TEXT NOT NULL, received_at INTEGER NOT NULL);
+  ALTER TABLE sessions ADD COLUMN voice_started_at INTEGER; -- first realtime-token mint (start of metered voice time)
+  ALTER TABLE sessions ADD COLUMN voice_last_seen_at INTEGER; -- server time of the last participant activity after voice started
+  `,
 ];
 
 db.exec('CREATE TABLE IF NOT EXISTS _migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)');

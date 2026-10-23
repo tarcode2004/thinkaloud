@@ -8,13 +8,15 @@ import { config } from './lib/config.ts';
 import { paths } from './lib/paths.ts';
 import { loadUser } from './lib/auth.ts';
 import { errorMiddleware } from './lib/http.ts';
-import { rateLimit, sameOriginGuard } from './lib/guards.ts';
+import { corsMiddleware, rateLimit, sameOriginGuard } from './lib/guards.ts';
 import { authRouter } from './routes/auth.ts';
 import { studiesRouter } from './routes/studies.ts';
 import { participantRouter } from './routes/participant.ts';
 import { aiRouter } from './routes/ai.ts';
+import { consentRouter } from './routes/consent.ts';
 import { buildsRouter } from './builds/routes.ts';
 import { analyticsRouter } from './analytics/routes.ts';
+import { billingRouter, stripeWebhookHandler } from './billing/routes.ts';
 
 /** The API + SPA Express app (no listening; see index.ts). */
 export function createApp() {
@@ -22,7 +24,13 @@ export function createApp() {
   app.disable('x-powered-by');
   app.set('trust proxy', true);
   app.use(cookieParser());
+  app.use('/api', corsMiddleware); // cross-origin front end (CORS_ORIGINS / PUBLIC_URL); no-op same-origin
+  // Stripe webhook: needs the exact raw body for signature verification, so it is mounted before
+  // the JSON parser, and before the CSRF origin guard (Stripe is not a browser; the signature is the auth).
+  app.post('/api/billing/webhook', express.raw({ type: '*/*', limit: '1mb' }), stripeWebhookHandler);
   app.use(express.json({ limit: '25mb' }));
+  // Cross-origin pagehide beacons are sent as text/plain (a CORS-safelisted type) but carry JSON.
+  app.use('/api/p', express.json({ type: 'text/plain', limit: '25mb' }));
   app.use(loadUser);
 
   app.get('/api/health', (_req, res) => res.json({ ok: true, appHostUrl: config.appHostUrl, ai: Boolean(config.openaiKey) }));
@@ -31,6 +39,8 @@ export function createApp() {
   app.use('/api/auth', authRouter);
   app.use('/api/p', participantRouter); // public participant API (session-secret auth)
   app.use('/api/ai', aiRouter);
+  app.use('/api/billing', billingRouter); // SaaS billing (inert unless STRIPE_SECRET_KEY is set)
+  app.use('/api', consentRouter);
   app.use('/api', studiesRouter);
   app.use('/api', buildsRouter);
   app.use('/api', analyticsRouter);

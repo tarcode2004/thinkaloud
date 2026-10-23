@@ -5,7 +5,7 @@ import {
   Pencil, Plus, ScrollText, Settings2, ShieldCheck, SlidersHorizontal, Trash2, Wand2, GripVertical,
 } from 'lucide-react';
 import { emptyProtocol, type InstrumentId, type Protocol, type ProtocolRecord, type Step, type StepType } from '@thinkaloud/shared';
-import { api } from '../../lib/api.ts';
+import { api, apiCredentials, apiUrl, authHeaders } from '../../lib/api.ts';
 import { Button, cn, Input, Modal, Textarea } from '../../ui/index.tsx';
 import { useToast } from '../../ui/toast.tsx';
 import { Callout, InlineEdit, KeyHint, Menu, MenuItem } from '../components/index.tsx';
@@ -133,7 +133,7 @@ function useAutosave(record: ProtocolRecord, onSaved: (r: ProtocolRecord) => voi
       window.removeEventListener('beforeunload', onBeforeUnload);
       if (dirty.current) {
         const snap = latest.current;
-        void fetch(`/api/protocols/${record.id}`, { method: 'PUT', credentials: 'include', keepalive: true, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(snap) })
+        void fetch(apiUrl(`/api/protocols/${record.id}`), { method: 'PUT', credentials: apiCredentials(), keepalive: true, headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(snap) })
           .then((r) => (r.ok ? r.json() : null))
           .then((j: { protocol?: ProtocolRecord } | null) => j?.protocol && onSavedRef.current(j.protocol))
           .catch(() => {});

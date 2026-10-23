@@ -57,3 +57,15 @@ export const lostnessLabel = (l: number | null) => (l == null ? '' : l < 0.4 ? '
 
 /** Simple markdown-ish emphasis for server strings with **bold**. */
 export const plain = (s: string) => s.replace(/\*\*/g, '');
+
+/** Participant-info value as text (yes/no, lists, YYYY-MM-DD dates). Empty → ''. */
+export function infoText(v: string | number | boolean | string[] | null | undefined, kind?: string): string {
+  if (v == null || v === '') return '';
+  if (typeof v === 'boolean') return v ? 'Yes' : 'No';
+  if (Array.isArray(v)) return v.join(', ');
+  if (kind === 'date' && typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)) {
+    const d = new Date(`${v}T00:00:00`);
+    if (!isNaN(d.getTime())) return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  }
+  return String(v);
+}

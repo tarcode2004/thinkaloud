@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router';
-import { BookOpen, ChevronsUpDown, FlaskConical, LayoutGrid, LogOut, Menu as MenuIcon, X } from 'lucide-react';
+import { BookOpen, ChevronsUpDown, CreditCard, FlaskConical, LayoutGrid, LogOut, Menu as MenuIcon, X } from 'lucide-react';
+import type { BillingOverview } from '@thinkaloud/shared';
 import { cn } from '../ui/index.tsx';
 import { Logo, Menu, MenuItem } from './components/index.tsx';
 import { useAuth } from './auth.tsx';
 import { rApi, STATUS_META, type StudySummary } from './lib.ts';
+import { BLOCK_COPY, useBillingOverview } from './billing/api.ts';
 
 /** Fire after creating/renaming/deleting a study so the sidebar refreshes. */
 export function notifyStudiesChanged() {
@@ -15,16 +17,17 @@ export default function AppShell() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const loc = useLocation();
   useEffect(() => setMobileOpen(false), [loc.pathname]);
+  const billing = useBillingOverview().data;
   return (
     <div className="flex min-h-screen bg-canvas">
       <aside className="material sticky top-0 hidden h-screen w-60 shrink-0 border-r lg:block">
-        <Sidebar />
+        <Sidebar billing={billing} />
       </aside>
       {mobileOpen && (
         <div className="fixed inset-0 z-50 lg:hidden" onClick={() => setMobileOpen(false)}>
           <div className="absolute inset-0 bg-black/20" />
           <aside className="material absolute inset-y-0 left-0 w-64 border-r" onClick={(e) => e.stopPropagation()}>
-            <Sidebar />
+            <Sidebar billing={billing} />
           </aside>
         </div>
       )}
@@ -36,6 +39,7 @@ export default function AppShell() {
           <Logo />
         </div>
         <main className="min-w-0 flex-1">
+          {billing?.enabled && billing.blockReason && loc.pathname !== '/billing' && <PlanBanner billing={billing} />}
           <Outlet />
         </main>
       </div>
@@ -43,7 +47,19 @@ export default function AppShell() {
   );
 }
 
-function Sidebar() {
+/** Shown in SaaS mode when the researcher can't run participant sessions. Calm, one line, dismissible by fixing it. */
+function PlanBanner({ billing }: { billing: BillingOverview }) {
+  return (
+    <div className="border-b border-separator bg-surface px-6 py-2.5 text-[13px] text-secondary sm:px-8" data-testid="plan-banner">
+      <div className="mx-auto flex max-w-[1120px] flex-wrap items-center justify-between gap-x-4 gap-y-1">
+        <span>{BLOCK_COPY[billing.blockReason!]}</span>
+        <Link to="/billing" className="font-medium text-brand-500 hover:underline">{billing.status === 'none' || billing.status === 'canceled' ? 'View plans' : 'Go to billing'}</Link>
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ billing }: { billing: BillingOverview | null }) {
   const { user, logout } = useAuth();
   const nav = useNavigate();
   const [recent, setRecent] = useState<StudySummary[]>([]);
@@ -62,6 +78,7 @@ function Sidebar() {
       </div>
       <nav className="space-y-px px-3 py-1">
         <SideLink to="/studies" end icon={<LayoutGrid className="size-4" />}>Studies</SideLink>
+        {billing?.enabled && <SideLink to="/billing" icon={<CreditCard className="size-4" />}>Billing</SideLink>}
       </nav>
       {recent.length > 0 && (
         <div className="mt-4 min-h-0 flex-1 overflow-y-auto px-3">
@@ -103,6 +120,7 @@ function Sidebar() {
           {(close) => (
             <>
               <MenuItem icon={<FlaskConical className="size-4" />} onClick={() => { close(); nav('/studies'); }}>All studies</MenuItem>
+              {billing?.enabled && <MenuItem icon={<CreditCard className="size-4" />} onClick={() => { close(); nav('/billing'); }}>Billing</MenuItem>}
               <MenuItem
                 icon={<LogOut className="size-4" />}
                 onClick={async () => {

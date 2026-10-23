@@ -1,6 +1,11 @@
 // Researcher-side API types + helpers (shapes from docs/API.md).
 import type { AppBuild, ProtocolRecord, Study, StudyLink, StudyStatus, User, Variant } from '@thinkaloud/shared';
-import { api, ApiError } from '../lib/api.ts';
+import { api, ApiError, setAuthToken } from '../lib/api.ts';
+
+const keepToken = <T extends { token?: string }>(r: T): T => {
+  setAuthToken(r.token);
+  return r;
+};
 
 export type StudySummary = Study & { sessionCount: number; completedCount: number; variantCount: number; lastSessionAt: number | null };
 export type LinkWithUrl = StudyLink & { url: string; sessionCount: number };
@@ -14,9 +19,10 @@ export interface StudyDetail {
 
 export const rApi = {
   me: () => api.get<{ user: User }>('/api/auth/me'),
-  login: (email: string, password: string) => api.post<{ user: User }>('/api/auth/login', { email, password }),
-  signup: (name: string, email: string, password: string) => api.post<{ user: User }>('/api/auth/signup', { name, email, password }),
-  logout: () => api.post<{ ok: boolean }>('/api/auth/logout'),
+  // The token is kept for bearer auth when the API is cross-origin (see lib/api.ts).
+  login: (email: string, password: string) => api.post<{ user: User; token?: string }>('/api/auth/login', { email, password }).then(keepToken),
+  signup: (name: string, email: string, password: string) => api.post<{ user: User; token?: string }>('/api/auth/signup', { name, email, password }).then(keepToken),
+  logout: () => api.post<{ ok: boolean }>('/api/auth/logout').finally(() => setAuthToken(null)),
   studies: () => api.get<{ studies: StudySummary[] }>('/api/studies'),
   createStudy: (body: { name: string; description?: string; template?: 'starter' | 'blank' }) => api.post<{ study: Study }>('/api/studies', body),
   study: (id: string) => api.get<StudyDetail>(`/api/studies/${id}`),

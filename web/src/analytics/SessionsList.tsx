@@ -7,8 +7,8 @@ import { plural, useAsync } from '../lib/hooks.ts';
 import { FullPageSpinner, cn } from '../ui/index.tsx';
 import { ResultsPage, useResults } from './ResultsRoutes.tsx';
 import { Dot, Empty, ExportMenu, OutcomeDots, Panel, Segmented, Switch } from './components.tsx';
-import { OUTCOME_META, secs, susGrade, variantColor } from './format.ts';
-import type { SessionRow } from './types.ts';
+import { infoText, OUTCOME_META, secs, susGrade, variantColor } from './format.ts';
+import type { ParticipantFieldCol, SessionRow, SessionsResponse } from './types.ts';
 
 const STATUS: Record<string, { label: string; color: string }> = {
   completed: { label: 'Completed', color: '#34c759' },
@@ -21,10 +21,26 @@ const STATUS: Record<string, { label: string; color: string }> = {
 
 type Sort = 'recent' | 'duration' | 'sus' | 'tasks';
 
+/** Compact participant-info summary: name on top, then age · gender (or sex); else the first couple of values. */
+function infoSummary(s: SessionRow, fields: ParticipantFieldCol[]): { primary: string; secondary: string } | null {
+  const info = s.participantInfo;
+  if (!info) return null;
+  const kind = new Map(fields.map((f) => [f.id, f.kind]));
+  const get = (id: string) => infoText(info[id], kind.get(id));
+  const name = get('full_name');
+  const demo = [get('age'), get('gender') || get('sex')].filter(Boolean);
+  if (!name && !demo.length) {
+    const rest = fields.map((f) => get(f.id)).filter(Boolean);
+    if (!rest.length) return null;
+    return { primary: rest[0], secondary: rest.slice(1, 3).join(' · ') };
+  }
+  return name ? { primary: name, secondary: demo.join(' · ') } : { primary: demo.join(' · '), secondary: '' };
+}
+
 export default function SessionsList() {
   const { studyId, base, includePreview, setIncludePreview } = useResults();
   const nav = useNavigate();
-  const { data, loading, error } = useAsync(() => api.get<{ sessions: SessionRow[] }>(`/api/studies/${studyId}/sessions`), [studyId]);
+  const { data, loading, error } = useAsync(() => api.get<SessionsResponse>(`/api/studies/${studyId}/sessions`), [studyId]);
   const [variant, setVariant] = useState<string>('all');
   const [status, setStatus] = useState<string>('all');
   const [outcome, setOutcome] = useState<string>('all');
@@ -32,6 +48,8 @@ export default function SessionsList() {
   const [sort, setSort] = useState<Sort>('recent');
 
   const all = data?.sessions ?? [];
+  const fields = data?.participantFields ?? [];
+  const showInfo = fields.length > 0;
   const variants = useMemo(() => {
     const m = new Map<string, string>();
     for (const s of all) m.set(s.variantId, s.variantName);
@@ -46,7 +64,14 @@ export default function SessionsList() {
     if (outcome !== 'all') r = r.filter((s) => s.outcomes.includes(outcome as TaskOutcome));
     if (q.trim()) {
       const n = q.trim().toLowerCase();
-      r = r.filter((s) => s.participantCode.toLowerCase().includes(n) || s.id.includes(n) || Object.values(s.urlParams ?? {}).some((v) => String(v).toLowerCase().includes(n)));
+      const hit = (v: unknown) => (Array.isArray(v) ? v.join(' ') : String(v)).toLowerCase().includes(n);
+      r = r.filter(
+        (s) =>
+          s.participantCode.toLowerCase().includes(n) ||
+          s.id.includes(n) ||
+          Object.values(s.urlParams ?? {}).some(hit) ||
+          Object.values(s.participantInfo ?? {}).some((v) => typeof v !== 'boolean' && hit(v)),
+      );
     }
     const sorted = [...r];
     if (sort === 'duration') sorted.sort((a, b) => (b.durationMs ?? -1) - (a.durationMs ?? -1));
@@ -104,8 +129,8 @@ export default function SessionsList() {
               <input
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Participant or Prolific ID"
-                className="h-8 w-56 rounded-full bg-fill pl-8 pr-3 text-[13px] text-label outline-none placeholder:text-tertiary focus:ring-4 focus:ring-brand-500/20"
+                placeholder={showInfo ? 'Participant, name or Prolific ID' : 'Participant or Prolific ID'}
+                className="h-8 w-60 rounded-full bg-fill pl-8 pr-3 text-[13px] text-label outline-none placeholder:text-tertiary focus:ring-4 focus:ring-brand-500/20"
               />
             </label>
             <div className="ml-auto">
@@ -113,10 +138,11 @@ export default function SessionsList() {
             </div>
           </div>
           <Panel className="overflow-x-auto">
-            <table className="w-full min-w-[960px] border-collapse text-[13px]">
+            <table className={cn('w-full border-collapse text-[13px]', showInfo ? 'min-w-[1100px]' : 'min-w-[960px]')}>
               <thead>
                 <tr className="border-b border-separator">
                   <th className={cn(head, 'pl-6')}>Participant</th>
+                  {showInfo && <th className={head}>Participant info</th>}
                   <th className={head}>Variant</th>
                   <th className={head}>Status</th>
                   <th className={head}>Date</th>
@@ -130,6 +156,7 @@ export default function SessionsList() {
               <tbody>
                 {rows.map((s) => {
                   const st = STATUS[s.effectiveStatus] ?? STATUS.created;
+                  const info = showInfo ? infoSummary(s, fields) : null;
                   return (
                     <tr
                       key={s.id}
@@ -146,6 +173,20 @@ export default function SessionsList() {
                           <div className="text-[11px] text-tertiary">{s.preview ? 'Preview' : `Prolific ${s.urlParams.PROLIFIC_PID.slice(0, 8)}…`}</div>
                         )}
                       </td>
+                      {showInfo && (
+                        <td className="max-w-[220px] px-3 py-3">
+                          {info ? (
+                            <>
+                              <div className="truncate text-label" title={info.primary}>
+                                {info.primary}
+                              </div>
+                              {info.secondary && <div className="truncate text-[11px] tabular-nums text-tertiary">{info.secondary}</div>}
+                            </>
+                          ) : (
+                            <span className="text-tertiary">—</span>
+                          )}
+                        </td>
+                      )}
                       <td className="px-3 py-3 text-secondary">
                         <span className="inline-flex items-center gap-1.5">
                           <Dot color={variantColor(variantIndex(s.variantId))} />
@@ -197,7 +238,7 @@ export default function SessionsList() {
                 })}
                 {!rows.length && (
                   <tr>
-                    <td colSpan={9} className="px-6 py-12 text-center text-[13px] text-tertiary">
+                    <td colSpan={showInfo ? 10 : 9} className="px-6 py-12 text-center text-[13px] text-tertiary">
                       No sessions match these filters.
                     </td>
                   </tr>

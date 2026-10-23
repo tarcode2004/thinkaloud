@@ -9,9 +9,11 @@ import StudiesPage from './StudiesPage.tsx';
 import StudyLayout from './study/StudyLayout.tsx';
 import Overview from './study/Overview.tsx';
 import ProtocolEditorRoute, { ProtocolsIndex } from './protocol/ProtocolEditor.tsx';
+import ConsentPage from './consent/ConsentPage.tsx';
 import AppsPage from './study/AppsPage.tsx';
 import VariantsPage from './study/VariantsPage.tsx';
 import RecruitPage from './study/RecruitPage.tsx';
+import BillingPage from './billing/BillingPage.tsx';
 
 const ResultsRoutes = lazy(() => import('../analytics/ResultsRoutes.tsx'));
 
@@ -43,10 +45,12 @@ export default function ResearcherRoutes() {
           <Route path="signup" element={<SignupPage />} />
           <Route element={<RequireAuth><AppShell /></RequireAuth>}>
             <Route path="studies" element={<StudiesPage />} />
+            <Route path="billing" element={<BillingPage />} />
             <Route path="studies/:studyId" element={<StudyLayout />}>
               <Route index element={<Overview />} />
               <Route path="protocols" element={<ProtocolsIndex />} />
               <Route path="protocols/:protocolId" element={<ProtocolEditorRoute />} />
+              <Route path="consent" element={<ConsentPage />} />
               <Route path="apps" element={<AppsPage />} />
               <Route path="variants" element={<VariantsPage />} />
               <Route path="recruit" element={<RecruitPage />} />

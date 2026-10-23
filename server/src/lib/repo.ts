@@ -6,6 +6,7 @@ import type {
   AppBuild,
   ConsentRecord,
   DeviceInfo,
+  ParticipantInfo,
   Protocol,
   ProtocolRecord,
   Session,
@@ -132,6 +133,7 @@ export function sessionFromRow(r: Row): Session {
     createdAt: Number(r.created_at),
     gazeErrorPx: nullNum(r.gaze_error_px),
     preview: Boolean(r.preview),
+    participantInfo: json.parse<ParticipantInfo | null>(r.participant_info, null),
   };
 }
 

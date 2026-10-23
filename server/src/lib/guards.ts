@@ -11,11 +11,36 @@ import { HttpError } from './http.ts';
 export function sameOriginGuard(req: Request, _res: Response, next: NextFunction) {
   if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
   if (req.path.startsWith('/p/')) return next();
+  if (req.path === '/billing/webhook') return next(); // Stripe server-to-server; authenticated by its signature
+  // Bearer-authenticated requests are not CSRF-able: a browser only attaches the header from script,
+  // and cross-origin script needs a CORS preflight that only CORS_ORIGINS pass (see corsMiddleware).
+  if (req.headers.authorization?.startsWith('Bearer ')) return next();
   const origin = req.headers.origin;
   if (!origin) return next(); // non-browser clients (curl, scripts) — cookie still required
-  const allowed = new Set([originOf(config.publicUrl), `${req.protocol}://${req.get('host')}`]);
+  const allowed = new Set([originOf(config.publicUrl), ...config.corsOrigins, `${req.protocol}://${req.get('host')}`]);
   if (!config.isProd) for (const p of [5173, 5300, 5400, 5500, 5800]) allowed.add(`http://localhost:${p}`);
   if (!allowed.has(origin)) return next(new HttpError(403, 'Cross-origin request refused'));
+  next();
+}
+
+/**
+ * CORS for a front end hosted on another origin (e.g. Firebase Hosting → API tunnel). Only the
+ * configured origins get Access-Control-Allow-Origin, and never with credentials: cross-origin
+ * researcher calls authenticate with `Authorization: Bearer`, participant calls with X-Session-Secret.
+ * Same-origin requests are untouched.
+ */
+export function corsMiddleware(req: Request, res: Response, next: NextFunction) {
+  const origin = req.headers.origin;
+  if (!origin || !config.corsOrigins.includes(origin)) return next();
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.append('Vary', 'Origin');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Range');
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Session-Secret, Range');
+    res.setHeader('Access-Control-Max-Age', '600');
+    return res.status(204).end();
+  }
   next();
 }
 

@@ -18,8 +18,8 @@ authRouter.post('/signup', (req, res) => {
   db.prepare('INSERT INTO users (id, email, name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)').run(
     user.id, user.email, user.name, hashPassword(body.password), user.createdAt,
   );
-  createAuthSession(res, user.id);
-  res.status(201).json({ user });
+  const token = createAuthSession(res, user.id); // token: bearer auth for cross-origin front ends
+  res.status(201).json({ token, user });
 });
 
 authRouter.post('/login', (req, res) => {
@@ -28,8 +28,8 @@ authRouter.post('/login', (req, res) => {
     | { id: string; email: string; name: string; password_hash: string; created_at: number }
     | undefined;
   if (!row || !verifyPassword(body.password, row.password_hash)) throw new HttpError(401, 'Wrong email or password');
-  createAuthSession(res, row.id);
-  res.json({ user: { id: row.id, email: row.email, name: row.name, createdAt: row.created_at } });
+  const token = createAuthSession(res, row.id);
+  res.json({ token, user: { id: row.id, email: row.email, name: row.name, createdAt: row.created_at } });
 });
 
 authRouter.post('/logout', (req, res) => {
