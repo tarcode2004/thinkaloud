@@ -120,7 +120,7 @@ def load_engine(cfg: Config, llm: Any = None) -> Engine:
         from .llm import make_llm
         llm = make_llm({"llm": cfg.llm})
     stt = STT(device=cfg.device)
-    tts = TTS(device=cfg.device)
+    tts = TTS(device=cfg.device, question_rise_st=cfg.question_rise_st)
     sf = (lambda s, language=None, prompt=None: StreamingTranscriber(s, language=language, prompt=prompt)) \
         if StreamingTranscriber else None
     return Engine(llm=llm, tts=tts, stt=stt, turn_factory=lambda c: TurnDetector(c), streaming_factory=sf, name="ort")

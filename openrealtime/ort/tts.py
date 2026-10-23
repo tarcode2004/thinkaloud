@@ -36,6 +36,7 @@ from typing import AsyncIterator, Iterable
 import numpy as np
 
 from .audio import GPU_GATE, PriorityExecutor
+from .prosody import ProsodyModel, patch_g2p, question_rises
 from .textnorm import SpeechNormalizer
 
 log = logging.getLogger("ort.tts")
@@ -302,8 +303,10 @@ def _fade(a: np.ndarray, ms: int = 4) -> np.ndarray:
 class TTS:
     sample_rate = SAMPLE_RATE
 
-    def __init__(self, device: str = "cuda", repo_id: str = REPO, default_language: str = "en"):
+    def __init__(self, device: str = "cuda", repo_id: str = REPO, default_language: str = "en",
+                 question_rise_st: float = 5.0):
         self.device = device
+        self.question_rise_st = question_rise_st
         self.repo_id = repo_id
         self.default_language = default_language
         # one GPU thread shared by all sessions; the first clause of any response jumps the
@@ -343,6 +346,8 @@ class TTS:
                 p.g2p = espeak.EspeakG2P(language=key[2:])
             else:
                 p = KPipeline(lang_code=key, repo_id=self.repo_id, model=model)
+                if key in ("a", "b"):
+                    patch_g2p(p.g2p)
             self._pipes[key] = p
         return p
 
@@ -422,7 +427,12 @@ class TTS:
         # English G2P splits at Kokoro's 510-phoneme limit itself; the espeak path only cuts at
         # sentence ends and silently TRUNCATES longer phoneme strings, so pre-split those.
         parts = [text] if key in ("a", "b") else _phoneme_safe_chunks(text)
-        for r in (r for part in parts for r in pipe(part, voice=kvoice, speed=speed, split_pattern=None)):
+        def run(part):
+            model = None
+            if key in ("a", "b") and self.question_rise_st > 0 and "?" in part:
+                model = ProsodyModel(self._model, question_rises(part), self.question_rise_st)
+            return pipe(part, voice=kvoice, speed=speed, split_pattern=None, model=model)
+        for r in (r for part in parts for r in run(part)):
             if cancel is not None and cancel.is_set():
                 return None
             if r.audio is None:

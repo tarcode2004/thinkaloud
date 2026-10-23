@@ -16,6 +16,8 @@ ORT_WS_AUDIO_LEAD_MS           WebSocket: how far ahead of real time audio is se
 ORT_WEBRTC_PLAYOUT_DELAY_MS    estimated network+jitter-buffer delay subtracted from "played" (default 60)
 ORT_ECHO_GATE                  1 (default): tell the turn detector what is playing so echo of the assistant's
                                own voice in the mic does not barge in (matters for WS clients without AEC)
+ORT_QUESTION_RISE_ST           English yes/no questions end rising by this many semitones (default 5; 0 = off,
+                               Kokoro's own contour falls even on '?')
 ORT_SPECULATIVE                1 (default): start STT/LLM on a likely end of turn, discard if the user resumes
 ORT_PARTIAL_TRANSCRIPTS        1 (default): live input transcription deltas while the user talks
 ORT_LEGACY_ITEM_CREATED        0 (default): also emit beta `conversation.item.created`
@@ -84,6 +86,7 @@ class Config:
     webrtc_playout_delay_ms: int = 60
     speculative: bool = True
     echo_gate: bool = True
+    question_rise_st: float = 5.0
     partial_transcripts: bool = True
     legacy_item_created: bool = False
     device: str = "cuda"
@@ -114,6 +117,7 @@ class Config:
             webrtc_playout_delay_ms=max(0, _int("ORT_WEBRTC_PLAYOUT_DELAY_MS", 60)),
             speculative=_bool("ORT_SPECULATIVE", True),
             echo_gate=_bool("ORT_ECHO_GATE", True),
+            question_rise_st=max(0.0, min(12.0, float(e("ORT_QUESTION_RISE_ST") or 5))),
             partial_transcripts=_bool("ORT_PARTIAL_TRANSCRIPTS", True),
             legacy_item_created=_bool("ORT_LEGACY_ITEM_CREATED", False),
             device=e("ORT_DEVICE", "cuda"),
