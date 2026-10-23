@@ -50,9 +50,14 @@ function InstructionEditor({ step, onChange }: { step: InstructionStep; onChange
       </Field>
       <Toggle checked={!!step.showApp} onChange={(v) => onChange({ ...step, showApp: v })} label="Show the app during this step" description="Use for first-impression or free-exploration moments." />
       {step.showApp && (
-        <Field label="Exploration time" hint="0 = move on as soon as the script is delivered." className="max-w-48">
-          <NumberInput value={step.exploreSeconds ?? 0} min={0} max={600} suffix="sec" onChange={(v) => onChange({ ...step, exploreSeconds: v ?? 0 })} />
-        </Field>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Exploration time" hint="0 = move on as soon as the script is delivered.">
+            <NumberInput value={step.exploreSeconds ?? 0} min={0} max={600} suffix="sec" onChange={(v) => onChange({ ...step, exploreSeconds: v ?? 0 })} />
+          </Field>
+          <Field label="Start page" hint="App path loaded when the step starts. Leave empty to keep the current page.">
+            <Input className="font-mono text-xs" value={step.startPath ?? ''} onChange={(e) => onChange({ ...step, startPath: e.target.value || undefined })} placeholder="/" />
+          </Field>
+        </div>
       )}
     </FormSection>
   );
@@ -225,8 +230,22 @@ function TaskEditor({ step, onChange }: { step: TaskStep; onChange: (s: Step) =>
           <Field label="Time limit" hint={step.timeLimitSec ? `≈ ${Math.round((step.timeLimitSec / 60) * 10) / 10} min. The task ends as a timeout after this.` : 'No limit'}>
             <NumberInput value={step.timeLimitSec} min={0} step={30} suffix="sec" onChange={(v) => onChange({ ...step, timeLimitSec: v })} placeholder="300" />
           </Field>
+          <Field
+            label="Check-in after"
+            hint={
+              step.softLimitSec
+                ? step.timeLimitSec && step.softLimitSec >= step.timeLimitSec
+                  ? 'Must be shorter than the time limit.'
+                  : 'The moderator asks once whether to keep trying or move on. Keeping going runs on to the time limit.'
+                : 'Optional soft limit.'
+            }
+          >
+            <NumberInput value={step.softLimitSec} min={0} step={30} suffix="sec" onChange={(v) => onChange({ ...step, softLimitSec: v || undefined })} placeholder="none" />
+          </Field>
         </div>
       </FormSection>
+
+      <AssistanceEditor step={step} onChange={onChange} />
 
       <FormSection title={<HiddenLabel>Success</HiddenLabel>} description="Never read to the participant. Used by the moderator to know when the task is done, and by analytics.">
         <Field label="Success criteria">
@@ -250,6 +269,39 @@ function TaskEditor({ step, onChange }: { step: TaskStep; onChange: (s: Step) =>
         </FieldGroup>
       </FormSection>
     </div>
+  );
+}
+
+function AssistanceEditor({ step, onChange }: { step: TaskStep; onChange: (s: Step) => void }) {
+  const a = step.assistance;
+  const set = (patch: Partial<NonNullable<TaskStep['assistance']>>) => {
+    const next = { generalPrompts: [], ...a, ...patch };
+    // a freshly added (still empty) prompt row keeps the block; removing everything clears it
+    const empty = next.generalPrompts.length === 0 && !next.directCue;
+    onChange({ ...step, assistance: empty ? undefined : next });
+  };
+  return (
+    <FormSection
+      title="Assistance"
+      description="Standard hints for a participant who seems stuck: not talking, no clicks or page changes for 15 seconds. General prompts score the task 1; a direct cue scores it 0."
+    >
+      <FieldGroup label={<SpokenLabel>General prompts</SpokenLabel>} hint="Said verbatim, one at a time, in this order.">
+        <StringListEditor numbered items={a?.generalPrompts ?? []} onChange={(generalPrompts) => set({ generalPrompts })} placeholder="e.g. What are you looking for right now?" addLabel="Add prompt" />
+      </FieldGroup>
+      {!!a?.generalPrompts.length && (
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="First prompt after" hint="Task time before any help.">
+            <NumberInput value={a.firstAfterSec} min={0} step={10} suffix="sec" onChange={(v) => set({ firstAfterSec: v })} placeholder="60" />
+          </Field>
+          <Field label="Then every" hint="Further stuck time before the next prompt.">
+            <NumberInput value={a.gapSec} min={5} step={5} suffix="sec" onChange={(v) => set({ gapSec: v })} placeholder="30" />
+          </Field>
+        </div>
+      )}
+      <Field label={<HiddenLabel>Direct cue</HiddenLabel>} hint="Last resort, after every general prompt. Leave empty to never give one.">
+        <Textarea rows={2} value={a?.directCue ?? ''} onChange={(e) => set({ directCue: e.target.value || undefined })} placeholder="e.g. Try the category labels above the posts on the right." />
+      </Field>
+    </FormSection>
   );
 }
 
@@ -322,6 +374,12 @@ function InterviewEditor({ step, onChange }: { step: InterviewStep; onChange: (s
       <Field label="Follow-ups per question" hint="Overrides the protocol-wide probe limit for this block." className="max-w-xs">
         <NumberInput value={step.maxFollowUps} min={0} max={10} onChange={(v) => onChange({ ...step, maxFollowUps: v })} placeholder="default" />
       </Field>
+      <Toggle checked={!!step.showApp} onChange={(v) => onChange({ ...step, showApp: v })} label="Show the app during this block" description='For questions about what is on screen, e.g. "What do you think this page is for?"' />
+      {step.showApp && (
+        <Field label="Start page" hint="App path loaded when the block starts. Leave empty to keep the current page." className="max-w-xs">
+          <Input className="font-mono text-xs" value={step.startPath ?? ''} onChange={(e) => onChange({ ...step, startPath: e.target.value || undefined })} placeholder="/" />
+        </Field>
+      )}
     </FormSection>
   );
 }

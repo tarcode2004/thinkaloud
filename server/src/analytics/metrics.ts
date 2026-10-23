@@ -2,6 +2,8 @@
 // Statistical choices follow Sauro & Lewis (see docs/RESEARCH.md §3 and stats.ts).
 import type {
   Answer,
+  AssistanceSummary,
+  CompletionScore,
   ComparisonResult,
   InstrumentId,
   Interval,
@@ -14,7 +16,7 @@ import type {
   Variant,
   VariantMetrics,
 } from '@thinkaloud/shared';
-import { INSTRUMENTS } from '@thinkaloud/shared';
+import { INSTRUMENTS, completionScore } from '@thinkaloud/shared';
 import * as S from './stats.ts';
 import { loadAnswers, loadMetricEvents, loadProtocols, loadSessions, loadTaskResults, loadVariants, type LoadedSession } from './data.ts';
 
@@ -28,8 +30,22 @@ export interface TaskMetricsX extends TaskMetrics {
   timeAllMs: Interval | null;
   /** Successful attempt durations (ms) — for distribution charts. */
   successTimesMs: number[];
-  /** All attempts (ms + outcome). */
-  attempts: { sessionId: string; ms: number; outcome: TaskOutcome }[];
+  /** All attempts (ms + outcome, 2/1/0 completion score, assistance, first action, backtracks). */
+  attempts: {
+    sessionId: string;
+    ms: number;
+    outcome: TaskOutcome;
+    score: CompletionScore;
+    assistance: AssistanceSummary;
+    firstAction: string | null;
+    backtracks: number | null;
+  }[];
+  /** Attempts per completion score (2 independent, 1 after general prompts, 0 direct cue / fail). */
+  scoreCounts: Record<'0' | '1' | '2', number>;
+  medianScore: number | null;
+  /** Attempts in which any assistance was given (general prompts / a direct cue). */
+  assistedGeneral: number;
+  assistedDirect: number;
   seqValues: number[];
   /** Median time from task start to first click (ms). */
   medianFirstClickMs: number | null;
@@ -145,6 +161,8 @@ interface TaskBehaviour {
   rage: number;
   errors: number;
   firstClickMs: number | null;
+  /** The first click (its label) or navigation after the task started. */
+  firstAction: string | null;
   lostness: number | null;
   backtracks: number;
   hasApp: boolean;
@@ -161,7 +179,16 @@ export function taskBehaviour(events: SessionEvent[], stepId: string, optimal: n
   let rage = 0;
   let errors = 0;
   let firstClickMs: number | null = null;
+  let firstAction: string | null = null;
   for (const e of inTask) {
+    if (startT != null && e.t >= startT && firstAction == null) {
+      // a navigation within 3 s of task start is the startPath load, not the participant
+      if (e.kind === 'app.click') {
+        const el = (e.data.el ?? {}) as { text?: string; ariaLabel?: string; selector?: string };
+        firstAction = `Clicked "${(el.text || el.ariaLabel || el.selector || '?').trim().slice(0, 60)}"`;
+      } else if (e.kind === 'app.navigate' && e.t - startT > 3000) firstAction = `Went to ${normPath(e.data.path)}`;
+      else if (e.kind === 'app.input') firstAction = 'Typed in a field';
+    }
     if (e.kind === 'app.click') {
       clicks++;
       if (firstClickMs == null && startT != null) firstClickMs = Math.max(0, e.t - startT);
@@ -188,7 +215,7 @@ export function taskBehaviour(events: SessionEvent[], stepId: string, optimal: n
     seen.add(p);
   }
   const lost = optimal && seq.length ? S.lostness(seq.length, seen.size, optimal) : null;
-  return { clicks, dead, rage, errors, firstClickMs, lostness: lost, backtracks, hasApp };
+  return { clicks, dead, rage, errors, firstClickMs, firstAction, lostness: lost, backtracks, hasApp };
 }
 
 function round(v: number | null | undefined, d = 4) {
@@ -225,10 +252,19 @@ function taskMetrics(
     if (seqA) seq.push(seqA.value!);
     if (!r) continue;
     outcomes[r.outcome] = (outcomes[r.outcome] ?? 0) + 1;
-    attempts.push({ sessionId: s.session.id, ms: r.durationMs, outcome: r.outcome });
     if (r.outcome === 'success' && r.durationMs > 0) succ.push(r.durationMs);
     const evs = events.get(s.session.id) ?? [];
     const b = taskBehaviour(evs, step.stepId, step.optimal);
+    const assistance = r.assistance ?? { general: 0, direct: 0 };
+    attempts.push({
+      sessionId: s.session.id,
+      ms: r.durationMs,
+      outcome: r.outcome,
+      score: r.completionScore ?? completionScore(r.outcome, assistance),
+      assistance,
+      firstAction: b.firstAction,
+      backtracks: b.hasApp ? b.backtracks : null,
+    });
     if (b.hasApp) {
       clicks.push(b.clicks);
       dead.push(b.dead);
@@ -241,6 +277,7 @@ function taskMetrics(
     errors += b.errors;
   }
   const n = attempts.length;
+  const scores = attempts.map((a) => a.score);
   return {
     stepId: step.stepId,
     title: step.title,
@@ -267,6 +304,10 @@ function taskMetrics(
     optimalPathLength: step.optimal,
     medianFirstClickMs: firstClicks.length ? S.median(firstClicks) : null,
     avgBacktracks: backtracks.length ? round(S.mean(backtracks), 2) : null,
+    scoreCounts: { '0': scores.filter((x) => x === 0).length, '1': scores.filter((x) => x === 1).length, '2': scores.filter((x) => x === 2).length },
+    medianScore: scores.length ? S.median(scores) : null,
+    assistedGeneral: attempts.filter((a) => a.assistance.general > 0 && !a.assistance.direct).length,
+    assistedDirect: attempts.filter((a) => a.assistance.direct > 0).length,
   };
 }
 

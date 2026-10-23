@@ -40,6 +40,8 @@ export const MOCK_REALTIME = () => {
     active: null as null | { id: string; done: boolean },
     oobLive: new Map<string, ReturnType<typeof setTimeout>>(),
     playing: null as null | { rid: string; timer: ReturnType<typeof setTimeout> },
+    /** An assistance prompt the system told the model to say ([ASSIST] item or a tool's say_verbatim). */
+    pendingSay: null as null | string,
   };
   const sent: Ev[] = [];
   const emit = (ev: Ev) => {
@@ -91,6 +93,11 @@ export const MOCK_REALTIME = () => {
   function policy(rid: string) {
     const b = (st.brief ?? {}) as { step?: { type?: string }; say_verbatim?: string; question?: { question_id: string } };
     const userSinceSaid = st.lastUserAt > st.lastSaidAt;
+    if (st.pendingSay) {
+      const t = st.pendingSay;
+      st.pendingSay = null;
+      return speak(rid, t);
+    }
     if (b.step?.type === 'intro' && userSinceSaid) return call(rid, 'complete_step', { summary: 'The participant is ready.' });
     if (b.question && userSinceSaid) {
       const t = st.lastUser;
@@ -161,7 +168,11 @@ export const MOCK_REALTIME = () => {
       }
       case 'conversation.item.create': {
         const item = ev.item as { type: string; role?: string; content?: { text?: string }[]; output?: string };
-        if (item.type === 'message' && item.role === 'system') parseBrief(item.content?.[0]?.text ?? '');
+        if (item.type === 'message' && item.role === 'system') {
+          const text = item.content?.[0]?.text ?? '';
+          parseBrief(text);
+          if (text.startsWith('[ASSIST]')) st.pendingSay = /"([^"]+)"/.exec(text)?.[1] ?? null;
+        }
         if (item.type === 'message' && item.role === 'user') {
           st.lastUser = item.content?.[0]?.text ?? '';
           st.lastUserAt = Date.now();
@@ -171,6 +182,7 @@ export const MOCK_REALTIME = () => {
             const o = JSON.parse(item.output ?? '{}');
             if (o && o.step) st.brief = o;
             else if (o?.current?.step) st.brief = o.current;
+            else if (o?.say_verbatim) st.pendingSay = o.say_verbatim;
           } catch {
             /* ignore */
           }

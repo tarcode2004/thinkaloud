@@ -91,3 +91,16 @@ test('structural errors are rejected', () => {
   assert.equal(ProtocolSchema.safeParse('x').success, false);
   assert.throws(() => normalizeProtocol({ steps: [{ type: 'questionnaire', instrument: 'XYZ' }] }));
 });
+
+test('assistance ladder, soft limit and app-visible interview steps round-trip', () => {
+  const p = starterProtocol('Acme Shop');
+  p.steps = [
+    { id: 'look', type: 'instruction', title: 'Look', script: 'Take a look.', showApp: true, exploreSeconds: 30, startPath: '/ChineseEVs' },
+    { id: 'mm', type: 'interview', title: 'Mental model', goal: 'g', questions: ['What do you think this page is for?'], showApp: true, startPath: '/ChineseEVs' },
+    {
+      id: 't1', type: 'task', title: 'T1', instruction: 'Do it.', successCriteria: 's', successRules: [], probes: [], timeLimitSec: 300, softLimitSec: 120,
+      assistance: { generalPrompts: ['What are you looking for right now?', 'What on the page might help?'], firstAfterSec: 60, gapSec: 30, directCue: 'Try the filters.' },
+    },
+  ];
+  assert.deepEqual(normalizeProtocol(p).steps, JSON.parse(JSON.stringify(p.steps)));
+});

@@ -5,3 +5,4 @@ export * from './moderator.ts';
 export * from './turns.ts';
 export * from './answers.ts';
 export * from './consent.ts';
+export * from './assistance.ts';

@@ -324,6 +324,7 @@ const KIND_LABEL: Record<string, string> = {
   answer: 'Answer',
   'moderator.probe': 'Probe',
   'moderator.nudge': 'Nudge',
+  'task.assist': 'Assistance',
   'moderator.tool': 'Moderator tool',
   'session.start': 'Session start',
   'session.end': 'Session end',
@@ -341,6 +342,7 @@ const KIND_COLOR: Record<string, string> = {
   'task.end': '#0071e3',
   'moderator.probe': '#5ac8fa',
   'moderator.nudge': '#a2a2f0',
+  'task.assist': '#ff9f0a',
 };
 
 function describe(e: SessionEvent, steps: Map<string, Step>): string {
@@ -373,6 +375,8 @@ function describe(e: SessionEvent, steps: Map<string, Step>): string {
     case 'moderator.probe':
     case 'moderator.nudge':
       return String(d.text ?? '');
+    case 'task.assist':
+      return `${d.level === 'direct' ? 'Direct cue' : 'General prompt'}: “${String(d.text ?? '').slice(0, 80)}”`;
     default:
       return '';
   }
@@ -534,6 +538,8 @@ function StepsPanel({ d, c, onChanged }: { d: Detail; c: PlayerClock; onChanged:
                   {t != null ? ` · ${clock(t)}` : ' · not reached'}
                   {r && ` · ${secs(r.durationMs)}`}
                   {seq != null && ` · SEQ ${seq}/7`}
+                  {r?.completionScore != null && ` · Score ${r.completionScore}`}
+                  {r?.assistance && (r.assistance.general || r.assistance.direct) ? ` (${assistText(r.assistance)})` : ''}
                 </div>
               </button>
               {isTask && (
@@ -581,6 +587,13 @@ function StepsPanel({ d, c, onChanged }: { d: Detail; c: PlayerClock; onChanged:
       )}
     </Panel>
   );
+}
+
+function assistText(a: { general: number; direct: number }) {
+  const parts = [];
+  if (a.general) parts.push(`${a.general} general prompt${a.general > 1 ? 's' : ''}`);
+  if (a.direct) parts.push('direct cue');
+  return parts.join(' + ');
 }
 
 function stepKind(s: Step) {

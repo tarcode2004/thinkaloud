@@ -371,15 +371,17 @@ function TaskTable({ a }: { a: StudyAnalyticsX }) {
     <section>
       <SectionTitle
         title="Tasks"
-        caption="Success uses adjusted-Wald intervals; partial counts as not successful. Time is the geometric mean of successful attempts. Lostness (Smith 1996): below 0.4 not lost, above 0.5 lost."
+        caption="Success uses adjusted-Wald intervals; partial counts as not successful. Completion counts attempts scored 2 (independent), 1 (after general prompts) and 0 (direct cue, gave up or failed). Time is the geometric mean of successful attempts. Lostness (Smith 1996): below 0.4 not lost, above 0.5 lost."
       />
       <Panel className="overflow-x-auto">
-        <table className="w-full min-w-[1040px] border-collapse text-[13px]">
+        <table className="w-full min-w-[1240px] border-collapse text-[13px]">
           <thead>
             <tr className="border-b border-separator text-left">
               <th className={cn(head, 'pl-6')}>Task</th>
               <th className={head}>Success</th>
               <th className={head}>Outcomes</th>
+              <th className={head} title="Attempts scored 2 · 1 · 0, and the median score">Completion</th>
+              <th className={cn(head, 'text-right')} title="Attempts that got general prompts / a direct cue">Assisted</th>
               <th className={cn(head, 'text-right')}>Time</th>
               <th className={cn(head, 'text-right')}>Median</th>
               <th className={cn(head, 'text-right')}>SEQ</th>
@@ -387,6 +389,7 @@ function TaskTable({ a }: { a: StudyAnalyticsX }) {
               <th className={cn(head, 'text-right')} title="Clicks that changed nothing (dead clicks)">Misclicks</th>
               <th className={cn(head, 'text-right')}>Rage</th>
               <th className={cn(head, 'text-right')}>Errors</th>
+              <th className={cn(head, 'text-right')} title="Mean revisits to an already-seen page per attempt">Backtracks</th>
               <th className={cn(head, 'pr-6 text-right')}>Lostness</th>
             </tr>
           </thead>
@@ -394,7 +397,7 @@ function TaskTable({ a }: { a: StudyAnalyticsX }) {
             {a.tasks.map((t) => (
               <Fragment key={t.stepId}>
                 <tr>
-                  <td colSpan={11} className="px-6 pb-1 pt-4 text-[13px] font-semibold text-label">
+                  <td colSpan={14} className="px-6 pb-1 pt-4 text-[13px] font-semibold text-label">
                     {t.title}
                   </td>
                 </tr>
@@ -423,6 +426,26 @@ function TaskTable({ a }: { a: StudyAnalyticsX }) {
                       <td className="px-2 py-2">
                         <OutcomeBar outcomes={m.outcomes} width={72} />
                       </td>
+                      <td className="whitespace-nowrap px-2 py-2 tabular-nums" title="2 independent · 1 after general prompts · 0 direct cue, gave up or failed">
+                        {m.n ? (
+                          <>
+                            <span className="text-label">
+                              {m.scoreCounts['2']}
+                              <span className="text-tertiary"> · </span>
+                              {m.scoreCounts['1']}
+                              <span className="text-tertiary"> · </span>
+                              {m.scoreCounts['0']}
+                            </span>
+                            <span className="block text-[11px] text-tertiary">median {num(m.medianScore)}</span>
+                          </>
+                        ) : (
+                          <span className="text-tertiary">—</span>
+                        )}
+                      </td>
+                      <td className={cn('whitespace-nowrap px-2 py-2 text-right tabular-nums', m.assistedGeneral + m.assistedDirect ? 'text-label' : 'text-tertiary')}>
+                        {m.assistedGeneral + m.assistedDirect}
+                        {m.assistedDirect > 0 && <span className="block text-[11px] text-tertiary">{m.assistedDirect} direct</span>}
+                      </td>
                       <td className="whitespace-nowrap px-2 py-2 text-right tabular-nums text-label" title={m.timeOnTaskMs ? `${secs(m.timeOnTaskMs.low)}–${secs(m.timeOnTaskMs.high)}` : ''}>
                         {secs(m.timeOnTaskMs?.estimate)}
                         {m.timeOnTaskMs && <span className="block text-[11px] text-tertiary">{secs(m.timeOnTaskMs.low)}–{secs(m.timeOnTaskMs.high)}</span>}
@@ -436,6 +459,7 @@ function TaskTable({ a }: { a: StudyAnalyticsX }) {
                       <td className="px-2 py-2 text-right tabular-nums text-secondary">{num(m.avgMisclicks)}</td>
                       <td className={cn('px-2 py-2 text-right tabular-nums', m.rageClicks ? 'text-label' : 'text-tertiary')}>{m.rageClicks}</td>
                       <td className={cn('px-2 py-2 text-right tabular-nums', m.errors ? 'text-label' : 'text-tertiary')}>{m.errors}</td>
+                      <td className="px-2 py-2 text-right tabular-nums text-secondary">{num(m.avgBacktracks)}</td>
                       <td className="py-2 pl-2 pr-6 text-right tabular-nums text-secondary" title={m.optimalPathLength ? `Optimal path: ${m.optimalPathLength} pages` : 'Set an optimal path length on the task to compute lostness'}>
                         {m.lostness != null ? m.lostness.toFixed(2) : '—'}
                         {m.lostness != null && <span className="block text-[11px] text-tertiary">{lostnessLabel(m.lostness)}</span>}

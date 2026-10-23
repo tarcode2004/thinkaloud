@@ -157,6 +157,8 @@ export function taskResultFromRow(r: Row): TaskResult {
     endedAt: Number(r.ended_at),
     durationMs: Number(r.duration_ms),
     evidence: optStr(r.evidence),
+    ...(r.completion_score != null ? { completionScore: Number(r.completion_score) as TaskResult['completionScore'] } : {}),
+    ...(r.assistance ? { assistance: json.parse<NonNullable<TaskResult['assistance']>>(r.assistance, { general: 0, direct: 0 }) } : {}),
   };
 }
 

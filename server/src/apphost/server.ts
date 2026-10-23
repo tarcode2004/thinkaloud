@@ -307,7 +307,7 @@ const HOP_HEADERS = new Set([
   'strict-transport-security', 'set-cookie', 'alt-svc', 'cross-origin-opener-policy', 'cross-origin-embedder-policy', 'cross-origin-resource-policy',
 ]);
 
-async function proxyExternal(app: AppRow, urlPath: string, search: string, req: Request, res: Response) {
+async function proxyExternal(app: AppRow, urlPath: string, search: string, req: Request, res: Response, stripPrefixOf?: string) {
   const target = new URL(String(app.source_url));
   const upstream = new URL(urlPath + search, target.origin);
   const selfBase = hostedAppBase(app.id as string).replace(/\/$/, '');
@@ -383,7 +383,7 @@ async function proxyExternal(app: AppRow, urlPath: string, search: string, req: 
     html = html.replace(/<meta[^>]+http-equiv=["']?(content-security-policy|x-frame-options)["']?[^>]*>/gi, '');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Content-Type', ct);
-    res.send(injectProbe(html));
+    res.send(withPrefixStrip(injectProbe(html), stripPrefixOf));
     return;
   }
   if (req.method === 'HEAD') {
@@ -402,7 +402,7 @@ function notHosted(res: Response, msg = 'There is no app at this address.') {
 function serveApp(app: AppRow, urlPath: string, search: string, req: Request, res: Response, stripPrefixOf?: string) {
   if (app.source_kind === 'url') {
     if (!readMeta(app.id as string).proxy) return notHosted(res, 'This app is an external URL and is not proxied.');
-    return proxyExternal(app, urlPath, search, req, res);
+    return proxyExternal(app, urlPath, search, req, res, stripPrefixOf);
   }
   if (app.status === 'ready' && readMeta(app.id as string).server) {
     return proxyServerApp(app.id as string, urlPath, search, req, res, {

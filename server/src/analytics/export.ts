@@ -1,10 +1,10 @@
 // CSV / JSON export of sessions, tasks, answers and events.
 import type { Step } from '@thinkaloud/shared';
-import { stepQuestions } from '@thinkaloud/shared';
+import { completionScore, stepQuestions } from '@thinkaloud/shared';
 import { db } from '../db.ts';
 import { eventFromRow, type Row } from '../lib/repo.ts';
-import { loadAnswers, loadSessions, loadTaskResults, loadVariants } from './data.ts';
-import { scoreSession, sessionDurationMs } from './metrics.ts';
+import { loadAnswers, loadMetricEvents, loadSessions, loadTaskResults, loadVariants } from './data.ts';
+import { scoreSession, sessionDurationMs, taskBehaviour } from './metrics.ts';
 import { loadConsentForm } from '../routes/consent.ts';
 import type { ParticipantFieldSnapshot, ParticipantValue } from '@thinkaloud/shared';
 
@@ -112,10 +112,15 @@ export function exportRows(studyId: string, table: ExportTable, opts: { includeP
       });
     }
   } else if (table === 'tasks') {
+    const events = loadMetricEvents(studyId);
     for (const s of sessions) {
       const { titles } = stepTitles(s.steps);
       const ans = answers.get(s.session.id) ?? [];
+      const evs = events.get(s.session.id) ?? [];
       for (const r of results.get(s.session.id) ?? []) {
+        const b = taskBehaviour(evs, r.stepId, null);
+        const assists = evs.filter((e) => e.kind === 'task.assist' && e.stepId === r.stepId);
+        const a = r.assistance ?? { general: 0, direct: 0 };
         rows.push({
           sessionId: s.session.id,
           participantCode: s.session.participantCode,
@@ -129,6 +134,14 @@ export function exportRows(studyId: string, table: ExportTable, opts: { includeP
           startedAt: iso(r.startedAt),
           endedAt: iso(r.endedAt),
           seq: ans.find((a) => a.stepId === r.stepId && a.questionId === 'seq')?.value ?? null,
+          completionScore: r.completionScore ?? completionScore(r.outcome, a),
+          assistGeneral: a.general,
+          assistDirect: a.direct,
+          assistanceGiven: assists.length
+            ? assists.map((e) => `[${Math.round(Number(e.data.atMs ?? 0) / 1000)}s ${e.data.level === 'direct' ? 'direct' : 'general'}] ${String(e.data.text ?? '')}`).join(' | ')
+            : null,
+          firstAction: b.firstAction,
+          backtracks: b.hasApp ? b.backtracks : null,
           evidence: r.evidence ?? null,
         });
       }

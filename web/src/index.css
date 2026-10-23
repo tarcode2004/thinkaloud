@@ -56,6 +56,7 @@ body { @apply bg-canvas text-label antialiased; font-feature-settings: 'ss01', '
 @keyframes ta-bar { 0%,100% { transform: scaleY(.35) } 50% { transform: scaleY(1) } }
 @keyframes ta-toast { 0% { opacity: 0; transform: translateY(-6px) scale(.98) } 8%,88% { opacity: 1; transform: none } 100% { opacity: 0; transform: translateY(-4px) } }
 @keyframes ta-sheet { from { opacity: 0; transform: translateY(8px) scale(.98) } to { opacity: 1; transform: none } }
+@keyframes ta-flash { 0%, 30% { box-shadow: 0 0 0 3px rgb(0 113 227 / .28); background-color: rgb(0 113 227 / .06) } 100% { box-shadow: 0 0 0 0 rgb(0 113 227 / 0); background-color: var(--color-fill) } }
 
 /* Long-form documents participants read (consent forms): readable measure, calm rhythm. */
 .prose-doc { @apply text-[17px] leading-[1.6] text-label; }

@@ -140,6 +140,7 @@ export const METRIC_EVENT_KINDS = [
   'task.start',
   'task.end',
   'task.resume',
+  'task.assist',
   'step.enter',
   'app.navigate',
   'app.click',

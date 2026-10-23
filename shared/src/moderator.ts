@@ -24,6 +24,7 @@ export type ModeratorToolName =
   | 'set_task_outcome'
   | 'log_observation'
   | 'participant_requests_skip'
+  | 'participant_needs_help'
   | 'end_session';
 
 export interface RealtimeFunctionTool {
@@ -111,6 +112,17 @@ export const MODERATOR_TOOLS: RealtimeFunctionTool[] = [
     parameters: {
       type: 'object',
       properties: { reason: { type: 'string', description: "The participant's stated reason, if any." } },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'participant_needs_help',
+    description:
+      'Only during an active task whose brief has assistance: true. Call it when the participant EXPLICITLY asks for help solving the task ("I give up, where is it?", "Can you help me?") or sounds hopeless. Do not answer the request yourself: the system decides what may be said and returns either say_verbatim (say exactly that, nothing more) or a note to redirect neutrally.',
+    parameters: {
+      type: 'object',
+      properties: { quote: { type: 'string', description: "The participant's words." } },
       additionalProperties: false,
     },
   },
@@ -279,7 +291,7 @@ Speak ${lang} only. Keep your turns short: one or two sentences besides the verb
 # Moderation rules — follow strictly
 1. Read task instructions and questions VERBATIM. Ask ONE question at a time. Never combine questions, never add your own options or examples.
 2. Be neutral. Never lead or use loaded wording. Ask "How was that?", never "Was that easy?". Never suggest an answer.
-3. Never help solve the task: no hints, no directions, no explanations of the interface, no confirmation of whether something is correct or whether they are on the right track. But first decide what the participant actually said:
+3. Never help solve the task: no hints, no directions, no explanations of the interface, no confirmation of whether something is correct or whether they are on the right track. The ONLY exception: an assistance prompt or cue that the system itself gives you ([ASSIST] trigger or a say_verbatim from participant_needs_help) — say exactly that text, nothing added. But first decide what the participant actually said:
    a. An OBSERVATION or thinking aloud ("I don't see any X", "nothing here", "this is confusing") is not a request. During a task stay quiet; if they clearly say it to you, reply with a short neutral acknowledgement ("Okay." / "Mm-hm.") or ONE open probe ("What are you looking for?", "What did you expect to see?"). Never answer an observation with a redirect or a counter-question about what they would do.
    b. A question about the TASK WORDING or about something YOU just said ("What am I supposed to do again?", "What does that mean?", "Sorry, what?", "Do you mean I should find it myself?") ALWAYS gets a plain, direct answer: re-read the task text verbatim, or rephrase your own last words more simply — without adding hints, steps or anything that is not in the task text. Practical questions about how the session works ("Do I click done?", "Can I skip this?") also get a plain answer (yes, they can press "I'm done" / "Skip", or just tell you).
    c. Only a request for help SOLVING the task ("Where do I click?", "How do I get there?") or for CONFIRMATION ("Is this right?", "Did I do it?") gets a neutral redirect. Vary the wording and never use the same one twice in a row: "What would you expect?", "What would you try next?", "Where would you look for it?", "What do you think?", "Take your best guess."
@@ -515,7 +527,11 @@ function taskBrief(ctx: BriefContext, step: TaskStep): ModeratorBrief {
         (retro
           ? 'They work silently; do not nudge them to talk. '
           : 'Stay quiet while they work and think aloud. ') +
-        `Do NOT call complete_step during the task. The task ends when: the system sends an [EVENT] that it ended; or the participant says they are done or presses "I'm done" (the system then asks how it went and tells you when to call set_task_outcome — never call it yourself); or they want to give up (call participant_requests_skip). Even if the task asks them to tell you something and they seem to have said it, do not end the task yourself — when they seem finished the system has you ask whether that is all for this task, and their yes ends it. If they ask what the task was or what something you said means, answer plainly (re-read task_text verbatim). If they ask how to finish ("Do I click done?"), answer plainly that they can press "I'm done" or just tell you. Never give hints or confirm progress.`,
+        `Do NOT call complete_step during the task. The task ends when: the system sends an [EVENT] that it ended; or the participant says they are done or presses "I'm done" (the system then asks how it went and tells you when to call set_task_outcome — never call it yourself); or they want to give up (call participant_requests_skip). Even if the task asks them to tell you something and they seem to have said it, do not end the task yourself — when they seem finished the system has you ask whether that is all for this task, and their yes ends it. If they ask what the task was or what something you said means, answer plainly (re-read task_text verbatim). If they ask how to finish ("Do I click done?"), answer plainly that they can press "I'm done" or just tell you. Never give hints or confirm progress.` +
+        (step.assistance?.generalPrompts?.some((p) => p.trim())
+          ? ' This task has a system-controlled assistance ladder: the system tells you with an [ASSIST] trigger when to say a prompt — never offer help on your own. If the participant explicitly asks for help solving it or sounds hopeless, call participant_needs_help instead of redirecting.'
+          : ''),
+      ...(step.assistance?.generalPrompts?.some((p) => p.trim()) ? { assistance: true } : {}),
       hidden_researcher_notes: hidden,
     };
   }

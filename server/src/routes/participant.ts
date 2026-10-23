@@ -20,6 +20,7 @@ import { HttpError, parse } from '../lib/http.ts';
 import { assertParticipant } from '../lib/auth.ts';
 import { config } from '../lib/config.ts';
 import { paths } from '../lib/paths.ts';
+import { refreshCompletionScore } from '../lib/taskScore.ts';
 import { parseProtocol, sessionFromRow, sessionProtocolFromRow, variantFromRow, type Row } from '../lib/repo.ts';
 import { checkConsentSubmission, loadConsentForm, publicConsentForm, sendConsentDocument } from './consent.ts';
 import { entitlement } from '../billing/account.ts';
@@ -368,7 +369,11 @@ export function ingestEvents(sessionId: string, rawEvents: unknown[]): { accepte
         if (d.success && sid) {
           const x = d.data;
           upsertTask.run(sessionId, sid, x.outcome, x.source, Math.round(x.startedAt), Math.round(x.endedAt), Math.round(x.durationMs), x.evidence ?? null);
+          refreshCompletionScore(sessionId, sid);
         }
+      } else if (e.kind === 'task.assist') {
+        // normally precedes task.end; a late one (same batch race) still updates the score
+        if (stepId) refreshCompletionScore(sessionId, stepId);
       } else if (e.kind === 'task.resume') {
         // "Back to task" after an accidental "I'm done": the outcome is recorded again when the task ends.
         if (stepId) db.prepare('DELETE FROM task_results WHERE session_id = ? AND step_id = ?').run(sessionId, stepId);

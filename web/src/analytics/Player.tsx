@@ -387,6 +387,7 @@ const MARKERS: Record<string, { color: string; label: string }> = {
   'app.dead_click': { color: '#ffcc00', label: 'Dead click' },
   'moderator.probe': { color: '#5ac8fa', label: 'Probe' },
   'moderator.nudge': { color: '#a2a2f0', label: 'Nudge' },
+  'task.assist': { color: '#ff9f0a', label: 'Assistance' },
 };
 
 export function Timeline({ clock: c, events, steps, results, notes }: { clock: PlayerClock; events: SessionEvent[]; steps: Step[]; results: TaskResult[]; notes: Note[] }) {

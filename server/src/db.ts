@@ -209,6 +209,12 @@ const MIGRATIONS: string[] = [
   ALTER TABLE users ADD COLUMN avatar_url TEXT;            -- Google profile picture (https URL)
   CREATE UNIQUE INDEX users_google_sub ON users(google_sub); -- SQLite can't ADD COLUMN ... UNIQUE; NULLs don't collide
   `,
+  /* 8 Task assistance ladder + 2/1/0 completion score */ `
+  ALTER TABLE task_results ADD COLUMN completion_score INTEGER; -- 2 independent, 1 after general prompts, 0 direct cue / fail
+  ALTER TABLE task_results ADD COLUMN assistance TEXT;          -- JSON {general, direct}: assistance prompts given
+  UPDATE task_results SET completion_score = CASE outcome WHEN 'success' THEN 2 WHEN 'partial' THEN 1 ELSE 0 END,
+    assistance = '{"general":0,"direct":0}';
+  `,
 ];
 
 db.exec('CREATE TABLE IF NOT EXISTS _migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)');

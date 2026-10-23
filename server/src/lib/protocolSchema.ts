@@ -135,6 +135,7 @@ export const InstructionStepSchema = z.object({
   script: text().default(''),
   showApp: bool().optional(),
   exploreSeconds: num((n) => n.min(0).max(3600)).optional(),
+  startPath: text(2000).optional(),
 });
 
 export const QuestionStepSchema = z.object({
@@ -155,6 +156,15 @@ export const TaskStepSchema = z.object({
   probes: strList(30).default([]),
   postTaskQuestions: z.array(QuestionSchema).max(30).optional(),
   askSEQ: bool().optional(),
+  softLimitSec: num((n) => n.min(0).max(7200)).optional(),
+  assistance: z
+    .object({
+      generalPrompts: strList(10).default([]),
+      firstAfterSec: num((n) => n.min(0).max(3600)).optional(),
+      gapSec: num((n) => n.min(5).max(3600)).optional(),
+      directCue: text(2000).optional(),
+    })
+    .optional(),
 });
 
 const InstrumentSchema = z.preprocess(
@@ -182,6 +192,8 @@ export const InterviewStepSchema = z.object({
   goal: text().default(''),
   questions: strList(50).default([]),
   maxFollowUps: num((n) => n.int().min(0).max(10)).optional(),
+  showApp: bool().optional(),
+  startPath: text(2000).optional(),
 });
 
 export const StepSchema = z.preprocess(

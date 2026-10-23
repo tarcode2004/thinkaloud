@@ -124,6 +124,8 @@ export interface InstructionStep extends StepBase {
   showApp?: boolean;
   /** Free exploration time in seconds (0 = move on once script is delivered). */
   exploreSeconds?: number;
+  /** With showApp: app path to load when the step starts (default: wherever the app is). */
+  startPath?: string;
 }
 
 export interface QuestionStep extends StepBase {
@@ -150,6 +152,36 @@ export interface TaskStep extends StepBase {
   postTaskQuestions?: Question[];
   /** Add the Single Ease Question automatically after this task. */
   askSEQ?: boolean;
+  /**
+   * Soft time limit: once reached (task still running), the moderator asks once, neutrally, whether
+   * they'd like to keep trying or move on. Keeping going runs on to `timeLimitSec` (the hard limit).
+   */
+  softLimitSec?: number;
+  /** Graded assistance ladder for a participant who seems stuck (see TaskAssistance). */
+  assistance?: TaskAssistance;
+}
+
+/**
+ * Standard hints for a stuck participant, in escalating order. After `firstAfterSec` of task time
+ * (default 60) with the participant stuck (silent, no recent app navigation, no success), the
+ * moderator says generalPrompts[0] verbatim; each further `gapSec` (default 30) of being stuck,
+ * the next prompt. Only after the prompts are exhausted (or an explicit plea for help) may it give
+ * the direct cue. General prompts score the task 1, a direct cue 0 (see completionScore).
+ */
+export interface TaskAssistance {
+  generalPrompts: string[];
+  firstAfterSec?: number;
+  gapSec?: number;
+  /** Hidden: what a last-resort direct cue may say (kept minimal). Without it, no direct cue is given. */
+  directCue?: string;
+}
+
+/** 2 = independent, 1 = completed after only general prompts, 0 = direct cue, abandoned or failed. */
+export type CompletionScore = 0 | 1 | 2;
+
+export interface AssistanceSummary {
+  general: number;
+  direct: number;
 }
 
 export type InstrumentId = 'SUS' | 'UMUX_LITE' | 'SEQ' | 'NASA_TLX' | 'NPS';
@@ -173,6 +205,10 @@ export interface InterviewStep extends StepBase {
   questions: string[];
   /** Max AI follow-ups per question (overrides moderation.maxProbesPerStep). */
   maxFollowUps?: number;
+  /** Keep the app visible while the questions are asked (e.g. "What do you think this page is for?"). */
+  showApp?: boolean;
+  /** With showApp: app path to load when the step starts (default: wherever the app is). */
+  startPath?: string;
 }
 
 export type Step = InstructionStep | QuestionStep | TaskStep | QuestionnaireStep | InterviewStep;
@@ -361,6 +397,9 @@ export interface TaskResult {
   endedAt: Millis;
   durationMs: number;
   evidence?: string;
+  /** Derived from the outcome and the task.assist events (see completionScore). */
+  completionScore?: CompletionScore;
+  assistance?: AssistanceSummary;
 }
 
 export interface Answer {
@@ -391,7 +430,7 @@ export type EventKind =
   // media: data { t } = session-clock time the recording started (audio files are aligned to this)
   | 'media.audio_start' | 'eyetracking.calibrated'
   // protocol
-  | 'step.enter' | 'step.exit' | 'task.start' | 'task.end' | 'task.resume' | 'answer'
+  | 'step.enter' | 'step.exit' | 'task.start' | 'task.end' | 'task.resume' | 'task.assist' | 'answer'
   // conversation
   | 'transcript.participant' | 'transcript.moderator' | 'moderator.tool' | 'moderator.probe' | 'moderator.nudge'
   | 'speech.start' | 'speech.stop'

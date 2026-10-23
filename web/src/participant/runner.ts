@@ -22,8 +22,10 @@ import {
   ANSWER_SILENCE_MS,
   WRAP_SILENCE_MS,
   MODERATOR_TOOLS,
+  nextAssistance,
   questionnaireOnScreen,
   stepQuestions,
+  type AssistAction,
   type BriefContext,
   type ConsentRecord,
   type ElementDescriptor,
@@ -258,6 +260,11 @@ export class SessionRunner {
   private lastTrigger = 0;
   private nudgesThisTask = 0;
   private checkInDone = false;
+  // Assistance ladder of the current task (TaskStep.assistance) and its soft time limit.
+  private assistGeneral = 0;
+  private assistDirect = false;
+  private lastAssistTaskMs: number | null = null;
+  private taskActivatedPerf = 0;
   /** Last click / navigation / typing in the app (performance.now). */
   private lastInteraction = 0;
   private lastAppAction = 0;
@@ -387,6 +394,16 @@ export class SessionRunner {
   private set(patch: Partial<RunnerState>) {
     this.state = { ...this.state, ...patch };
     for (const l of this.listeners) l();
+  }
+
+  /** Participant-safe outline of the session in its order: titles and kinds only, no hidden notes. */
+  get outline(): { id: string; title: string; type: Step['type'] }[] {
+    return this.steps.map((st) => ({ id: st.id, title: st.title, type: st.type }));
+  }
+
+  /** Webcam eye tracking is running in this session. */
+  get eyeTracking() {
+    return Boolean(this.opts.eye);
   }
 
   get protocol() {
@@ -1004,6 +1021,9 @@ Reply with exactly one word: YES or NO.`;
     this.doneRequested = false;
     this.nudgesThisTask = 0;
     this.checkInDone = false;
+    this.assistGeneral = 0;
+    this.assistDirect = false;
+    this.lastAssistTaskMs = null;
     this.observed = new Map();
     this.behaviourProbeAsked = false;
     this.endWrap();
@@ -1021,7 +1041,7 @@ Reply with exactly one word: YES or NO.`;
     // Anything said before this step's first moderator line is not a reply to it.
     this.resetTurn();
     this.queue.stepId = step?.id ?? (index < 0 ? 'intro' : 'closing');
-    const showApp = Boolean(step && this.opts.start.appUrl && (step.type === 'task' || (step.type === 'instruction' && step.showApp)));
+    const showApp = Boolean(step && this.opts.start.appUrl && (step.type === 'task' || ((step.type === 'instruction' || step.type === 'interview') && step.showApp)));
     this.set({
       index,
       step,
@@ -1044,6 +1064,7 @@ Reply with exactly one word: YES or NO.`;
       // Task becomes active when the moderator finished reading it, on first interaction, or after 25s.
       this.taskActivateTimer = setTimeout(() => this.activateTask('timeout'), this.state.mode === 'manual' ? 0 : 25_000);
     }
+    if (showApp && (step?.type === 'instruction' || step?.type === 'interview') && step.startPath?.trim()) this.navigateApp(step.startPath.trim());
     if (step?.type === 'instruction' && (step.exploreSeconds ?? 0) > 0 && this.state.mode === 'manual') this.startExplore();
     this.updateCard();
     this.applyTurnDetection();
@@ -1192,6 +1213,7 @@ Reply with exactly one word: YES or NO.`;
     this.taskWallStart = Date.now();
     const deadline = s.timeLimitSec ? this.taskWallStart + s.timeLimitSec * 1000 : null;
     this.set({ taskPhase: 'active', taskStartedAt: this.taskWallStart, taskDeadline: deadline });
+    this.taskActivatedPerf = performance.now();
     this.lastUserSpeech = Math.max(this.lastUserSpeech, performance.now());
     this.queue.push('task.start', { startedAt: this.taskWallStart, timeLimitSec: s.timeLimitSec ?? null, startPath: s.startPath ?? null, trigger: reason });
     this.applyTurnDetection();
@@ -1619,6 +1641,25 @@ Reply with exactly one word: YES or NO.`;
         }
         if (s?.type === 'task') return { output: { ...this.brief(), ignored: true, note: 'Nothing to skip: the task has already ended. Continue with this brief.' }, respond: true };
         return this.err('There is nothing to skip right now.');
+      }
+
+      case 'participant_needs_help': {
+        if (s?.type !== 'task' || this.state.taskPhase !== 'active' || !s.assistance) {
+          return { output: { ok: true, note: 'No assistance is available here. Redirect neutrally with ONE short open question ("What would you try?") or remind them once that they can skip. No hints.' }, respond: true };
+        }
+        const a = this.dueAssistance(true);
+        if (!a) {
+          return { output: { ok: true, note: 'Not now. Redirect neutrally with ONE short open question such as "What would you try?" or "Where would you look for it?" — no hints, no directions.' }, respond: true };
+        }
+        this.recordAssist(a, 'help_request');
+        return {
+          output: {
+            ok: true,
+            say_verbatim: a.text,
+            note: a.level === 'direct' ? 'This is the direct cue: say it in one short sentence, adding nothing, then let them work.' : 'Say exactly this and nothing more, then let them work.',
+          },
+          respond: true,
+        };
       }
 
       case 'end_session': {
@@ -2403,7 +2444,79 @@ Reply with exactly one word: YES or NO.`;
       this.reportCrash('heartbeat lost');
     }
     this.maybeAnnounceCrash();
+    this.maybeSoftLimit();
+    this.maybeAssist();
     this.maybeNudge();
+  }
+
+  /** Task time so far (ms), while a task is active. */
+  private taskElapsedMs() {
+    return Date.now() - this.taskWallStart;
+  }
+
+  private dueAssistance(helpRequested: boolean): AssistAction | null {
+    const s = this.step;
+    if (s?.type !== 'task' || this.state.taskPhase !== 'active') return null;
+    return nextAssistance(s.assistance, {
+      elapsedMs: this.taskElapsedMs(),
+      // speech doesn't count: someone narrating "I can't find it" is still stuck
+      idleMs: performance.now() - Math.max(this.lastInteraction, this.taskActivatedPerf),
+      generalGiven: this.assistGeneral,
+      directGiven: this.assistDirect,
+      lastAssistMs: this.lastAssistTaskMs,
+      helpRequested,
+    });
+  }
+
+  private recordAssist(a: AssistAction, via: 'stuck' | 'help_request') {
+    if (a.level === 'direct') this.assistDirect = true;
+    else this.assistGeneral++;
+    this.lastAssistTaskMs = this.taskElapsedMs();
+    this.lastTrigger = performance.now();
+    this.queue.push('task.assist', { stepId: this.step?.id ?? null, level: a.level, text: a.text, atMs: this.lastAssistTaskMs, via });
+  }
+
+  /**
+   * Assistance ladder: a stuck participant (no click/navigation for a while, not talking, task not
+   * done) gets the researcher's general prompts verbatim, one per gap, then — only after those —
+   * the direct cue. Each is recorded as task.assist and lowers the completion score.
+   */
+  private maybeAssist() {
+    const s = this.step;
+    const rt = this.rt;
+    if (!rt || this.state.mode === 'manual' || s?.type !== 'task' || !s.assistance || this.state.taskPhase !== 'active' || this.doneRequested || this.wrap) return;
+    if (this.state.muted || this.someoneTalking() || this.state.appStatus === 'crashed' || performance.now() - this.lastUserSpeech < 1500) return;
+    if (!this.dueAssistance(false)) return;
+    this.nudgeWhenSilent(() => {
+      const a = this.dueAssistance(false);
+      if (!a || this.wrap) return;
+      this.recordAssist(a, 'stuck');
+      rt.addSystemItem(
+        a.level === 'general'
+          ? `[ASSIST] The participant seems stuck on this task. Say exactly this, in ${languageName(this.mod.language)}, and nothing before or after it: "${a.text}" Then stay quiet and let them work.`
+          : `[ASSIST] The participant is still stuck after the general prompts. Give this direct cue in ONE short sentence in ${languageName(this.mod.language)}, as close to verbatim as possible and adding nothing: "${a.text}" Then stay quiet and let them work.`,
+      );
+      rt.requestResponse(undefined, undefined, undefined, true);
+    });
+  }
+
+  /** Soft time limit: ask once whether to keep trying or move on; keeping going runs on to the hard limit. */
+  private maybeSoftLimit() {
+    const s = this.step;
+    const rt = this.rt;
+    if (!rt || this.state.mode === 'manual' || s?.type !== 'task' || !s.softLimitSec || this.state.taskPhase !== 'active' || this.doneRequested || this.wrap || this.checkInDone) return;
+    if (s.timeLimitSec && s.softLimitSec >= s.timeLimitSec) return;
+    if (this.taskElapsedMs() < s.softLimitSec * 1000 || this.someoneTalking() || this.state.appStatus === 'crashed') return;
+    this.nudgeWhenSilent(() => {
+      if (this.checkInDone || this.wrap) return;
+      this.checkInDone = true; // the one "keep going or move on?" check-in of this task
+      this.lastTrigger = performance.now();
+      this.queue.push('moderator.nudge', { kind: 'soft_limit', elapsedSec: Math.round(this.taskElapsedMs() / 1000) });
+      rt.addSystemItem(
+        `[TRIGGER] This task has been running for ${Math.round(s.softLimitSec! / 60 * 10) / 10} minutes. Ask ONCE, neutrally and briefly, in ${languageName(this.mod.language)}, whether they would like to keep trying or move on (e.g. "Would you like to keep trying, or move on to the next part?"). No hints, no judgement, never imply they are slow. If they want to move on, call participant_requests_skip. If they want to keep going, say only "Okay." and stay quiet.`,
+      );
+      rt.requestResponse(undefined, undefined, undefined, true);
+    });
   }
 
   private someoneTalking() {

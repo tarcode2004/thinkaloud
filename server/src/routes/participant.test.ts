@@ -111,7 +111,9 @@ test('ingestEvents stores events idempotently and applies side effects', () => {
   assert.deepEqual(m.ingestEvents(sid, batch), { accepted: 0, rejected: 2 }, 'resend is a no-op');
 
   const tr = (db.prepare('SELECT * FROM task_results WHERE session_id = ?').all(sid) as Row[]).map(repo.taskResultFromRow);
-  assert.deepEqual(tr, [{ sessionId: sid, stepId: 'task_1', outcome: 'success', source: 'rule', startedAt: 1000, endedAt: 6000, durationMs: 5000, evidence: 'url matched' }]);
+  assert.deepEqual(tr, [
+    { sessionId: sid, stepId: 'task_1', outcome: 'success', source: 'rule', startedAt: 1000, endedAt: 6000, durationMs: 5000, evidence: 'url matched', completionScore: 2, assistance: { general: 0, direct: 0 } },
+  ]);
 
   const answers = (db.prepare('SELECT * FROM answers WHERE session_id = ? ORDER BY at').all(sid) as Row[]).map(repo.answerFromRow);
   assert.equal(answers.length, 2);
@@ -127,6 +129,36 @@ test('ingestEvents stores events idempotently and applies side effects', () => {
   assert.equal(ev[4].stepId, null);
 });
 
+test('completion score: 2 independent, 1 after general prompts, 0 after a direct cue', () => {
+  const sid = seedSession();
+  const end = (seq: number, stepId: string, outcome = 'success') => ({
+    seq, kind: 'task.end', t: seq, at: seq, stepId, data: { outcome, source: 'ai', startedAt: 0, endedAt: seq, durationMs: seq },
+  });
+  const assist = (seq: number, stepId: string, level: 'general' | 'direct') => ({ seq, kind: 'task.assist', t: seq, at: seq, stepId, data: { stepId, level, text: 'What are you looking for right now?', atMs: 61_000 } });
+  m.ingestEvents(sid, [
+    end(1, 'a'),
+    assist(2, 'b', 'general'),
+    end(3, 'b'),
+    assist(4, 'c', 'general'),
+    assist(5, 'c', 'general'),
+    assist(6, 'c', 'direct'),
+    end(7, 'c'),
+    end(8, 'd', 'partial'),
+    end(9, 'e', 'abandoned'),
+  ]);
+  const score = (step: string) => repo.taskResultFromRow(db.prepare('SELECT * FROM task_results WHERE session_id = ? AND step_id = ?').get(sid, step) as Row);
+  assert.equal(score('a').completionScore, 2);
+  assert.equal(score('b').completionScore, 1);
+  assert.deepEqual(score('b').assistance, { general: 1, direct: 0 });
+  assert.equal(score('c').completionScore, 0);
+  assert.deepEqual(score('c').assistance, { general: 2, direct: 1 });
+  assert.equal(score('d').completionScore, 1);
+  assert.equal(score('e').completionScore, 0);
+  // an assist that arrives after the end (separate batch) still updates the score
+  m.ingestEvents(sid, [assist(10, 'a', 'general')]);
+  assert.equal(score('a').completionScore, 1);
+});
+
 test('answers are upserted; researcher task overrides are never overwritten', () => {
   const sid = seedSession();
   m.ingestEvents(sid, [{ seq: 1, kind: 'answer', t: 1, at: 1, stepId: 'q', data: { questionId: 'x', value: 2, source: 'screen' } }]);
@@ -136,7 +168,7 @@ test('answers are upserted; researcher task overrides are never overwritten', ()
   assert.deepEqual(repo.answerFromRow(a[0]).choices, ['a']);
   assert.equal(repo.answerFromRow(a[0]).value, 4);
 
-  db.prepare("INSERT INTO task_results VALUES (?, 't', 'failure', 'researcher', 1, 2, 1, NULL)").run(sid);
+  db.prepare("INSERT INTO task_results (session_id, step_id, outcome, source, started_at, ended_at, duration_ms, evidence) VALUES (?, 't', 'failure', 'researcher', 1, 2, 1, NULL)").run(sid);
   m.ingestEvents(sid, [{ seq: 3, kind: 'task.end', t: 3, at: 3, stepId: 't', data: { outcome: 'success', source: 'ai', startedAt: 1, endedAt: 3, durationMs: 2 } }]);
   const r = db.prepare('SELECT outcome, source FROM task_results WHERE session_id = ?').get(sid) as Row;
   assert.deepEqual({ ...r }, { outcome: 'failure', source: 'researcher' });

@@ -7,6 +7,7 @@ import { db, json, tx } from '../db.ts';
 import { assertChildAccess, assertStudyAccess, requireUser } from '../lib/auth.ts';
 import { HttpError, parse } from '../lib/http.ts';
 import { answerFromRow, taskResultFromRow, variantFromRow, type Row } from '../lib/repo.ts';
+import { refreshCompletionScore } from '../lib/taskScore.ts';
 import { loadNotes, loadSession, loadSessionEvents, loadSessions, loadTaskResults, loadAnswers, noteFromRow } from './data.ts';
 import { computeAnalytics, scoreSession, sessionDurationMs } from './metrics.ts';
 import { audioTracks, deleteSessionFiles, hasReplay, readPoints, readReplay, sendAudio } from './media.ts';
@@ -179,7 +180,12 @@ analyticsRouter.get('/sessions/:sid/points', requireUser, (req, res) => {
   res.json({ kind, points: readPoints(sid(req), kind) });
 });
 
-const OverrideBody = z.object({ outcome: z.enum(['success', 'partial', 'failure', 'abandoned', 'timeout']), note: z.string().max(2000).optional() });
+const OverrideBody = z.object({
+  outcome: z.enum(['success', 'partial', 'failure', 'abandoned', 'timeout']),
+  note: z.string().max(2000).optional(),
+  /** Researcher's own 2/1/0 score; omitted = derived from the outcome and the assistance given. */
+  completionScore: z.union([z.literal(0), z.literal(1), z.literal(2)]).optional(),
+});
 
 analyticsRouter.put('/sessions/:sid/tasks/:stepId', requireUser, (req, res) => {
   const row = assertChildAccess(req, 'sessions', sid(req));
@@ -205,6 +211,9 @@ analyticsRouter.put('/sessions/:sid/tasks/:stepId', requireUser, (req, res) => {
       "INSERT INTO task_results (session_id, step_id, outcome, source, started_at, ended_at, duration_ms, evidence) VALUES (?, ?, ?, 'researcher', ?, ?, ?, ?)",
     ).run(sid(req), stepId, body.outcome as TaskOutcome, startedAt, endedAt, Math.max(0, endedAt - startedAt), `Override by ${who}${body.note ? ` — ${body.note}` : ''}`);
   }
+  refreshCompletionScore(sid(req), stepId);
+  if (body.completionScore !== undefined)
+    db.prepare('UPDATE task_results SET completion_score = ? WHERE session_id = ? AND step_id = ?').run(body.completionScore, sid(req), stepId);
   const r = db.prepare('SELECT * FROM task_results WHERE session_id = ? AND step_id = ?').get(sid(req), stepId) as Row;
   res.json({ taskResult: taskResultFromRow(r) });
 });

@@ -1,7 +1,9 @@
 // Client-side mirrors of the analytics API (superset of the shared contract; see server/src/analytics/*).
 import type {
   Answer,
+  AssistanceSummary,
   ComparisonResult,
+  CompletionScore,
   EventKind,
   Insight,
   InstrumentId,
@@ -24,7 +26,19 @@ export interface TaskMetricsX extends TaskMetrics {
   partials: number;
   timeAllMs: Interval | null;
   successTimesMs: number[];
-  attempts: { sessionId: string; ms: number; outcome: TaskOutcome }[];
+  attempts: {
+    sessionId: string;
+    ms: number;
+    outcome: TaskOutcome;
+    score: CompletionScore;
+    assistance: AssistanceSummary;
+    firstAction: string | null;
+    backtracks: number | null;
+  }[];
+  scoreCounts: Record<'0' | '1' | '2', number>;
+  medianScore: number | null;
+  assistedGeneral: number;
+  assistedDirect: number;
   seqValues: number[];
   medianFirstClickMs: number | null;
   avgBacktracks: number | null;

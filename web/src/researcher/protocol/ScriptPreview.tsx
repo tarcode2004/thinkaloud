@@ -77,8 +77,19 @@ export function ScriptPreview({ p, onJump, activeId }: { p: Protocol; onJump: (i
             {s.startPath && <Act icon={<MonitorSmartphone className="size-3.5" />}>Loads {s.startPath} in the app.</Act>}
             {s.instruction ? <Say>{s.instruction}</Say> : <Act>(no instruction yet)</Act>}
             <Act icon={<Clock className="size-3.5" />}>
-              Listens while they work.{moderated && m.silencePromptSeconds ? ` After ${m.silencePromptSeconds}s of silence it nudges: “What are you thinking right now?”` : ''} It gives no hints and never confirms correctness.
+              Listens while they work.{moderated && m.silencePromptSeconds ? ` After ${m.silencePromptSeconds}s of silence it nudges: “What are you thinking right now?”` : ''} It gives no hints of its own and never confirms correctness.
             </Act>
+            {!!s.assistance?.generalPrompts.some((p) => p.trim()) && (
+              <Act icon={<Clock className="size-3.5" />}>
+                If they seem stuck after {s.assistance.firstAfterSec ?? 60}s, it says {s.assistance.generalPrompts.filter((p) => p.trim()).map((p) => `“${p}”`).join(', then ')}, {s.assistance.gapSec ?? 30}s apart
+                {s.assistance.directCue?.trim() ? `, and only then the direct cue: “${s.assistance.directCue}”` : ''}. Assisted tasks score 1, or 0 after a direct cue.
+              </Act>
+            )}
+            {!!s.softLimitSec && (
+              <Act icon={<Clock className="size-3.5" />}>
+                After {Math.round((s.softLimitSec / 60) * 10) / 10} min it asks once whether they’d like to keep trying or move on.
+              </Act>
+            )}
             <Act icon={<Flag className="size-3.5" />}>
               Task ends when {s.successRules?.length ? `${s.successRules.map(ruleText).join(' or ')}, ` : ''}the participant says they are done or presses “I’m done” (the AI then judges the success criteria), gives up{s.timeLimitSec ? `, or after ${Math.round(s.timeLimitSec / 60 * 10) / 10} min` : ''}.
             </Act>
@@ -106,6 +117,7 @@ export function ScriptPreview({ p, onJump, activeId }: { p: Protocol; onJump: (i
       case 'interview':
         return (
           <>
+            {s.showApp && <Act icon={<Eye className="size-3.5" />}>Keeps the app on screen{s.startPath ? ` (loads ${s.startPath})` : ''}.</Act>}
             {s.questions.filter(Boolean).map((q, i) => <Say key={i}>{q}</Say>)}
             {probes && <Act>Up to {s.maxFollowUps ?? m.maxProbesPerStep} follow-ups per question, reflecting the participant's own words back.</Act>}
           </>

@@ -539,23 +539,153 @@ test('M4 · status: "Listening" while they talk, "Got it" right after they stop,
 
   // Task one of two: banner + spoken number + how to finish (first task only).
   await expect(session).toHaveAttribute('data-step', 'task_a', { timeout: 20_000 });
-  await expect(page.getByTestId('task-banner')).toContainText('Task 1 of 2');
+  await expect(page.getByTestId('task-text')).toContainText('Task 1 of 2');
   await page.screenshot({ path: path.join(OUT, 'mock-task-banner.png') });
   const a = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_a' && /task one of two/i.test(String(e.data.text)), 15_000, 'task one of two');
   expect(String(a.data.text)).toMatch(/just tell me, or press I'm done/);
   await expect(page.getByTestId('step-label')).toContainText('Task 1 of 2');
   await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 20_000 });
+  // Once it has been said, the task stays in the panel in writing (no transcript needed).
+  await expect(page.getByTestId('task-text')).toHaveAttribute('data-revealed', '1');
+  await expect(page.getByTestId('task-instruction-text')).toHaveText('Find the Aurora desk lamp.');
+  await expect(page.getByTestId('panel-steps').getByTestId('panel-step').nth(0)).toHaveAttribute('data-state', 'current');
+  await expect(page.getByTestId('captions')).toHaveCount(0); // conversation collapsed by default
   await waitIdle(page);
   // During the task the dock shows the status too (quiet phase: just "Listening").
-  await expect(page.getByTestId('dock-orb')).toContainText('Listening');
+  await expect(page.getByTestId('panel-status')).toContainText('Listening');
   await page.screenshot({ path: path.join(OUT, 'mock-task-dock.png') });
 
   await page.getByTestId('skip-task').click();
   await expect(session).toHaveAttribute('data-step', 'task_b', { timeout: 20_000 });
-  await expect(page.getByTestId('task-banner')).toContainText('Task 2 of 2');
+  await expect(page.getByTestId('task-text')).toContainText('Task 2 of 2');
+  await expect(page.getByTestId('panel-steps').getByTestId('panel-step').nth(0)).toHaveAttribute('data-state', 'done');
   const b = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_b' && /task two of two/i.test(String(e.data.text)), 15_000, 'task two of two');
   expect(String(b.data.text)).not.toMatch(/just tell me/);
   save('status', await log(page));
+  expect(openaiHits.filter((u) => !u.endsWith('/v1/realtime/calls'))).toEqual([]);
+  await context.close();
+});
+
+test('M5 · assistance ladder: a stuck participant gets the general prompts verbatim, one per gap, then the direct cue; a click resets "stuck"; the soft limit asks once; the result scores 0 with the assistance recorded', async () => {
+  test.setTimeout(150_000);
+  const steps = [
+    task({
+      id: 'task_stuck',
+      title: 'Find',
+      instruction: 'Find the Aurora desk lamp.',
+      softLimitSec: 45,
+      assistance: { generalPrompts: ['What are you looking for right now?', 'What on the page might help?'], firstAfterSec: 3, gapSec: 5, directCue: 'Try the search box at the top.' },
+    }),
+    { id: 'wrapup', type: 'interview', title: 'Wrap-up', goal: 'Impression', questions: ['How would you describe the website to a friend?'], maxFollowUps: 0 },
+  ];
+  const { token, studyId } = await createStudy('Mock assistance', protocol(steps));
+  const { context, page, openaiHits } = await newPage();
+  await start(page, token);
+  await waitIdle(page);
+  await says(page, "Yes, I'm ready.");
+  const session = page.getByTestId('session');
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 20_000 });
+  const active = await waitEvent(page, (e) => e.kind === 'task.start', 5000, 'task start');
+
+  // Working (a click every few seconds) is not stuck: no prompt for 20 s although firstAfterSec is 3.
+  const app = page.frameLocator('iframe').locator('body');
+  for (let i = 0; i < 5; i++) {
+    await app.click({ position: { x: 40, y: 40 } });
+    await page.waitForTimeout(4000);
+  }
+  expect((await log(page)).some((e) => e.kind === 'task.assist')).toBe(false);
+
+  // Then stuck: 15 s without clicks → first general prompt, said verbatim.
+  const g1 = await waitEvent(page, (e) => e.kind === 'task.assist', 25_000, 'first prompt');
+  expect(g1.data).toMatchObject({ level: 'general', text: 'What are you looking for right now?', via: 'stuck' });
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > g1.t && /What are you looking for right now\?/.test(String(e.data.text)), 10_000, 'prompt 1 spoken');
+  await says(page, "I'm looking for a lamp but I can't see one.");
+  const g2 = await waitEvent(page, (e) => e.kind === 'task.assist' && e.data.level === 'general' && e.t > g1.t, 20_000, 'second prompt');
+  expect(g2.data.text).toBe('What on the page might help?');
+  expect(g2.t - g1.t).toBeGreaterThanOrEqual(5000);
+  const d = await waitEvent(page, (e) => e.kind === 'task.assist' && e.data.level === 'direct', 20_000, 'direct cue');
+  expect(d.data.text).toBe('Try the search box at the top.');
+  expect(d.t - g2.t).toBeGreaterThanOrEqual(5000);
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > d.t && /search box/.test(String(e.data.text)), 10_000, 'cue spoken');
+
+  // Soft limit: asked once.
+  await waitEvent(page, (e) => e.kind === 'moderator.nudge' && e.data.kind === 'soft_limit', 30_000, 'soft limit');
+  await page.waitForTimeout(8000);
+  expect((await log(page)).filter((e) => e.kind === 'moderator.nudge' && e.data.kind === 'soft_limit')).toHaveLength(1);
+  expect((await log(page)).filter((e) => e.kind === 'task.assist')).toHaveLength(3);
+  expect(active.t).toBeLessThan(g1.t);
+
+  // Finish: success, but assisted with a direct cue → score 0.
+  await page.getByTestId('im-done').click();
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.stepId === 'task_stuck' && /how do you feel/i.test(String(e.data.text)), 15_000, 'how did it go');
+  await says(page, 'It was okay, I found it in the end.');
+  await expect(session).toHaveAttribute('data-step', 'wrapup', { timeout: 30_000 });
+  save('assistance', await log(page));
+  let r: { completionScore?: number; assistance?: { general: number; direct: number }; outcome: string } | undefined;
+  for (let i = 0; i < 20 && r?.completionScore == null; i++) {
+    await page.waitForTimeout(500);
+    r = (await lastSession(studyId)).taskResults.find((x) => x.stepId === 'task_stuck') as typeof r;
+  }
+  expect(r?.outcome).toBe('success');
+  expect(r?.assistance).toEqual({ general: 2, direct: 1 });
+  expect(r?.completionScore).toBe(0);
+  expect(openaiHits.filter((u) => !u.endsWith('/v1/realtime/calls'))).toEqual([]);
+  await context.close();
+});
+
+test('M6 · layout: the app gets the full height beside the panel (wide); under 900 px the panel is a bottom sheet in the flow that never covers the app, and its collapsed row keeps the status, the task and Done', async () => {
+  const steps = [
+    task({ id: 'task_a', title: 'Find a lamp', instruction: 'Imagine you want a new lamp for your desk. Find the Aurora desk lamp.' }),
+    task({ id: 'task_b', title: 'Posters', instruction: 'Have a look at the poster section.' }),
+    { id: 'wrapup', type: 'interview', title: 'Wrap-up', goal: 'Impression', questions: ['How would you describe the website to a friend?'], maxFollowUps: 0 },
+  ];
+  const { token } = await createStudy('Mock layout', protocol(steps));
+  const { context, page, openaiHits } = await newPage();
+  await start(page, token);
+  await waitIdle(page);
+  await page.screenshot({ path: path.join(OUT, 'layout-wide-intro.png') });
+  await says(page, "Yes, I'm ready.");
+  const session = page.getByTestId('session');
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 20_000 });
+  await waitIdle(page);
+
+  // Wide: no bars; the iframe spans the full height and ends where the panel starts.
+  await expect(session).toHaveAttribute('data-layout', 'panel');
+  const frame = (await page.getByTestId('app-frame').boundingBox())!;
+  const panel = (await page.getByTestId('panel').boundingBox())!;
+  expect(frame.y).toBe(0);
+  expect(frame.height).toBe(800);
+  expect(Math.round(frame.x + frame.width)).toBeLessThanOrEqual(Math.round(panel.x));
+  expect(panel.width).toBeGreaterThanOrEqual(340);
+  await expect(page.getByTestId('task-instruction-text')).toContainText('Aurora desk lamp');
+  await page.screenshot({ path: path.join(OUT, 'layout-wide-task.png') });
+  await page.getByTestId('toggle-conversation').click();
+  await expect(page.getByTestId('captions')).toContainText(/task one of two/i);
+  await page.screenshot({ path: path.join(OUT, 'layout-wide-conversation.png') });
+  await page.getByTestId('toggle-conversation').click();
+
+  // Narrow: bottom sheet below the app.
+  await page.setViewportSize({ width: 820, height: 900 });
+  await expect(session).toHaveAttribute('data-layout', 'sheet');
+  const sheet = page.getByTestId('panel');
+  await expect(sheet).toHaveAttribute('data-sheet', 'closed');
+  await expect(sheet).toContainText('Find a lamp');
+  await expect(sheet.getByTestId('im-done')).toBeVisible();
+  await expect(sheet.getByTestId('panel-status')).toBeVisible();
+  const f2 = (await page.getByTestId('app-frame').boundingBox())!;
+  const s2 = (await sheet.boundingBox())!;
+  expect(f2.width).toBe(820);
+  expect(Math.round(f2.y + f2.height)).toBeLessThanOrEqual(Math.round(s2.y));
+  await page.screenshot({ path: path.join(OUT, 'layout-narrow-collapsed.png') });
+  await page.getByTestId('sheet-toggle').click();
+  await expect(sheet).toHaveAttribute('data-sheet', 'open');
+  await expect(page.getByTestId('task-instruction-text')).toBeVisible();
+  const f3 = (await page.getByTestId('app-frame').boundingBox())!;
+  const s3 = (await sheet.boundingBox())!;
+  expect(Math.round(f3.y + f3.height)).toBeLessThanOrEqual(Math.round(s3.y));
+  expect(f3.height).toBeGreaterThan(250);
+  await page.waitForTimeout(2800); // let the open animation and the task highlight settle
+  await page.screenshot({ path: path.join(OUT, 'layout-narrow-open.png') });
   expect(openaiHits.filter((u) => !u.endsWith('/v1/realtime/calls'))).toEqual([]);
   await context.close();
 });

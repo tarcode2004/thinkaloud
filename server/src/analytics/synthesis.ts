@@ -28,7 +28,7 @@ export function transcriptOf(events: SessionEvent[]): TranscriptLine[] {
     .sort((a, b) => a.t - b.t);
 }
 
-const NOTABLE = new Set(['app.rage_click', 'app.dead_click', 'app.error', 'app.network_error', 'app.crash', 'moderator.probe', 'moderator.nudge', 'task.start', 'task.end', 'app.navigate']);
+const NOTABLE = new Set(['task.assist', 'app.rage_click', 'app.dead_click', 'app.error', 'app.network_error', 'app.crash', 'moderator.probe', 'moderator.nudge', 'task.start', 'task.end', 'app.navigate']);
 
 const ts = (ms: number) => (ms / 1000).toFixed(1);
 
