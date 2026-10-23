@@ -1,5 +1,5 @@
 // Researcher-side API types + helpers (shapes from docs/API.md).
-import type { AppBuild, ProtocolRecord, Study, StudyLink, StudyStatus, User, Variant } from '@thinkaloud/shared';
+import type { AppBuild, ProtocolRecord, ReadinessReport, Study, StudyLink, StudyStatus, User, Variant } from '@thinkaloud/shared';
 import { api, ApiError, setAuthToken } from '../lib/api.ts';
 
 const keepToken = <T extends { token?: string }>(r: T): T => {
@@ -30,6 +30,7 @@ export const rApi = {
   study: (id: string) => api.get<StudyDetail>(`/api/studies/${id}`),
   patchStudy: (id: string, body: { name?: string; description?: string; status?: StudyStatus }) => api.patch<{ study: Study }>(`/api/studies/${id}`, body),
   deleteStudy: (id: string) => api.del(`/api/studies/${id}`),
+  readiness: (id: string, probe = true) => api.get<ReadinessReport>(`/api/studies/${id}/readiness${probe ? '' : '?probe=0'}`),
   previewUrl: (id: string, variantId?: string) =>
     api.get<{ url: string }>(`/api/studies/${id}/preview-url${variantId ? `?variantId=${encodeURIComponent(variantId)}` : ''}`),
 };

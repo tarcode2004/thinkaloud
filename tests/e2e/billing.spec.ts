@@ -9,6 +9,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
+import http from 'node:http';
 import Stripe from 'stripe';
 
 const PORT = 4840;
@@ -22,6 +23,9 @@ test.use({ launchOptions: { executablePath: existsSync(CHROME) ? CHROME : undefi
 test.describe.configure({ mode: 'serial' });
 
 let server: ChildProcess | null = null;
+// Go live checks the realtime voice service: a stub that only answers /health (no OpenAI).
+const VOICE_PORT = 4842;
+const voice = http.createServer((req, res) => res.writeHead(req.url === '/health' ? 200 : 404).end());
 
 test.beforeAll(async () => {
   for (const port of [PORT, PORT + 1]) {
@@ -29,12 +33,14 @@ test.beforeAll(async () => {
   }
   rmSync(DATA, { recursive: true, force: true });
   mkdirSync(SHOTS, { recursive: true });
+  await new Promise<void>((r) => voice.listen(VOICE_PORT, '127.0.0.1', r));
   server = spawn('npx', ['tsx', 'server/src/index.ts'], {
     detached: true, // own process group, so afterAll stops tsx too (not just npx)
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
       OPENAI_API_KEY: '',
+      REALTIME_BASE_URL: `http://127.0.0.1:${VOICE_PORT}/v1`,
       PORT: String(PORT),
       APP_HOST_PORT: String(PORT + 1),
       APP_HOST_URL: `http://localhost:${PORT + 1}`,
@@ -63,6 +69,7 @@ test.beforeAll(async () => {
 });
 
 test.afterAll(async () => {
+  voice.close();
   if (server?.pid) {
     try {
       process.kill(-server.pid, 'SIGTERM');
@@ -137,6 +144,7 @@ test('pricing, sign-up to checkout, gating, and the neutral participant message'
   await expect(page.getByTestId('plan-banner')).toBeVisible();
   await shot(page, '04-study-with-plan-banner');
   await page.getByTestId('go-live').click();
+  await page.getByTestId('publish-anyway').click(); // readiness warnings: no app, not previewed
   await expect(page).toHaveURL(/\/billing$/);
 
   // Subscription starts (signed webhook) → trial.
@@ -149,6 +157,7 @@ test('pricing, sign-up to checkout, gating, and the neutral participant message'
 
   await page.goto(`${BASE}/studies/${studyId}`);
   await page.getByTestId('go-live').click();
+  await page.getByTestId('publish-anyway').click();
   await expect(page.getByText('Study is live. Share your link from Recruit.')).toBeVisible();
   const detail = await (await page.request.get(`${BASE}/api/studies/${studyId}`)).json();
   const linkUrl = `${BASE}/s/${detail.links[0].token}`;

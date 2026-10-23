@@ -496,6 +496,9 @@ test('researcher: generate the protocol with AI, add a url_matches rule, assign 
   await shot(rp, 'r11-recruit');
 
   await rp.getByTestId('go-live').click();
+  // Readiness sheet: warnings (e.g. not previewed yet) ask before publishing.
+  const anyway = rp.getByTestId('publish-anyway');
+  if (await anyway.isVisible({ timeout: 8000 }).catch(() => false)) await anyway.click();
   await expect(rp.getByText(/Study is live/)).toBeVisible();
   saveState();
   await shot(rp, 'r12-live');

@@ -9,6 +9,7 @@ import { assertChildAccess, assertStudyAccess, requireUser } from '../lib/auth.t
 import { paths } from '../lib/paths.ts';
 import { normalizeProtocol } from '../lib/protocolSchema.ts';
 import { entitlement } from '../billing/account.ts';
+import { studyReadiness } from '../lib/readiness.ts';
 import {
   appFromRow,
   linkFromRow,
@@ -342,6 +343,14 @@ studiesRouter.delete('/links/:lid', (req, res) => {
   db.prepare('DELETE FROM links WHERE id = ?').run(row.id as string);
   touchStudy(row.study_id as string);
   res.json({ ok: true });
+});
+
+// ── readiness ────────────────────────────────────────────────────────────────
+
+// Pre-publish checklist: errors block Go live (see goLiveProblems), warnings ask "publish anyway?".
+studiesRouter.get('/studies/:id/readiness', async (req, res) => {
+  const study = assertStudyAccess(req, sid(req));
+  res.json(await studyReadiness(study.id as string, { probe: req.query.probe !== '0' }));
 });
 
 // ── preview ──────────────────────────────────────────────────────────────────

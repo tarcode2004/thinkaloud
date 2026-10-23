@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation, useNavigate, useParams } from 'react-router';
 import { AlertTriangle, ChevronDown, ChevronRight, Eye, MoreHorizontal, Pause, Play, Rocket, Square, Trash2 } from 'lucide-react';
-import type { StudyStatus } from '@thinkaloud/shared';
+import { readinessReport, type ReadinessFix, type ReadinessItem, type ReadinessReport, type StudyStatus } from '@thinkaloud/shared';
 import { useAsync } from '../../lib/hooks.ts';
 import { ApiError } from '../../lib/api.ts';
 import { Button, cn, FullPageSpinner, Modal } from '../../ui/index.tsx';
@@ -10,6 +10,9 @@ import { Callout, InlineEdit, Menu, MenuItem, StatusBadge } from '../components/
 import { errorDetails, errorMessage, rApi, type StudyDetail } from '../lib.ts';
 import { notifyStudiesChanged } from '../AppShell.tsx';
 import { StudyContext, useStudy as useStudyCtx } from './StudyContext.tsx';
+import ReadinessSheet, { fixHref } from './ReadinessSheet.tsx';
+import CoachMarks, { type CoachStep } from '../components/CoachMarks.tsx';
+import { validateProtocol } from '../protocol/validate.ts';
 
 export default function StudyLayout() {
   const { studyId = '' } = useParams();
@@ -40,6 +43,14 @@ export default function StudyLayout() {
   );
 }
 
+const TOUR: CoachStep[] = [
+  { target: '[data-tour="protocols"]', title: 'Write the protocol', body: 'The tasks, questions and questionnaires the AI moderator follows. A starter protocol is already here to edit.' },
+  { target: '[data-tour="apps"]', title: 'Add the app under test', body: 'Upload a build, connect git, or paste a URL. Then assign it to a variant so participants actually see it.' },
+  { target: '[data-tour="consent"]', title: 'Set up consent', body: 'What participants agree to before anything is recorded.' },
+  { target: '[data-tour="preview"]', title: 'Preview as a participant', body: 'Run the whole session yourself. It\u2019s the only way to know the app loads and the tasks make sense. Previews don\u2019t count toward results.' },
+  { target: '[data-tour="go-live"]', title: 'Go live', body: 'We check everything once more (app loads, consent, voice) before participants can join, and tell you what to fix.' },
+];
+
 const TABS = [
   { to: '', label: 'Overview', end: true },
   { to: 'protocols', label: 'Protocol' },
@@ -60,7 +71,42 @@ function StudyHeader() {
   const [issues, setIssues] = useState<{ title: string; items: string[] } | null>(null);
   const [confirmClose, setConfirmClose] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [check, setCheck] = useState<{ report: ReadinessReport | null; error: string | null } | null>(null);
   const base = `/studies/${study.id}`;
+
+  /** Go live / Resume / Reopen: run the readiness checklist first; publish directly when it is clean. */
+  const goLive = async () => {
+    setCheck({ report: null, error: null });
+    try {
+      const server = await rApi.readiness(study.id);
+      // Protocol problems the editor already knows about (empty prompts, broken scales, ...).
+      const used = protocols.filter((p) => variants.some((v) => v.active && v.protocolId === p.id));
+      const local: ReadinessItem[] = used.flatMap((p) => {
+        const errs = validateProtocol(p.protocol).filter((i) => i.level === 'error');
+        return errs.length
+          ? [{ id: `validate:${p.id}`, level: 'error' as const, title: `Protocol "${p.name}" has ${errs.length} problem${errs.length > 1 ? 's' : ''}`, detail: errs[0].message, fix: { label: 'Edit protocol', tab: 'protocols' as const, id: p.id } }]
+          : [];
+      });
+      const report = readinessReport([...local, ...server.items], server.checkedAt);
+      if (!report.items.length) {
+        setCheck(null);
+        await setStatus('live');
+        return;
+      }
+      setCheck({ report, error: null });
+    } catch (e) {
+      setCheck({ report: null, error: errorMessage(e) });
+    }
+  };
+
+  const fix = (f: ReadinessFix) => {
+    if (f.tab === 'preview') {
+      void preview(activeVariants[0]?.id);
+      return;
+    }
+    setCheck(null);
+    nav(fixHref(base, f));
+  };
 
   const setStatus = async (status: StudyStatus) => {
     setBusy(status);
@@ -128,7 +174,7 @@ function StudyHeader() {
               <Menu
                 align="right"
                 trigger={({ toggle }) => (
-                  <Button variant="secondary" size="sm" icon={<Eye className="size-4" />} onClick={toggle}>
+                  <Button variant="secondary" size="sm" icon={<Eye className="size-4" />} onClick={toggle} data-tour="preview">
                     Preview <ChevronDown className="size-3.5" />
                   </Button>
                 )}
@@ -142,12 +188,12 @@ function StudyHeader() {
                 }
               </Menu>
             ) : (
-              <Button variant="secondary" size="sm" icon={<Eye className="size-4" />} onClick={() => preview(activeVariants[0]?.id)} title="Run the participant session yourself. Preview sessions are excluded from results.">
+              <Button variant="secondary" size="sm" icon={<Eye className="size-4" />} onClick={() => preview(activeVariants[0]?.id)} data-tour="preview" title="Run the participant session yourself. Preview sessions are excluded from results.">
                 Preview
               </Button>
             )}
             {study.status === 'draft' && (
-              <Button size="sm" icon={<Rocket className="size-4" />} loading={busy === 'live'} onClick={() => setStatus('live')} data-testid="go-live">Go live</Button>
+              <Button size="sm" icon={<Rocket className="size-4" />} loading={busy === 'live'} onClick={() => void goLive()} data-testid="go-live" data-tour="go-live">Go live</Button>
             )}
             {study.status === 'live' && (
               <>
@@ -157,12 +203,12 @@ function StudyHeader() {
             )}
             {study.status === 'paused' && (
               <>
-                <Button size="sm" icon={<Play className="size-4" />} loading={busy === 'live'} onClick={() => setStatus('live')}>Resume</Button>
+                <Button size="sm" icon={<Play className="size-4" />} loading={busy === 'live'} onClick={() => void goLive()}>Resume</Button>
                 <Button variant="secondary" size="sm" icon={<Square className="size-3.5" />} onClick={() => setConfirmClose(true)}>Close</Button>
               </>
             )}
             {study.status === 'closed' && (
-              <Button variant="secondary" size="sm" icon={<Play className="size-4" />} loading={busy === 'live'} onClick={() => setStatus('live')}>Reopen</Button>
+              <Button variant="secondary" size="sm" icon={<Play className="size-4" />} loading={busy === 'live'} onClick={() => void goLive()}>Reopen</Button>
             )}
             <Menu align="right" trigger={({ toggle }) => <button onClick={toggle} aria-label="More" className="grid size-7 place-items-center rounded-full bg-fill text-label transition-colors hover:bg-black/[0.07]"><MoreHorizontal className="size-4" /></button>}>
               {(close) => (
@@ -184,6 +230,7 @@ function StudyHeader() {
               key={t.label}
               to={to}
               end={t.end}
+              data-tour={t.to || 'overview'}
               className={cn('whitespace-nowrap rounded-full px-3.5 py-1.5 text-[13px] font-medium transition-colors duration-200', active ? 'bg-label text-white' : 'text-secondary hover:bg-black/[0.05] hover:text-label')}
             >
               {t.label}
@@ -215,6 +262,19 @@ function StudyHeader() {
           ))}
         </div>
       </Modal>
+
+      <CoachMarks steps={study.status === 'draft' ? TOUR : TOUR.slice(0, 4)} autoStart={study.status === 'draft'} />
+
+      <ReadinessSheet
+        open={!!check}
+        report={check?.report ?? null}
+        error={check?.error}
+        publishing={busy === 'live'}
+        onClose={() => setCheck(null)}
+        onPublish={async () => { await setStatus('live'); setCheck(null); }}
+        onPreview={() => void preview(activeVariants[0]?.id)}
+        onFix={fix}
+      />
 
       <Modal
         open={confirmClose}

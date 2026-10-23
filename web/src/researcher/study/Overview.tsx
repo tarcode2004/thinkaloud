@@ -4,9 +4,11 @@ import { Check, ChevronRight, Copy } from 'lucide-react';
 import { useToast } from '../../ui/toast.tsx';
 import { cn, Stat } from '../../ui/index.tsx';
 import { timeAgo } from '../../lib/hooks.ts';
-import { copy, rApi, type StudySummary } from '../lib.ts';
+import { copy, errorMessage, rApi, type StudySummary } from '../lib.ts';
+import type { ReadinessReport } from '@thinkaloud/shared';
 import { validateProtocol } from '../protocol/validate.ts';
 import { useStudy } from './StudyContext.tsx';
+import { openTour } from '../components/CoachMarks.tsx';
 
 type ItemState = 'done' | 'todo' | 'warn';
 
@@ -34,10 +36,37 @@ export default function Overview() {
   const firstProtocol = usedProtocols[0] ?? protocols[0];
   const mainLink = activeLinks[0];
 
-  const items: { state: ItemState; title: string; desc: string; to: string; cta: string; icon?: React.ReactNode }[] = [
+  // Consent and preview state come from the readiness check (no live probes here: it's cheap).
+  const [ready, setReady] = useState<ReadinessReport | null>(null);
+  useEffect(() => {
+    const load = () => rApi.readiness(study.id, false).then(setReady, () => {});
+    void load();
+    // Coming back from a preview tab: refresh "previewed" without a reload.
+    window.addEventListener('focus', load);
+    return () => window.removeEventListener('focus', load);
+  }, [study.id, study.updatedAt]);
+  const has = (prefix: string) => ready?.items.find((i) => i.id === prefix || i.id.startsWith(prefix + ':'));
+  const consentItem = has('consent');
+  const previewItem = has('preview');
+  const appWarning = ready?.items.find((i) => i.id.startsWith('app:') && i.level === 'warning');
+  const publishBlockers = (ready?.items ?? []).filter((i) => i.level === 'error' && (i.id === 'variants' || i.id === 'link'));
+
+  const preview = async () => {
+    const w = window.open('about:blank', '_blank');
+    try {
+      const { url } = await rApi.previewUrl(study.id, active[0]?.id);
+      if (w) w.location.href = url;
+      else window.open(url, '_blank');
+    } catch (e) {
+      w?.close();
+      toast(errorMessage(e), 'error');
+    }
+  };
+
+  const items: { state: ItemState; title: string; desc: string; to?: string; onClick?: () => void; cta: string; testId: string }[] = [
     {
       state: !usedProtocols.length || protoErrors ? 'todo' : protoWarnings ? 'warn' : 'done',
-      title: 'Protocol is ready',
+      title: 'Write the protocol',
       desc: !usedProtocols.length
         ? 'No active variant uses a protocol yet.'
         : protoErrors
@@ -47,40 +76,56 @@ export default function Overview() {
             : `${usedProtocols.reduce((s, p) => s + p.protocol.steps.length, 0)} steps, about ${firstProtocol?.protocol.estimatedMinutes ?? '?'} min.`,
       to: firstProtocol ? `${base}/protocols/${firstProtocol.id}` : `${base}/protocols`,
       cta: 'Edit protocol',
+      testId: 'setup-protocol',
     },
     {
-      state: appsBlocking.length ? 'todo' : variantsWithApp.length ? 'done' : 'warn',
-      title: 'App under test is connected',
+      state: appsBlocking.length ? 'todo' : appWarning ? 'todo' : variantsWithApp.length ? 'done' : 'warn',
+      title: 'Connect the app under test',
       desc: appsBlocking.length
         ? `${appsBlocking.length} variant${appsBlocking.length > 1 ? 's use' : ' uses'} an app that is not ready yet.`
-        : variantsWithApp.length
-          ? `${readyApps.length} ready build${readyApps.length !== 1 ? 's' : ''} assigned.`
-          : readyApps.length
-            ? 'You have a ready build. Assign it to a variant.'
-            : 'Upload a build or add a URL. Skip this for interview-only studies.',
+        : appWarning
+          ? `${appWarning.title}. ${readyApps.length ? 'Assign your build to the variant.' : 'Upload a build or add a URL.'}`
+          : variantsWithApp.length
+            ? `${readyApps.length} ready build${readyApps.length !== 1 ? 's' : ''} assigned.`
+            : readyApps.length
+              ? 'You have a ready build. Assign it to a variant.'
+              : 'Upload a build or add a URL. Skip this for interview-only studies.',
       to: variantsWithApp.length || !readyApps.length ? `${base}/apps` : `${base}/variants`,
       cta: readyApps.length && !variantsWithApp.length ? 'Assign app' : 'Manage apps',
+      testId: 'setup-app',
     },
     {
-      state: active.length ? 'done' : 'todo',
-      title: 'Variants configured',
-      desc: active.length > 1 ? `${active.length} active variants, A/B assignment by weight.` : active.length ? 'One variant. Add another to run an A/B comparison.' : 'Activate at least one variant.',
-      to: `${base}/variants`,
-      cta: 'Variants',
+      state: !ready ? 'warn' : consentItem ? 'todo' : 'done',
+      title: 'Set up consent',
+      desc: consentItem ? consentItem.title + '. Participants must see what is recorded first.' : 'Participants see your consent text before anything is recorded.',
+      to: `${base}/consent`,
+      cta: 'Consent',
+      testId: 'setup-consent',
     },
     {
-      state: activeLinks.length ? 'done' : 'todo',
-      title: 'Recruitment link ready',
-      desc: activeLinks.length ? `${activeLinks.length} active link${activeLinks.length > 1 ? 's' : ''}.` : 'Create or activate a link to share.',
-      to: `${base}/recruit`,
-      cta: 'Recruit',
+      state: !ready ? 'warn' : previewItem ? 'todo' : 'done',
+      title: 'Preview as a participant',
+      desc: previewItem ? `${previewItem.detail ?? previewItem.title}` : 'Previewed since your last change. Preview sessions are excluded from results.',
+      onClick: () => void preview(),
+      cta: 'Preview',
+      testId: 'setup-preview',
     },
     {
       state: study.status === 'live' ? 'done' : 'todo',
-      title: 'Study is live',
-      desc: study.status === 'live' ? 'Accepting participants.' : study.status === 'paused' ? 'Paused: links are not accepting participants.' : study.status === 'closed' ? 'Closed.' : 'Preview it yourself, then use Go live at the top right.',
+      title: 'Publish',
+      desc:
+        study.status === 'live'
+          ? `Accepting participants${activeLinks.length ? ` on ${activeLinks.length} link${activeLinks.length > 1 ? 's' : ''}` : ''}.`
+          : study.status === 'paused'
+            ? 'Paused: links are not accepting participants.'
+            : study.status === 'closed'
+              ? 'Closed.'
+              : publishBlockers.length
+                ? publishBlockers.map((i) => i.title).join('. ') + '.'
+                : 'Use Go live at the top right. Everything is checked once more before participants can join.',
       to: `${base}/recruit`,
-      cta: 'Share link',
+      cta: study.status === 'live' ? 'Share link' : 'Links',
+      testId: 'setup-publish',
     },
   ];
   const doneCount = items.filter((i) => i.state === 'done').length;
@@ -95,10 +140,13 @@ export default function Overview() {
                 <h2 className="text-[22px] font-semibold tracking-[-0.015em]">Setup</h2>
                 <p className="mt-0.5 text-[13px] text-secondary">{doneCount === items.length ? 'Everything is set. Your study is running.' : `${doneCount} of ${items.length} done`}</p>
               </div>
+              <button onClick={openTour} className="text-[14px] text-brand-500 hover:underline" data-testid="show-tour">Show me around</button>
             </div>
             <div className="mt-3 overflow-hidden rounded-[18px] bg-surface ring-1 ring-black/[0.04]">
-              {items.map((it, i) => (
-                <Link key={it.title} to={it.to} className={cn('group relative flex items-center gap-4 px-4 py-3 transition-colors hover:bg-black/[0.02]', i > 0 && 'before:absolute before:left-[52px] before:right-0 before:top-0 before:h-px before:bg-separator')}>
+              {items.map((it, i) => {
+                const rowClass = cn('group relative flex w-full items-center gap-4 px-4 py-3 text-left transition-colors hover:bg-black/[0.02]', i > 0 && 'before:absolute before:left-[52px] before:right-0 before:top-0 before:h-px before:bg-separator');
+                const body = (
+                <>
                   <span
                     className={cn(
                       'grid size-[22px] shrink-0 place-items-center rounded-full',
@@ -113,8 +161,14 @@ export default function Overview() {
                   </div>
                   <span className="hidden shrink-0 text-[13px] text-brand-500 sm:inline">{it.cta}</span>
                   <ChevronRight className="size-4 shrink-0 text-tertiary" />
-                </Link>
-              ))}
+                </>
+                );
+                return it.onClick ? (
+                  <button key={it.title} onClick={it.onClick} className={rowClass} data-testid={it.testId} data-state={it.state}>{body}</button>
+                ) : (
+                  <Link key={it.title} to={it.to!} className={rowClass} data-testid={it.testId} data-state={it.state}>{body}</Link>
+                );
+              })}
             </div>
           </section>
 
