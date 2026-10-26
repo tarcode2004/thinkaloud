@@ -4,7 +4,7 @@
 // sheet in the layout flow (it pushes the app up, never covers it).
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { ArrowUp, Check, ChevronDown, ChevronUp, Eye, Keyboard, Mic, MicOff, RotateCw, X } from 'lucide-react';
-import type { Question, Step, TaskStep } from '@thinkaloud/shared';
+import type { Question, RealtimeProvider, Step, TaskStep } from '@thinkaloud/shared';
 import { Button, cn, Modal } from '../ui/index.tsx';
 import { VoiceOrb } from './VoiceOrb.tsx';
 import { StatusLabel } from './VoiceStatus.tsx';
@@ -41,9 +41,11 @@ export function SessionView({ runner, title, preview, onWithdraw }: { runner: Se
 
   return (
     <div className="fixed inset-0 flex flex-col bg-canvas text-label" data-testid="session" data-step={s.step?.id ?? (s.index < 0 ? 'intro' : 'closing')} data-task-phase={s.taskPhase ?? ''} data-app-visible={app ? '1' : '0'} data-orb={s.orb} data-status={s.status} data-mode={s.mode} data-layout={wide ? 'panel' : 'sheet'}>
-      {preview && (
+      {/* The server offers a choice of voice engines only to the owner's previews. */}
+      {(preview || s.engine.available.length > 1) && (
         <div className="flex h-7 shrink-0 items-center justify-center gap-2 bg-label text-[12px] font-medium text-white/90" data-testid="preview-banner">
           <span className="size-1.5 rounded-full bg-sys-orange" /> Preview — data excluded from results
+          <EngineSwitch runner={runner} s={s} />
         </div>
       )}
 
@@ -165,6 +167,49 @@ export function SessionView({ runner, title, preview, onWithdraw }: { runner: Se
       >
         <p className="text-[15px] leading-relaxed text-secondary">The session ends right away and everything recorded so far — audio, screen activity and answers — is deleted. That’s completely fine and you won’t be asked why.</p>
       </Modal>
+    </div>
+  );
+}
+
+// ── Voice engine switch (owner previews) ─────────────────────────────────────
+
+const ENGINES: { id: RealtimeProvider; label: string }[] = [
+  { id: 'openrealtime', label: 'OpenRealtime' },
+  { id: 'openai', label: 'OpenAI' },
+];
+
+function EngineSwitch({ runner, s }: { runner: SessionRunner; s: RunnerState }) {
+  const e = s.engine;
+  const offered = ENGINES.filter((x) => e.available.includes(x.id));
+  if (s.mode === 'manual' || offered.length < 2) return null;
+  const measured = offered.filter((x) => e.replies[x.id]);
+  return (
+    <div className="ml-3 flex items-center gap-2" data-testid="engine-switch" data-engine={e.current ?? ''}>
+      <div role="radiogroup" aria-label="Voice engine" className="flex rounded-full bg-white/15 p-0.5">
+        {offered.map((x) => {
+          const on = x.id === e.current;
+          return (
+            <button
+              key={x.id}
+              role="radio"
+              aria-checked={on}
+              disabled={e.switching}
+              onClick={() => void runner.switchEngine(x.id)}
+              className={cn('h-5 rounded-full px-2.5 text-[11px] font-semibold transition-colors', on ? 'bg-white text-label' : 'text-white/80 hover:text-white', e.switching && 'cursor-default opacity-60')}
+              data-testid={`engine-${x.id}`}
+            >
+              {x.label}
+            </button>
+          );
+        })}
+      </div>
+      <span className="hidden tabular-nums text-white/60 sm:inline" data-testid="engine-latency" title="Time from the end of your turn until the moderator is heard: median (number of replies)">
+        {e.switching
+          ? 'Switching…'
+          : measured.length
+            ? `Reply time ${measured.map((x) => `${x.label} ${(e.replies[x.id]!.median / 1000).toFixed(1)} s (${e.replies[x.id]!.n})`).join(' · ')}`
+            : 'Reply time —'}
+      </span>
     </div>
   );
 }

@@ -408,6 +408,29 @@ export class RealtimeClient {
     }
   }
 
+  /**
+   * Hang up on purpose and connect again with a fresh token (e.g. to another realtime backend). The
+   * transport is chosen anew and it does not count as a dropped connection; onReady reports a resume.
+   */
+  async restart(): Promise<void> {
+    this.closedByUs = true;
+    this.teardown();
+    this.wsAudio?.dispose();
+    this.wsAudio = null;
+    this.opts.audioEl.srcObject = null;
+    this.remoteStream = null;
+    this.useWs = false;
+    this.reconnects = 0;
+    this.outbox = [];
+    this.wantResponse = null;
+    this.lastCreate = null;
+    this.liveCreate = null;
+    this.pendingCallOutputs = 0;
+    this.respondAfterCalls = false;
+    this.cancelNextCreated = false;
+    await this.connectWithRetry();
+  }
+
   close() {
     this.closedByUs = true;
     this.teardown();

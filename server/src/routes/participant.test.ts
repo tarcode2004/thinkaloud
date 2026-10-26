@@ -197,3 +197,23 @@ test('withdrawSession deletes captured data and files', () => {
   assert.equal(fs.existsSync(paths.session(sid)), false);
   assert.equal((db.prepare('SELECT status FROM sessions WHERE id = ?').get(sid) as Row).status, 'withdrawn');
 });
+
+test('realtimeTargets: self-hosted is the default, OpenAI is offered next to it when a key is set', () => {
+  const self = { realtimeBaseUrl: 'http://127.0.0.1:8787/v1', realtimePublicUrl: 'https://rt.example.com/v1', realtimeKey: 'ort', openaiKey: 'sk-x' };
+  const t = m.realtimeTargets(self);
+  assert.deepEqual(t.all.map((x) => x.provider), ['openrealtime', 'openai']);
+  assert.equal(t.default!.provider, 'openrealtime');
+  assert.equal(t.default!.publicUrl, 'https://rt.example.com/v1');
+  const oa = t.all[1];
+  assert.equal(oa.base, 'https://api.openai.com/v1');
+  assert.equal(oa.key, 'sk-x');
+  assert.equal(oa.selfHosted, false);
+
+  // No OpenAI key: only the self-hosted server.
+  assert.deepEqual(m.realtimeTargets({ ...self, openaiKey: '' }).all.map((x) => x.provider), ['openrealtime']);
+  // OpenAI only (no REALTIME_BASE_URL): OpenAI with the realtime key.
+  const only = m.realtimeTargets({ realtimeBaseUrl: 'https://api.openai.com/v1', realtimePublicUrl: 'https://api.openai.com/v1', realtimeKey: 'sk-r', openaiKey: 'sk-r' });
+  assert.deepEqual(only.all.map((x) => [x.provider, x.key]), [['openai', 'sk-r']]);
+  // Nothing configured.
+  assert.equal(m.realtimeTargets({ realtimeBaseUrl: 'https://api.openai.com/v1', realtimePublicUrl: 'https://api.openai.com/v1', realtimeKey: '', openaiKey: '' }).default, null);
+});

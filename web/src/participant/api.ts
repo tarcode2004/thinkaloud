@@ -1,5 +1,5 @@
 // Participant API client (public, session-secret authenticated). See docs/API.md "Participant API".
-import type { PublicLinkInfo, RealtimeTokenResponse, SessionEvent, StartSessionRequest, StartSessionResponse } from '@thinkaloud/shared';
+import type { PublicLinkInfo, RealtimeProvider, RealtimeTokenResponse, SessionEvent, StartSessionRequest, StartSessionResponse } from '@thinkaloud/shared';
 import { api, apiIsCrossOrigin, apiUrl } from '../lib/api.ts';
 
 export interface SessionAuth {
@@ -25,7 +25,7 @@ export const pApi = {
     });
     if (!res.ok) throw new Error(`audio upload ${res.status}`);
   },
-  realtimeToken: (a: SessionAuth) => api.post<RealtimeTokenResponse>(`${base(a)}/realtime-token`, {}, h(a)),
+  realtimeToken: (a: SessionAuth, provider?: RealtimeProvider) => api.post<RealtimeTokenResponse>(`${base(a)}/realtime-token`, provider ? { provider } : {}, h(a)),
   complete: (a: SessionAuth, status: 'completed' | 'abandoned') => api.post<{ ok: boolean; redirectUrl: string | null }>(`${base(a)}/complete`, { status }, h(a)),
   withdraw: (a: SessionAuth) => api.post<{ ok: boolean }>(`${base(a)}/withdraw`, {}, h(a)),
   /** For pagehide: sendBeacon with ?secret= (no custom headers possible). */

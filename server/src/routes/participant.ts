@@ -6,11 +6,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import {
+  REALTIME_PROVIDERS,
   REALTIME_VOICES,
   languageName,
   newId,
   type Protocol,
   type PublicLinkInfo,
+  type RealtimeProvider,
   type RealtimeTokenResponse,
   type StartSessionResponse,
   type Step,
@@ -464,10 +466,41 @@ export function transcriptionConfig(lang: string | undefined): { model: string; 
   };
 }
 
+const OPENAI_REALTIME = 'https://api.openai.com/v1';
+
+export interface RealtimeTarget {
+  provider: RealtimeProvider;
+  base: string;
+  publicUrl: string;
+  key: string;
+  selfHosted: boolean;
+}
+
+/**
+ * The realtime backends this server can moderate with: the configured one (REALTIME_BASE_URL, or
+ * OpenAI when unset) is the default; OpenAI is also offered next to a self-hosted server when an
+ * OPENAI_API_KEY is set, so owners can compare the two in previews.
+ */
+export function realtimeTargets(c: Pick<typeof config, 'realtimeBaseUrl' | 'realtimePublicUrl' | 'realtimeKey' | 'openaiKey'> = config): { default: RealtimeTarget | null; all: RealtimeTarget[] } {
+  const selfHosted = !c.realtimeBaseUrl.startsWith('https://api.openai.com');
+  const all: RealtimeTarget[] = [];
+  if (selfHosted) all.push({ provider: 'openrealtime', base: c.realtimeBaseUrl, publicUrl: c.realtimePublicUrl, key: c.realtimeKey, selfHosted: true });
+  const openaiKey = selfHosted ? c.openaiKey : c.realtimeKey;
+  if (openaiKey) all.push({ provider: 'openai', base: OPENAI_REALTIME, publicUrl: OPENAI_REALTIME, key: openaiKey, selfHosted: false });
+  return { default: all[0] ?? null, all };
+}
+
 participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
   const row = sessionFor(req);
-  const selfHosted = !config.realtimeBaseUrl.startsWith('https://api.openai.com');
-  if (!config.realtimeKey && !selfHosted) throw new HttpError(503, 'Voice moderation is not configured on this server (missing OPENAI_API_KEY)');
+  const { provider: wantedProvider } = parse(z.object({ provider: z.enum(REALTIME_PROVIDERS).optional() }), req.body ?? {});
+  const targets = realtimeTargets();
+  // Only the owner's preview may pick the backend; real participants always get the default.
+  const target = row.preview && wantedProvider ? targets.all.find((t) => t.provider === wantedProvider) : targets.default;
+  if (!target) {
+    if (wantedProvider && row.preview) throw new HttpError(400, `This server has no ${wantedProvider === 'openai' ? 'OpenAI API key' : 'self-hosted realtime server'} configured`);
+    throw new HttpError(503, 'Voice moderation is not configured on this server (missing OPENAI_API_KEY)');
+  }
+  const selfHosted = target.selfHosted;
   const sessionId = row.id as string;
   // Billing: a real session may only start voice while the owner's plan allows it. Reconnects of a
   // session whose voice already started are never cut off.
@@ -476,7 +509,7 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
     if (owner && !entitlement(String(owner.owner_id)).canRunSessions) throw new HttpError(409, UNAVAILABLE_MESSAGES.unavailable, { reason: 'unavailable' });
   }
   const used = tokenCounts.get(sessionId) ?? 0;
-  if (used >= MAX_TOKENS_PER_SESSION) throw new HttpError(429, 'Too many voice connections for this session');
+  if (used >= MAX_TOKENS_PER_SESSION * (row.preview ? 4 : 1)) throw new HttpError(429, 'Too many voice connections for this session');
   tokenCounts.set(sessionId, used + 1);
 
   const protocol = sessionProtocolFromRow(row) ?? protocolForVariant(row.variant_id as string, row.study_id as string).protocol;
@@ -500,9 +533,9 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
   };
 
   const mint = async (withReasoning: boolean) =>
-    fetch(`${config.realtimeBaseUrl}/realtime/client_secrets`, {
+    fetch(`${target.base}/realtime/client_secrets`, {
       method: 'POST',
-      headers: { ...(config.realtimeKey ? { Authorization: `Bearer ${config.realtimeKey}` } : {}), 'Content-Type': 'application/json' },
+      headers: { ...(target.key ? { Authorization: `Bearer ${target.key}` } : {}), 'Content-Type': 'application/json' },
       body: JSON.stringify({ session: withReasoning ? { ...session, reasoning: { effort: config.realtimeEffort } } : session }),
       signal: AbortSignal.timeout(15_000),
     });
@@ -522,7 +555,7 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
   }
   if (!r.ok) {
     const text = await r.text().catch(() => '');
-    console.error('[realtime-token] upstream error', r.status, text.slice(0, 500));
+    console.error(`[realtime-token] ${target.provider} upstream error`, r.status, text.slice(0, 500));
     throw new HttpError(r.status === 429 ? 503 : 502, 'Could not start the voice session', { upstreamStatus: r.status });
   }
   const j = (await r.json()) as { value?: string; expires_at?: number; client_secret?: { value?: string; expires_at?: number } };
@@ -534,14 +567,16 @@ participantRouter.post('/sessions/:sid/realtime-token', async (req, res) => {
     model,
     voice,
     transcription,
-    callsUrl: `${config.realtimePublicUrl}/realtime/calls`,
-    ...(config.realtimeIceServers.length ? { iceServers: config.realtimeIceServers.map((urls) => ({ urls })) } : {}),
+    callsUrl: `${target.publicUrl}/realtime/calls`,
+    provider: target.provider,
+    ...(row.preview ? { providers: targets.all.map((t) => t.provider) } : {}),
+    ...(selfHosted && config.realtimeIceServers.length ? { iceServers: config.realtimeIceServers.map((urls) => ({ urls })) } : {}),
     // Self-hosted servers (OpenRealtime) also speak the Realtime WebSocket protocol, which passes
     // through HTTP tunnels where WebRTC's UDP media can't (symmetric NAT, mobile carriers).
     ...(selfHosted
       ? {
           transport: config.realtimeTransport,
-          ...(config.realtimeTransport !== 'webrtc' ? { wsUrl: `${config.realtimePublicUrl.replace(/^http/, 'ws')}/realtime` } : {}),
+          ...(config.realtimeTransport !== 'webrtc' ? { wsUrl: `${target.publicUrl.replace(/^http/, 'ws')}/realtime` } : {}),
         }
       : {}),
   };

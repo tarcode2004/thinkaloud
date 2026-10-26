@@ -663,6 +663,10 @@ export interface StartSessionResponse {
   redirectUrl: string | null;
 }
 
+/** Realtime backends: OpenAI's Realtime API, or a self-hosted OpenRealtime server (REALTIME_BASE_URL). */
+export const REALTIME_PROVIDERS = ['openai', 'openrealtime'] as const;
+export type RealtimeProvider = (typeof REALTIME_PROVIDERS)[number];
+
 export interface RealtimeTokenResponse {
   /** Ephemeral client secret value (ek_...). */
   value: string;
@@ -679,6 +683,10 @@ export interface RealtimeTokenResponse {
   wsUrl?: string;
   /** Self-hosted only: 'websocket' = skip WebRTC; 'webrtc' = never fall back; 'auto' = WebRTC, WS fallback. */
   transport?: 'webrtc' | 'websocket' | 'auto';
+  /** The backend this key is for. */
+  provider?: RealtimeProvider;
+  /** Owner previews only: the backends this server can switch between. */
+  providers?: RealtimeProvider[];
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

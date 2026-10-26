@@ -32,6 +32,7 @@ import {
   type ModeratorBrief,
   type PointBatchData,
   type Question,
+  type RealtimeProvider,
   type StartSessionResponse,
   type Step,
   type SuccessRule,
@@ -125,6 +126,17 @@ export interface RunnerState {
   recording: boolean;
   /** The app iframe: `key` changes to remount it (fresh renderer process); `src` null = unmounted. */
   appFrame: { key: number; src: string | null };
+  engine: EngineState;
+}
+
+/** Owner previews: which realtime backend moderates, and how fast it answers (for comparing). */
+export interface EngineState {
+  current: RealtimeProvider | null;
+  /** Backends the server offers to this session (more than one only in owner previews). */
+  available: RealtimeProvider[];
+  switching: boolean;
+  /** Participant finished speaking → moderator audible, per backend (last and median, ms). */
+  replies: Partial<Record<RealtimeProvider, { last: number; median: number; n: number }>>;
 }
 
 export interface RunnerOptions {
@@ -212,11 +224,18 @@ interface Utterance {
   typed: boolean;
 }
 
+export const engineName = (p: RealtimeProvider | null | undefined) => (p === 'openai' ? 'OpenAI Realtime' : p === 'openrealtime' ? 'OpenRealtime' : 'the current voice');
+
 export class SessionRunner {
   readonly queue: EventQueue;
   readonly bridge: ProbeBridge;
   private rrweb: RrwebUploader;
   private rt: RealtimeClient | null = null;
+  /** Backend asked for (owner previews); undefined = the server's default. */
+  private provider: RealtimeProvider | undefined;
+  /** The next onReady is a deliberate backend switch (not a dropped connection). */
+  private engineSwitch: { cutText: string | null; owed: boolean } | null = null;
+  private replySamples = new Map<RealtimeProvider, number[]>();
   /** Moderator captions revealed in step with the audible voice. */
   private pacer: CaptionPacer | null = null;
   private recorder: MixedRecorder | null = null;
@@ -369,6 +388,7 @@ export class SessionRunner {
       ended: false,
       recording: false,
       appFrame: { key: 0, src: opts.start.appUrl ?? null },
+      engine: { current: null, available: [], switching: false, replies: {} },
     };
     this.bridge = new ProbeBridge({
       onHello: (path) => this.onProbeHello(path),
@@ -486,7 +506,11 @@ export class SessionRunner {
 
   private async connectRealtime() {
     const rt = new RealtimeClient({
-      getToken: () => pApi.realtimeToken(this.opts.auth),
+      getToken: async () => {
+        const t = await pApi.realtimeToken(this.opts.auth, this.provider);
+        this.set({ engine: { ...this.state.engine, current: t.provider ?? null, available: t.providers ?? (t.provider ? [t.provider] : []) } });
+        return t;
+      },
       mic: this.opts.mic,
       audioEl: this.opts.audioEl,
       // Never start speaking while the participant is talking.
@@ -538,6 +562,7 @@ export class SessionRunner {
         onAssistantTranscript: (rid, text, phase) => this.pacer?.done(rid, text, phase),
         onAssistantAudioStart: (rid) => {
           this.pacer?.audioStart(rid);
+          this.sampleReply();
           this.lastAssistantAudio = performance.now();
           this.lastAssistantAudioStart = this.lastAssistantAudio;
           // The moderator reacts to the Done button: it is no longer "pending".
@@ -599,8 +624,15 @@ export class SessionRunner {
     // reject the instructions above.
     rt.updateSession({ include: ['item.input_audio_transcription.logprobs'] });
     this.applyTurnDetection(true);
+    this.queue.push('observation', { kind: 'voice_engine', provider: this.state.engine.current, transport: rt.transport, model: rt.model });
+    const switched = this.engineSwitch;
+    this.engineSwitch = null;
     if (!reconnected) {
       this.enterStep(-1, 'announce');
+      return;
+    }
+    if (switched) {
+      this.resumeAfterSwitch(switched);
       return;
     }
     this.queue.push('observation', { kind: 'realtime_reconnected' });
@@ -617,6 +649,82 @@ export class SessionRunner {
       `[EVENT] The connection dropped briefly and was restored. Recent conversation:\n${recent || '(none)'}\nSay one short sentence in ${languageName(this.mod.language)} like "Sorry, we had a short connection problem." and then continue exactly where you left off according to this brief (do not restart earlier steps):\n[STEP] ${JSON.stringify(this.brief())}`,
     );
     rt.requestResponse();
+  }
+
+  /**
+   * Owner previews: hang up and continue the session on another realtime backend, at any point. The
+   * moderator is stopped first (its cut-off turn is re-said by the new one); the new backend gets the
+   * moderator instructions, the current step and the recent conversation.
+   */
+  async switchEngine(provider: RealtimeProvider) {
+    const rt = this.rt;
+    const e = this.state.engine;
+    if (!rt || this.state.mode === 'manual' || e.switching || provider === e.current || !e.available.includes(provider)) return;
+    const from = e.current;
+    const speaking = rt.assistantAudioPlaying || rt.responding;
+    // What the moderator is saying right now: the new engine says it again (in full).
+    const cutText = rt.assistantAudioPlaying ? (this.pacer?.speakingText() ?? null) : null;
+    // A reply was being prepared, or is owed (they spoke last): the new engine gives it.
+    const owed = (speaking && !cutText) || (this.lastParticipantInput > this.lastAssistantAudio && !this.isQuietPhase());
+    this.set({ engine: { ...e, switching: true } });
+    if (speaking) {
+      rt.cancelResponse();
+      // Let the audio-stop bookkeeping (captions, answer window) run before hanging up.
+      for (let i = 0; i < 30 && rt.assistantAudioPlaying; i++) await new Promise((r) => setTimeout(r, 50));
+    }
+    this.queue.push('observation', { kind: 'voice_engine_switch', from, to: provider });
+    this.provider = provider;
+    this.engineSwitch = { cutText, owed };
+    try {
+      await rt.restart();
+    } catch (err) {
+      console.warn('[runner] voice engine switch failed', err);
+      this.queue.push('session.error', { message: `Switching to ${provider} failed: ${(err as Error).message}`, source: 'realtime' });
+      this.provider = from ?? undefined;
+      this.engineSwitch = { cutText, owed };
+      try {
+        await rt.restart();
+        this.set({ notice: `Could not switch the voice to ${engineName(provider)}; staying on ${engineName(from)}.` });
+      } catch (err2) {
+        this.engineSwitch = null;
+        this.queue.push('session.error', { message: `Realtime reconnect failed: ${(err2 as Error).message}`, fallback: 'manual' });
+        this.toManual('The voice connection was lost, so we continue on screen. Your progress is saved.');
+      }
+    } finally {
+      this.set({ engine: { ...this.state.engine, switching: false } });
+      this.updateOrb();
+    }
+  }
+
+  private resumeAfterSwitch({ cutText, owed }: { cutText: string | null; owed: boolean }) {
+    const rt = this.rt!;
+    if (this.state.index >= this.steps.length) {
+      if (!this.closingSpoken) this.sayClosing();
+      return;
+    }
+    const recent = this.transcriptLog
+      .slice(-16)
+      .map((l) => `${l.role}: ${l.text}`)
+      .join('\n');
+    rt.addSystemItem(
+      `[EVENT] The session continues on a different voice system (the researcher is comparing them). The conversation so far:\n${recent || '(none yet)'}\nDo not mention the switch and do not apologise. Continue exactly where the session is according to this brief (do not restart earlier steps):\n[STEP] ${JSON.stringify(this.brief())}`,
+    );
+    // Nothing is said unless a turn was cut off or a reply is owed: the participant may be working.
+    if (cutText) this.directed(`Say this again, verbatim and nothing else: "${cutText}"`);
+    else if (owed) rt.requestResponse();
+  }
+
+  /** Reply latency: the participant spoke (or typed) last and the moderator just became audible. */
+  private sampleReply() {
+    const p = this.state.engine.current;
+    if (!p || !this.lastParticipantInput || this.lastParticipantInput <= this.lastAssistantAudio) return;
+    const ms = Math.round(performance.now() - this.lastParticipantInput);
+    if (ms > 30_000) return;
+    const all = [...(this.replySamples.get(p) ?? []), ms].slice(-50);
+    this.replySamples.set(p, all);
+    const sorted = [...all].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    this.set({ engine: { ...this.state.engine, replies: { ...this.state.engine.replies, [p]: { last: ms, median, n: all.length } } } });
   }
 
   private applyTurnDetection(force = false) {

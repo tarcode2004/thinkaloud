@@ -91,6 +91,13 @@ export class CaptionPacer {
     this.lastTick = this.now();
     this.timer = o.manual ? (0 as unknown as ReturnType<typeof setInterval>) : setInterval(() => this.tick(), 70);
   }
+  /** Everything the response playing now is saying (also the words not heard yet). */
+  speakingText(): string | null {
+    if (!this.playing) return null;
+    const t = this.segs.filter((g) => g.responseId === this.playing).map((g) => g.full).join(' ').trim();
+    return t || null;
+  }
+
 
   dispose() {
     clearInterval(this.timer);

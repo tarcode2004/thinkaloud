@@ -241,8 +241,8 @@ async function waitIdle(page: Page, quietMs = 600) {
 }
 
 /** Landing → consent → mic check (local wav) → session; intro; "ready". */
-async function start(page: Page, token: string) {
-  await page.goto(`${WEB}/s/${token}`);
+async function start(page: Page, token: string, query = '') {
+  await page.goto(`${WEB}/s/${token}${query}`);
   await page.getByTestId('get-started').click();
   await page.getByTestId('opt-age').click();
   await page.getByTestId('accept-consent').click();
@@ -687,5 +687,81 @@ test('M6 · layout: the app gets the full height beside the panel (wide); under 
   await page.waitForTimeout(2800); // let the open animation and the task highlight settle
   await page.screenshot({ path: path.join(OUT, 'layout-narrow-open.png') });
   expect(openaiHits.filter((u) => !u.endsWith('/v1/realtime/calls'))).toEqual([]);
+  await context.close();
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+test('M7 · preview voice-engine switch: OpenRealtime ↔ OpenAI at any point (idle, and mid-sentence); the new engine gets the instructions and the conversation, says nothing about a dropped connection, re-says a cut-off turn; reply times per engine', async () => {
+  const steps = [
+    task({ id: 'task_a', title: 'Lamp', instruction: 'Find the Aurora desk lamp.' }),
+    task({ id: 'task_b', title: 'Posters', instruction: 'Have a look at the poster section and tell me which one you like best.' }),
+  ];
+  const { token } = await createStudy('Mock engine switch', protocol(steps));
+  const { context, page, openaiHits } = await newPage();
+  // Both engines are local mocks (WebRTC): OpenAI's SDP endpoint is answered by newPage's route.
+  const asked: (string | null)[] = [];
+  await context.route('https://ort.mock/**', (r) => r.fulfill({ status: 200, contentType: 'application/sdp', body: 'v=0 mock-answer' }));
+  await context.route('**/api/p/sessions/*/realtime-token', (r) => {
+    const provider = (r.request().postDataJSON() as { provider?: string } | null)?.provider ?? null;
+    asked.push(provider);
+    const p = provider ?? 'openrealtime';
+    const callsUrl = p === 'openai' ? 'https://api.openai.com/v1/realtime/calls' : 'https://ort.mock/v1/realtime/calls';
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ value: `ek_${p}`, expiresAt: 0, model: 'mock-realtime', voice: 'marin', transcription: { model: 'mock-transcribe', language: 'en' }, callsUrl, provider: p, providers: ['openrealtime', 'openai'] }),
+    });
+  });
+  await start(page, token); // the token route offers both engines, as the server does for owner previews
+  const session = page.getByTestId('session');
+  const sw = page.getByTestId('engine-switch');
+  await waitEvent(page, (e) => e.kind === 'transcript.moderator', 30_000, 'intro');
+  await expect(sw).toHaveAttribute('data-engine', 'openrealtime');
+  await waitIdle(page);
+
+  // 1 · idle → OpenAI: the new engine gets the instructions and the conversation so far.
+  const sentBefore = await page.evaluate(() => (window as unknown as { __mockRt: { sent: unknown[] } }).__mockRt.sent.length);
+  await page.getByTestId('engine-openai').click();
+  await expect(sw).toHaveAttribute('data-engine', 'openai', { timeout: 10_000 });
+  await expect(page.getByTestId('engine-openai')).toBeEnabled();
+  const after = await page.evaluate((n) => (window as unknown as { __mockRt: { sent: { type: string; session?: { instructions?: string }; item?: { content?: { text?: string }[] } }[] } }).__mockRt.sent.slice(n), sentBefore);
+  expect(after.some((e) => e.type === 'session.update' && (e.session?.instructions ?? '').length > 200)).toBe(true);
+  const ctx = after.find((e) => e.type === 'conversation.item.create' && /different voice system/.test(e.item?.content?.[0]?.text ?? ''));
+  expect(ctx, 'conversation handed over').toBeTruthy();
+  expect(ctx!.item!.content![0].text).toMatch(/moderator: /);
+  let evs = await log(page);
+  expect(evs.some((e) => e.kind === 'observation' && e.data.kind === 'voice_engine_switch' && e.data.to === 'openai')).toBe(true);
+  expect(evs.some((e) => e.kind === 'observation' && e.data.kind === 'voice_engine' && e.data.provider === 'openai')).toBe(true);
+  expect(evs.some((e) => e.kind === 'observation' && e.data.kind === 'realtime_reconnected')).toBe(false);
+  expect(modLines(evs).some((t) => /connection problem/i.test(t))).toBe(false);
+  // Nothing was owed (the moderator waits for "ready"): the new engine stays quiet.
+  await page.waitForTimeout(1500);
+  expect(modLines(await log(page)).length).toBe(modLines(evs).length);
+  await waitIdle(page);
+
+  // The session carries on with the new engine: "ready" → task one.
+  await says(page, "Yes, I'm ready.", 900);
+  await expect(session).toHaveAttribute('data-step', 'task_a', { timeout: 20_000 });
+  await expect(page.getByTestId('engine-latency')).toContainText(/OpenAI \d+\.\d s \(\d+\)/, { timeout: 15_000 });
+
+  // 2 · mid-sentence → back to OpenRealtime: the cut-off turn is said again by the new engine.
+  await expect(session).toHaveAttribute('data-orb', 'assistant', { timeout: 15_000 });
+  await page.waitForTimeout(1500); // a few words in
+  const switchAt = (await log(page)).at(-1)!.t;
+  await page.getByTestId('engine-openrealtime').click();
+  await expect(sw).toHaveAttribute('data-engine', 'openrealtime', { timeout: 10_000 });
+  // The new engine says the interrupted turn in full (whatever was heard of the old one is kept as cut).
+  const again = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > switchAt && e.stepId === 'task_a' && !e.data.truncated, 15_000, 'turn re-said after switch');
+  expect(String(again.data.text)).toMatch(/^Task one of two\. Find the Aurora desk lamp/);
+  const heard = (await log(page)).find((e) => e.kind === 'transcript.moderator' && e.t > switchAt - 3000 && e.stepId === 'task_a' && e.data.truncated);
+  expect(String(heard?.data.text ?? ''), 'the words heard before the switch are kept, marked cut').toMatch(/^Task one/);
+  await expect(session).toHaveAttribute('data-task-phase', 'active', { timeout: 10_000 });
+  evs = await log(page);
+  expect(evs.filter((e) => e.kind === 'observation' && e.data.kind === 'voice_engine_switch').map((e) => e.data.to)).toEqual(['openai', 'openrealtime']);
+  expect(asked).toEqual([null, 'openai', 'openrealtime']);
+  await expect(page.getByTestId('engine-switch')).toBeVisible();
+  await page.screenshot({ path: path.join(OUT, 'mock-engine-switch.png') });
+  save('engine-switch', evs);
+  expect(openaiHits.every((u) => u.endsWith('/v1/realtime/calls'))).toBe(true);
   await context.close();
 });
