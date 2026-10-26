@@ -33,8 +33,9 @@ export interface RealtimeHandlers {
   onServerEvent?: (ev: ServerEvent) => void;
   onFunctionCall?: (call: FunctionCall) => Promise<{ output: unknown; respond: boolean }> | { output: unknown; respond: boolean };
   /** `itemId`: the input item this speech segment becomes (its transcript arrives later with the same id). */
-  onUserSpeechStart?: (itemId?: string) => void;
-  onUserSpeechStop?: () => void;
+  onUserSpeechStart?: (itemId?: string, audioMs?: number) => void;
+  /** `audioMs`: the server's audio_start_ms / audio_end_ms (position in the input audio). */
+  onUserSpeechStop?: (itemId?: string, audioMs?: number) => void;
   onUserTranscriptDelta?: (itemId: string, delta: string) => void;
   /** `logprobs`: transcription token log-probabilities when the session includes them. */
   onUserTranscript?: (itemId: string, text: string, logprobs?: unknown) => void;
@@ -857,11 +858,11 @@ export class RealtimeClient {
       }
       case 'input_audio_buffer.speech_started':
         this.userSpeaking = true;
-        h.onUserSpeechStart?.(ev.item_id as string | undefined);
+        h.onUserSpeechStart?.(ev.item_id as string | undefined, typeof ev.audio_start_ms === 'number' ? ev.audio_start_ms : undefined);
         break;
       case 'input_audio_buffer.speech_stopped':
         this.userSpeaking = false;
-        h.onUserSpeechStop?.();
+        h.onUserSpeechStop?.(ev.item_id as string | undefined, typeof ev.audio_end_ms === 'number' ? ev.audio_end_ms : undefined);
         break;
       case 'conversation.item.input_audio_transcription.delta':
         h.onUserTranscriptDelta?.(ev.item_id as string, (ev.delta as string) ?? '');

@@ -58,16 +58,23 @@ export interface NoiseCheck {
   language?: string;
   /** Mean token log-probability of the transcription, if known (0 = certain, -1 = very unsure). */
   avgLogprob?: number | null;
+  /** How long the speech the transcript came from lasted (server audio positions), if known. */
+  durationMs?: number | null;
 }
+
+/** Faster than anyone talks: a transcript with more words than this per second of audio is invented. */
+export const MAX_WORDS_PER_SEC = 7;
 
 /**
  * Very short, low-confidence or wrong-language fragments are background noise / mis-transcriptions
  * ("Tja, wol zančanic.", "Wortfrieden-Text.") — never answers. Longer utterances are always kept.
  */
-export function isLikelyNoise({ text, language, avgLogprob }: NoiseCheck): boolean {
+export function isLikelyNoise({ text, language, avgLogprob, durationMs }: NoiseCheck): boolean {
   const t = text.trim();
   const w = words(t);
   if (!w.length) return true;
+  // Speech recognisers "hear" whole phrases in a click or a breath ("It could be too." in 0.2 s).
+  if (durationMs != null && Number.isFinite(durationMs) && w.length >= 2 && w.length / (Math.max(durationMs, 1) / 1000) > MAX_WORDS_PER_SEC) return true;
   if (w.length > 4) return false;
   const lang = (language || 'en').toLowerCase().split(/[-_]/)[0];
   if (avgLogprob != null && Number.isFinite(avgLogprob) && avgLogprob < -1.0) return true;
@@ -80,6 +87,16 @@ export function isLikelyNoise({ text, language, avgLogprob }: NoiseCheck): boole
     if (/\p{Lu}\p{Ll}{5,}-\p{Lu}/u.test(t) && known === 0) return true;
   }
   return false;
+}
+
+/** What is left of `full` after the words in `heard`, from the start of the sentence the cut fell in. */
+export function resumeFrom(full: string, heard: string): string {
+  const tokens = full.trim().split(/\s+/);
+  const n = heard.trim() ? heard.trim().split(/\s+/).length : 0;
+  if (n >= tokens.length) return '';
+  let start = n;
+  while (start > 0 && !/[.!?]["')\]]*$/.test(tokens[start - 1])) start--;
+  return tokens.slice(start).join(' ');
 }
 
 /** Mean log-probability of a transcription's tokens (realtime `logprobs`), or null. */

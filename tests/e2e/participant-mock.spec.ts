@@ -765,3 +765,50 @@ test('M7 · preview voice-engine switch: OpenRealtime ↔ OpenAI at any point (i
   expect(openaiHits.every((u) => u.endsWith('/v1/realtime/calls'))).toBe(true);
   await context.close();
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+test('M8 · noise that cuts the intro: empty speech → the moderator carries on from the cut sentence; "It could be too." in 0.2 s is noise; a real interruption gets an answer, but the intro is finished before step one', async () => {
+  const steps = [task({ id: 'task_a', title: 'Lamp', instruction: 'Find the Aurora desk lamp.' })];
+  const { token } = await createStudy('Mock intro barge-in', protocol(steps));
+  const { context, page, openaiHits } = await newPage();
+  await start(page, token);
+  const session = page.getByTestId('session');
+  const sayOpts = (text: string, ms: number, opts: Json) =>
+    page.evaluate(([t, d, o]) => (window as unknown as { __mockRt: { userSays: (t: string, d: number, o: unknown) => Promise<void> } }).__mockRt.userSays(t as string, d as number, o), [text, ms, opts] as const);
+
+  // 1 · A noise burst cuts the intro after ~2 s and turns out to be nothing.
+  await expect(session).toHaveAttribute('data-orb', 'assistant', { timeout: 30_000 });
+  await page.waitForTimeout(2200);
+  await sayOpts('', 300, { bargeIn: true });
+  const resumed = await waitEvent(page, (e) => e.kind === 'observation' && e.data.kind === 'resumed_after_noise', 10_000, 'resumed');
+  const cont = await waitEvent(page, (e) => e.kind === 'transcript.moderator' && e.t > resumed.t, 15_000, 'continuation');
+  expect(String(cont.data.text)).toMatch(/Are you ready to begin\?$/);
+  expect(String(cont.data.text)).not.toMatch(/^Hi, and thanks/); // carries on, does not start over
+
+  // 2 · Again, now with an invented transcript: 4 words from 0.17 s of audio.
+  await waitIdle(page);
+  await sayOpts('It could be too.', 170, {});
+  await page.waitForTimeout(2500);
+  let evs = await log(page);
+  expect(evs.find((e) => e.kind === 'transcript.participant' && /could be too/.test(String(e.data.text)))?.data.noise).toBe(true);
+  expect(evs.some((e) => e.kind === 'step.enter' && e.data.index === 0)).toBe(false);
+
+  // 3 · A real interruption early in a fresh intro reading is answered — and the intro is still finished.
+  await context.close();
+  const b = await newPage();
+  await start(b.page, token);
+  await expect(b.page.getByTestId('session')).toHaveAttribute('data-orb', 'assistant', { timeout: 30_000 });
+  await b.page.waitForTimeout(1500);
+  await b.page.evaluate(() => (window as unknown as { __mockRt: { userSays: (t: string, d: number, o: unknown) => Promise<void> } }).__mockRt.userSays("Yes, I'm ready.", 900, { bargeIn: true }));
+  const rest = await waitEvent(b.page, (e) => e.kind === 'transcript.moderator' && /Are you ready to begin\?/.test(String(e.data.text)) && !e.data.truncated, 20_000, 'rest of the intro');
+  evs = await log(b.page);
+  const rejected = evs.find((e) => e.kind === 'moderator.tool' && e.data.name === 'complete_step' && e.data.ok === false);
+  expect(String(rejected?.data.error)).toMatch(/whole introduction/);
+  expect(evs.find((e) => e.kind === 'step.enter' && e.data.index === 0)?.t ?? Infinity).toBeGreaterThan(rest.t);
+  await waitIdle(b.page);
+  await b.page.evaluate(() => (window as unknown as { __mockRt: { userSays: (t: string, d?: number) => Promise<void> } }).__mockRt.userSays("Yes, I'm ready.", 900));
+  await expect(b.page.getByTestId('session')).toHaveAttribute('data-step', 'task_a', { timeout: 20_000 });
+  save('intro-barge-in', await log(b.page));
+  expect([...openaiHits, ...b.openaiHits].every((u) => u.endsWith('/v1/realtime/calls'))).toBe(true);
+  await b.context.close();
+});

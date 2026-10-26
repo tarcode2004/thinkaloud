@@ -24,6 +24,7 @@ import {
   MODERATOR_TOOLS,
   nextAssistance,
   questionnaireOnScreen,
+  resumeFrom,
   stepQuestions,
   type AssistAction,
   type BriefContext,
@@ -236,6 +237,15 @@ export class SessionRunner {
   /** The next onReady is a deliberate backend switch (not a dropped connection). */
   private engineSwitch: { cutText: string | null; owed: boolean } | null = null;
   private replySamples = new Map<RealtimeProvider, number[]>();
+  /** Server audio positions of each speech item (ms): how long the speech behind a transcript was. */
+  private speechSpans = new Map<string, { start?: number; end?: number }>();
+  /** The moderator's last turn, cut off by the server VAD (barge-in): resumed if that "speech" was noise. */
+  private cutTurn: { full: string; heard: string; index: number; at: number } | null = null;
+  /** What of the intro was audible so far (it may be spread over cut-off turns). */
+  private introHeardText = '';
+  private introGateRejects = 0;
+  /** The last moderator segment committed by the caption pacer (full text, and what was heard of it). */
+  private lastCommit: { full: string; text: string } | null = null;
   /** Moderator captions revealed in step with the audible voice. */
   private pacer: CaptionPacer | null = null;
   private recorder: MixedRecorder | null = null;
@@ -536,7 +546,8 @@ export class SessionRunner {
           }
         },
         onFunctionCall: (call) => this.handleToolCall(call),
-        onUserSpeechStart: (itemId) => {
+        onUserSpeechStart: (itemId, audioMs) => {
+          if (itemId) this.noteSpeechSpan(itemId, { start: audioMs });
           this.lastUserSpeech = performance.now();
           this.userSpeechStartT = this.queue.now();
           if (itemId) {
@@ -549,7 +560,8 @@ export class SessionRunner {
           this.queue.push('speech.start', { who: 'participant' });
           this.updateOrb();
         },
-        onUserSpeechStop: () => {
+        onUserSpeechStop: (itemId, audioMs) => {
+          if (itemId) this.noteSpeechSpan(itemId, { end: audioMs });
           this.lastUserSpeech = performance.now();
           this.lastSpeechStopAt = this.lastUserSpeech;
           this.lastParticipantInput = this.lastUserSpeech;
@@ -577,6 +589,10 @@ export class SessionRunner {
           const cut = this.pacer?.audioStop(rid, cleared);
           // We cut it off ourselves: tell the server what was heard (its own VAD interruptions it truncates itself).
           if (cut && byClient) rt.truncate(cut.seg.itemId, cut.playedMs);
+          // The server's VAD cut it off: if that turns out to be noise, the moderator carries on.
+          const lc = this.lastCommit;
+          const heard = lc && lc.full === cut?.seg.full ? lc.text : '';
+          this.cutTurn = cut && cleared && !byClient && cut.seg.full.trim() ? { full: cut.seg.full.trim(), heard, index: this.state.index, at: performance.now() } : null;
           this.lastAssistantAudio = performance.now();
           this.queue.push('speech.stop', { who: 'moderator' });
           this.updateOrb();
@@ -605,6 +621,7 @@ export class SessionRunner {
         if (text) this.caption('moderator', id, text, final, false);
       },
       commit: (seg, text, truncated, late) => {
+        this.lastCommit = { full: seg.full, text };
         this.onAssistantTranscript(seg.id, text, seg.phase, truncated);
         if (late && !this.rt?.assistantAudioPlaying) this.onModeratorFinishedSpeaking();
       },
@@ -714,6 +731,43 @@ export class SessionRunner {
     else if (owed) rt.requestResponse();
   }
 
+  private noteSpeechSpan(itemId: string, part: { start?: number; end?: number }) {
+    const cur = this.speechSpans.get(itemId) ?? {};
+    if (part.start != null) cur.start = part.start;
+    if (part.end != null) cur.end = part.end;
+    this.speechSpans.set(itemId, cur);
+    if (this.speechSpans.size > 200) this.speechSpans.delete(this.speechSpans.keys().next().value!);
+  }
+
+  /**
+   * The server's VAD cut the moderator off, and that "speech" was noise (or nothing): carry on with
+   * the interrupted turn, from the start of the sentence it was cut in.
+   */
+  private resumeCutTurn(reason: string) {
+    const c = this.cutTurn;
+    const rt = this.rt;
+    if (!c || !rt || c.index !== this.state.index || performance.now() - c.at > 20_000) return;
+    if (rt.responding || rt.assistantAudioPlaying || rt.userSpeaking) return;
+    this.cutTurn = null;
+    const rest = resumeFrom(c.full, c.heard);
+    if (!rest) return;
+    this.queue.push('observation', { kind: 'resumed_after_noise', reason, note: rest.slice(0, 300) });
+    this.lastDirectedAt = performance.now();
+    rt.requestResponse(
+      `${buildModeratorInstructions(this.protocol, this.steps)}\n\n# NOW\nYou were interrupted by background noise, not by the participant. Continue your interrupted turn: say exactly this and nothing else: "${rest}"`,
+      'none',
+    );
+  }
+
+  /** The part of the intro the participant has not heard yet (from the first unheard sentence), or null. */
+  private unheardIntro(): string | null {
+    const intro = (this.protocol.intro || '').trim();
+    if (!intro) return null;
+    const sentences = intro.match(/[^.!?]+[.!?]+["')\]]*|[^.!?]+$/g)?.map((x) => x.trim()).filter(Boolean) ?? [intro];
+    const first = sentences.findIndex((x) => !isReadingOf(this.introHeardText, x, 0.8));
+    return first < 0 ? null : sentences.slice(first).join(' ');
+  }
+
   /** Reply latency: the participant spoke (or typed) last and the moderator just became audible. */
   private sampleReply() {
     const p = this.state.engine.current;
@@ -819,17 +873,24 @@ export class SessionRunner {
     this.turn.transcriptPending = false;
     const startP = this.speechStarts.get(itemId) ?? this.lastUserSpeech;
     const startT = this.speechStarts.has(itemId) ? Math.round(this.queue.now() - (performance.now() - startP)) : (this.userSpeechStartT ?? undefined);
-    if (!text) return;
+    const span = this.speechSpans.get(itemId);
+    const durationMs = span?.start != null && span.end != null && span.end >= span.start ? span.end - span.start : null;
+    if (!text) {
+      this.resumeCutTurn('nothing was said');
+      return;
+    }
     const avgLogprob = meanLogprob(logprobs);
-    if (isLikelyNoise({ text, language: this.mod.language, avgLogprob })) {
+    if (isLikelyNoise({ text, language: this.mod.language, avgLogprob, durationMs })) {
       // Background noise / a mis-transcribed fragment in another language: logged for the researcher,
       // but never an answer, never a turn, and removed from the model's conversation.
-      this.queue.push('transcript.participant', { text, itemId, startT, endT: this.queue.now(), source: 'voice', noise: true, ...(avgLogprob != null ? { avgLogprob: Math.round(avgLogprob * 100) / 100 } : {}) });
+      this.queue.push('transcript.participant', { text, itemId, startT, endT: this.queue.now(), source: 'voice', noise: true, ...(avgLogprob != null ? { avgLogprob: Math.round(avgLogprob * 100) / 100 } : {}), ...(durationMs != null ? { durationMs } : {}) });
       this.dropCaption(itemId);
       // (The VAD never auto-responds, so nothing was started for it.)
       this.rt?.deleteItem(itemId);
+      this.resumeCutTurn('noise');
       return;
     }
+    this.cutTurn = null; // they really spoke: the model replies to them (it knows where it was cut off)
     this.heardSinceStep = true;
     this.transcriptLog.push({ role: 'participant', text });
     this.queue.push('transcript.participant', { text, itemId, startT, endT: this.queue.now(), source: 'voice', ...(avgLogprob != null ? { avgLogprob: Math.round(avgLogprob * 100) / 100 } : {}) });
@@ -1005,6 +1066,7 @@ Reply with exactly one word: YES or NO.`;
     if (!text) return;
     this.caption('moderator', rid, text, true, false);
     this.transcriptLog.push({ role: 'moderator', text });
+    if (this.state.index < 0) this.introHeardText += ' ' + text;
     this.queue.push('transcript.moderator', { text, responseId: rid, ...(phase ? { phase } : {}), ...(truncated ? { truncated: true } : {}) });
     // Which question was actually read out, completely and audibly (an interrupted reading does not
     // count). Only speech that starts after this moment can answer it.
@@ -1664,6 +1726,16 @@ Reply with exactly one word: YES or NO.`;
         if (idx >= this.steps.length) return this.err('There is no next step.', 'Say the closing text verbatim if you have not yet, then call end_session.');
         if (idx < 0) {
           if (!this.heardSinceStep) return this.err('The participant has not replied yet.', 'Wait silently for the participant to reply to the intro.');
+          // An intro cut off by the participant (or by noise) must still be heard in full: it may carry
+          // the recording / consent check. Enforced twice at most (a translated intro can't be matched).
+          const unheard = this.unheardIntro();
+          if (unheard && this.introGateRejects < 2) {
+            this.introGateRejects++;
+            return this.err(
+              'You were cut off: the participant has not heard the whole introduction yet.',
+              `Do not skip it and do not call complete_step yet. If they asked or said something, reply in one short sentence; then say the rest of the introduction verbatim: "${unheard}" Then wait for their reply.`,
+            );
+          }
         } else if (s) {
           const block = this.completionBlocker(s);
           if (block) return this.err(block.error, block.hint);

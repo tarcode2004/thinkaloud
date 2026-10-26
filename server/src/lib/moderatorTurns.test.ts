@@ -9,6 +9,7 @@ import {
   buildModeratorInstructions,
   isDontKnow,
   isLikelyNoise,
+  resumeFrom,
   isUnfinishedUtterance,
   MODERATOR_TOOLS,
   type Protocol,
@@ -92,4 +93,25 @@ test('the real session shows the regressions these rules address', () => {
   assert.ok(said.includes("What would you do if I weren't here?"));
   const err = real.events.find((e) => e.kind === 'moderator.tool' && e.data.ok === false);
   assert.equal(err?.data.error, 'value must be 1 (yes) or 0 (no).');
+});
+
+test('isLikelyNoise: more words than anyone can say in the speech behind them is noise', () => {
+  // The real case: "It could be too." from 0.17 s of "speech" during the intro.
+  assert.equal(isLikelyNoise({ text: 'It could be too.', language: 'en', durationMs: 170 }), true);
+  assert.equal(isLikelyNoise({ text: 'It could be too.', language: 'en', durationMs: 470 }), true);
+  // Real answers, also with VAD padding missing.
+  assert.equal(isLikelyNoise({ text: "Yes, I'm ready.", language: 'en', durationMs: 600 }), false);
+  assert.equal(isLikelyNoise({ text: 'Yes.', language: 'en', durationMs: 120 }), false);
+  assert.equal(isLikelyNoise({ text: 'I think the second post is the one about batteries.', language: 'en', durationMs: 1500 }), false);
+  assert.equal(isLikelyNoise({ text: 'I think the second post is the one about batteries.', language: 'en', durationMs: 900 }), true);
+  // Unknown duration: unchanged behaviour.
+  assert.equal(isLikelyNoise({ text: 'It could be too.', language: 'en' }), false);
+});
+
+test('resumeFrom: continue a cut-off turn from the start of the sentence it was cut in', () => {
+  const full = "Hi, and thanks for joining. I'm an AI moderator, and I'll guide you through this session. Are you okay with recording?";
+  assert.equal(resumeFrom(full, "Hi, and thanks for joining. I'm an AI moderator,"), "I'm an AI moderator, and I'll guide you through this session. Are you okay with recording?");
+  assert.equal(resumeFrom(full, 'Hi, and thanks for joining.'), "I'm an AI moderator, and I'll guide you through this session. Are you okay with recording?");
+  assert.equal(resumeFrom(full, ''), full);
+  assert.equal(resumeFrom(full, full), '');
 });

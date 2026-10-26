@@ -7,7 +7,10 @@
 // (like the real API, much faster than the audio).
 //
 // Test controls (window.__mockRt):
-//   userSays(text, ms?)          participant speech: speech_started → (ms) → speech_stopped → transcript
+//   userSays(text, ms?, opts?)   participant speech: speech_started → (ms) → speech_stopped → transcript
+//                                opts.bargeIn: the server VAD cuts the moderator's audio (interrupt_response);
+//                                opts.audioMs: speech length reported in audio_start_ms/audio_end_ms (default ms);
+//                                text '' = speech with no words (empty transcript)
 //   config.rules                 [regex, label][] for out-of-band classifications (default "NO")
 //   config.oobDelayMs            how long a classification stays "in progress" on the server
 //   config.responseDelayMs       how long the model takes to start a reply (default 250)
@@ -183,6 +186,9 @@ export const MOCK_REALTIME = () => {
             if (o && o.step) st.brief = o;
             else if (o?.current?.step) st.brief = o.current;
             else if (o?.say_verbatim) st.pendingSay = o.say_verbatim;
+            // A rejected tool call whose hint dictates what to say (the model follows it).
+            const dictated = o?.ok === false && /verbatim: "([^"]+)"/.exec(String(o.hint ?? ''))?.[1];
+            if (dictated) st.pendingSay = dictated;
           } catch {
             /* ignore */
           }
@@ -220,11 +226,21 @@ export const MOCK_REALTIME = () => {
     }
   }
 
-  async function userSays(text: string, ms = Math.max(800, (text.split(/\s+/).length / 2.6) * 1000)) {
+  let audioClock = 5000;
+  async function userSays(text: string, ms = Math.max(800, (text.split(/\s+/).length / 2.6) * 1000), opts: { bargeIn?: boolean; audioMs?: number } = {}) {
     const item = id('item_user');
-    emit({ type: 'input_audio_buffer.speech_started', item_id: item });
+    const a0 = audioClock;
+    emit({ type: 'input_audio_buffer.speech_started', item_id: item, audio_start_ms: a0 });
+    if (opts.bargeIn && st.playing) {
+      clearTimeout(st.playing.timer);
+      const rid = st.playing.rid;
+      st.playing = null;
+      emit({ type: 'output_audio_buffer.cleared', response_id: rid });
+    }
     await new Promise((r) => setTimeout(r, ms));
-    emit({ type: 'input_audio_buffer.speech_stopped', item_id: item });
+    audioClock = a0 + (opts.audioMs ?? ms);
+    emit({ type: 'input_audio_buffer.speech_stopped', item_id: item, audio_end_ms: audioClock });
+    audioClock += 1000;
     // Like the real API: the VAD creates the reply at speech_stopped, before the transcript arrives.
     if (st.createResponse) onCreate({ type: 'response.create' }, 800);
     await new Promise((r) => setTimeout(r, 300));
